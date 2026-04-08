@@ -1,0 +1,54 @@
+# OpenAI API settings used by the review service.
+# OpenAI 配置：用于代码审查调用的大模型服务参数。
+openai:
+  # Base URL for OpenAI-compatible API endpoint (usually ends with /v1).
+  # OpenAI 兼容接口地址（通常以 /v1 结尾）。
+  base_url: "https://api.openai.com/v1"
+  # API key for model access.
+  # 模型服务 API Key。
+  api_key: "sk-xxxxxxxx"
+  # Model name used for code review requests.
+  # 用于代码审查请求的模型名称。
+  model: "gpt-4.1"
+  # Reasoning effort for supported models: low / medium / high.
+  # 支持模型的推理强度：low / medium / high。
+  reasoning_effort: "medium"
+
+# Code platform connection settings (currently GitLab-oriented).
+# 代码平台连接配置（当前主要面向 GitLab）。
+code_platform:
+  # Platform type. Keep "gitlab" unless your service explicitly supports others.
+  # 平台类型；除非你已扩展实现，否则保持为 gitlab。
+  type: "gitlab"
+  # Base URL of your GitLab instance.
+  # GitLab 实例基础地址。
+  url: "https://gitlab.company.com"
+  # Access token used to fetch MR changes and post comments.
+  # 用于读取 MR Diff 与发表评论的访问令牌。
+  token: "glpat-xxxxxxxx"
+  # Optional webhook secret token for validating incoming webhook requests.
+  # 可选：Webhook 密钥，用于校验请求来源。
+  webhook_secret: "replace-with-webhook-secret"
+
+# HTTP server runtime settings.
+# 服务运行参数。
+server:
+  # Bind address for the review server.
+  # 服务监听地址。
+  host: "0.0.0.0"
+  # Bind port for the review server.
+  # 服务监听端口。
+  port: 5000
+  # Log verbosity level: DEBUG / INFO / WARNING / ERROR.
+  # 日志级别：DEBUG / INFO / WARNING / ERROR。
+  log_level: "INFO"
+
+# Review process behavior controls.
+# 审查流程控制参数。
+review:
+  # Maximum diff size (in characters) processed in one review.
+  # 单次审查处理的最大 Diff 字符数。
+  max_diff_size: 50000
+  # Request timeout for a single review run (in seconds).
+  # 单次审查超时时间（秒）。
+  timeout: 180
