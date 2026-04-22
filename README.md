@@ -49,6 +49,8 @@ opencr/
 ├── config.example.yaml     # Config template (copy to config.yaml)
 ├── README.md               # English documentation
 ├── README-zh.md            # Chinese documentation
+├── skills/                 # Review skills
+│   └── review/             # Skill markdowns (general/flutter/ts...)
 ├── src/                    # Source code
 │   ├── __init__.py
 │   ├── review_server.py    # Flask main service
@@ -58,6 +60,7 @@ opencr/
 # Generated after installation
 ~/opencr/
 ├── src/                    # Copied source
+├── skills/                 # Copied skills for auto skill routing
 ├── logs/                   # Log directory
 ├── venv/                   # Python virtual environment
 ├── config.yaml             # Runtime configuration file
@@ -101,7 +104,7 @@ chmod +x install.sh
 The installer automatically:
 - Checks system requirements (Python3, pip, curl)
 - Reads project `config.yaml` (if present) and interactively confirms config values
-- Copies source code to `~/opencr/`
+- Copies source code and `skills/` to `~/opencr/`
 - Creates a Python virtual environment and installs dependencies
 - Generates startup scripts and launchd configuration
 - Starts and verifies the service
@@ -131,6 +134,7 @@ pip install openai flask gunicorn python-dotenv requests
 
 # Copy source code
 cp -r /path/to/opencr/src ./
+cp -r /path/to/opencr/skills ./
 ```
 
 #### 3. Configure `config.yaml`
@@ -158,6 +162,7 @@ server:
 review:
   max_diff_size: 50000
   timeout: 180
+  skills_dir: "skills/review"
 ```
 
 #### 4. Start Service
@@ -233,7 +238,7 @@ curl http://localhost:5000/health
 # Trigger manual review
 curl -X POST http://localhost:5000/manual-review \
   -H "Content-Type: application/json" \
-  -d '{"project_id": 123, "mr_iid": 456}'
+  -d '{"project_id": 123, "mr_iid": 456, "review_mode": "file"}'
 ```
 
 ### Update Deployment
@@ -243,6 +248,7 @@ cd ~/opencr
 
 # Copy updated source files
 cp -r /path/to/new/src/* src/
+cp -r /path/to/new/skills/* skills/
 
 # Restart service
 launchctl stop com.opencr.server
@@ -272,7 +278,18 @@ Recommended: generate project `config.yaml` from `config.example.yaml` and manag
 The service skips review automatically when:
 - MR title contains `WIP`, `Draft`, or `skip-review`
 - Source branch matches `dependabot/*`
-- MR action is `update` (not open/reopen)
+
+MR event to review mode mapping:
+- `open`: overall + file-level review
+- `update` with new commit: file-level review for incremental commit diff only (inline comments)
+- `reopen`: ignored (no review)
+
+Review strategy per MR is determined by webhook event and manual API:
+- Mode is controlled by MR event (`open/update`) or manual API `review_mode`
+- Skill is auto-selected by AI based on:
+  - `skills/review/*.md` descriptions
+  - changed file paths and diff content
+- If no skill matches, that review branch is skipped
 
 ---
 
@@ -385,18 +402,19 @@ Gunicorn production entry point.
 
 ## Customization
 
-### Customize Review Prompt
+### Customize Review Skills
 
-Edit `build_review_prompt` in `src/review_server.py`:
+Place skill prompt files under `skills/review`.
+The service auto-selects one or more matching skills for each review based on skill descriptions and code changes.
+If no skill matches, this review branch is skipped.
 
-```python
-def build_review_prompt(diff: str) -> str:
-    return f"""Your custom prompt...
-{diff}
-"""
+Example:
+
+```text
+skills/review/flutter.md
+skills/review/ts.md
+skills/review/security.md
 ```
-
-Restart the service after changes.
 
 ### Add Custom Skip Rules
 
@@ -405,9 +423,11 @@ Edit `should_review_mr`:
 ```python
 def should_review_mr(data: dict) -> tuple:
     # Add your own filtering logic
-    if "specific-label" in title:
-        return False, "Skip MR with specific label"
-    return True, "Review conditions met"
+    attrs = data.get("object_attributes", {})
+    title = (attrs.get("title") or "").lower()
+    if "[skip-review]" in title:
+        return False, "Skip MR by title keyword", ""
+    return True, "Review conditions met", "overall"
 ```
 
 ---

@@ -1,0 +1,193 @@
+#!/usr/bin/env python3
+"""
+GitLab API 交互
+"""
+
+import logging
+from datetime import datetime
+from typing import List
+
+from .common import ReviewError
+from .config import load_gitlab_config, load_openai_config
+
+logger = logging.getLogger(__name__)
+
+
+def require_gitlab_config() -> dict:
+    """确保 GitLab 基础配置完整"""
+    cfg = load_gitlab_config()
+
+    if not cfg["url"] or not cfg["token"]:
+        logger.error(
+            f"GitLab config missing: url={'SET' if cfg['url'] else 'EMPTY'}, "
+            f"token={'SET' if cfg['token'] else 'EMPTY'}"
+        )
+        raise ReviewError(f"GitLab 配置不完整: url={bool(cfg['url'])}, token={bool(cfg['token'])}")
+
+    return cfg
+
+
+def get_mr_changes(project_id: int, mr_iid: int) -> List[dict]:
+    """从 GitLab API 获取 MR 变更列表"""
+    changes, _ = get_mr_changes_with_refs(project_id, mr_iid)
+    return changes
+
+
+def get_mr_changes_with_refs(project_id: int, mr_iid: int) -> tuple:
+    """从 GitLab API 获取 MR 变更列表与 diff refs"""
+    cfg = require_gitlab_config()
+    gitlab_url = cfg["url"]
+    token = cfg["token"]
+
+    url = f"{gitlab_url}/api/v4/projects/{project_id}/merge_requests/{mr_iid}/changes"
+
+    headers = {
+        "PRIVATE-TOKEN": token,
+        "Content-Type": "application/json",
+    }
+
+    try:
+        import requests
+        import urllib3
+
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        response = requests.get(url, headers=headers, timeout=30, verify=False)
+        response.raise_for_status()
+
+        data = response.json()
+        changes = data.get("changes", [])
+        diff_refs = data.get("diff_refs", {}) or {}
+        if not changes:
+            return [], diff_refs
+        return changes, diff_refs
+
+    except Exception as e:
+        logger.error(f"Failed to fetch MR diff: {e}")
+        raise ReviewError(f"获取 MR diff 失败: {str(e)}")
+
+
+def get_compare_changes(project_id: int, from_sha: str, to_sha: str) -> List[dict]:
+    """从 GitLab compare API 获取两个提交区间的增量变更列表"""
+    cfg = require_gitlab_config()
+    gitlab_url = cfg["url"]
+    token = cfg["token"]
+
+    url = f"{gitlab_url}/api/v4/projects/{project_id}/repository/compare"
+    headers = {
+        "PRIVATE-TOKEN": token,
+        "Content-Type": "application/json",
+    }
+    params = {
+        "from": from_sha,
+        "to": to_sha,
+    }
+
+    try:
+        import requests
+        import urllib3
+
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        response = requests.get(url, headers=headers, params=params, timeout=30, verify=False)
+        response.raise_for_status()
+
+        data = response.json() or {}
+        diffs = data.get("diffs", []) or []
+        return diffs
+    except Exception as e:
+        logger.error("Failed to fetch compare changes from %s to %s: %s", from_sha, to_sha, e)
+        raise ReviewError(f"获取提交区间 diff 失败: {str(e)}")
+
+
+def get_mr_diff(project_id: int, mr_iid: int) -> str:
+    """从 GitLab API 获取 MR diff（兼容旧逻辑）"""
+    changes = get_mr_changes(project_id, mr_iid)
+    return "\n".join([c.get("diff", "") for c in changes])
+
+
+def post_mr_comment(project_id: int, mr_iid: int, content: str) -> None:
+    """在 MR 中发表评论"""
+    cfg = require_gitlab_config()
+    gitlab_url = cfg["url"]
+    token = cfg["token"]
+
+    url = f"{gitlab_url}/api/v4/projects/{project_id}/merge_requests/{mr_iid}/notes"
+    headers = {
+        "PRIVATE-TOKEN": token,
+        "Content-Type": "application/json",
+    }
+
+    ai_cfg = load_openai_config()
+    full_content = f"""## 🤖 AI 代码审查报告
+
+**审查时间**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+**审查模型**: {ai_cfg['model']}
+
+---
+
+{content}
+
+"""
+
+    try:
+        import requests
+        import urllib3
+
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        response = requests.post(url, headers=headers, json={"body": full_content}, timeout=30, verify=False)
+        response.raise_for_status()
+        logger.info(f"Posted comment to MR !{mr_iid}")
+    except Exception as e:
+        logger.error(f"Failed to post comment: {e}")
+        raise ReviewError(f"发表评论失败: {str(e)}")
+
+
+def post_mr_inline_comment(
+    project_id: int,
+    mr_iid: int,
+    content: str,
+    new_path: str,
+    new_line: int,
+    diff_refs: dict,
+    old_path: str = "",
+) -> None:
+    """在 MR 的文件行位置发表评论（discussion）"""
+    cfg = require_gitlab_config()
+    gitlab_url = cfg["url"]
+    token = cfg["token"]
+
+    base_sha = diff_refs.get("base_sha", "")
+    start_sha = diff_refs.get("start_sha", "")
+    head_sha = diff_refs.get("head_sha", "")
+    if not (base_sha and start_sha and head_sha):
+        raise ReviewError("缺少 diff_refs，无法发布行内评论")
+
+    url = f"{gitlab_url}/api/v4/projects/{project_id}/merge_requests/{mr_iid}/discussions"
+    headers = {
+        "PRIVATE-TOKEN": token,
+        "Content-Type": "application/json",
+    }
+
+    payload = {
+        "body": content,
+        "position": {
+            "position_type": "text",
+            "base_sha": base_sha,
+            "start_sha": start_sha,
+            "head_sha": head_sha,
+            "new_path": new_path,
+            "old_path": old_path or new_path,
+            "new_line": int(new_line),
+        },
+    }
+
+    try:
+        import requests
+        import urllib3
+
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        response = requests.post(url, headers=headers, json=payload, timeout=30, verify=False)
+        response.raise_for_status()
+        logger.info("Posted inline comment to MR !%s at %s:%s", mr_iid, new_path, new_line)
+    except Exception as e:
+        logger.error("Failed to post inline comment: %s", e)
+        raise ReviewError(f"发布行内评论失败: {str(e)}")

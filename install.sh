@@ -267,16 +267,25 @@ copy_files() {
     print_step "安装项目文件"
 
     # 创建目录
-    mkdir -p "$INSTALL_DIR"/{src,logs,scripts}
+    mkdir -p "$INSTALL_DIR"/{src,skills,logs,scripts}
     print_success "创建目录: $INSTALL_DIR"
 
     # 复制源码
     if [[ -d "$SCRIPT_DIR/src" ]]; then
-        cp -r "$SCRIPT_DIR/src" "$INSTALL_DIR/"
+        cp -r "$SCRIPT_DIR/src/." "$INSTALL_DIR/src/"
         print_success "复制源码文件"
     else
         print_error "未找到 src 目录: $SCRIPT_DIR/src"
         exit 1
+    fi
+
+    # 复制技能目录（用于自动 skill 路由）
+    if [[ -d "$SCRIPT_DIR/skills" ]]; then
+        cp -r "$SCRIPT_DIR/skills/." "$INSTALL_DIR/skills/"
+        print_success "复制 skills 目录"
+    else
+        print_warning "未找到 skills 目录: $SCRIPT_DIR/skills"
+        print_warning "自动 skill 选择将无法命中，审查分支会被跳过"
     fi
 
     # 设置可执行权限
@@ -387,6 +396,7 @@ generate_config_file() {
     REVIEW_LOG_LEVEL=${REVIEW_LOG_LEVEL:-INFO}
     REVIEW_MAX_DIFF_SIZE=${REVIEW_MAX_DIFF_SIZE:-50000}
     REVIEW_TIMEOUT=${REVIEW_TIMEOUT:-180}
+    REVIEW_SKILLS_DIR=${REVIEW_SKILLS_DIR:-skills/review}
     OPENAI_REASONING_EFFORT=${OPENAI_REASONING_EFFORT:-medium}
 
     cat > "$INSTALL_DIR/config.yaml" << CONFIG_EOF
@@ -414,6 +424,7 @@ server:
 review:
   max_diff_size: ${REVIEW_MAX_DIFF_SIZE}
   timeout: ${REVIEW_TIMEOUT}
+  skills_dir: "${REVIEW_SKILLS_DIR}"
 CONFIG_EOF
 
     chmod 600 "$INSTALL_DIR/config.yaml"
@@ -518,6 +529,8 @@ show_summary() {
     echo "    ├── src/"
     echo "    │   ├── review_server.py  # 主服务代码"
     echo "    │   └── wsgi.py           # WSGI 入口"
+    echo "    ├── skills/"
+    echo "    │   └── review/           # 审查 skill 提示词"
     echo "    ├── start.sh              # 生产启动脚本"
     echo "    ├── start-dev.sh          # 开发启动脚本"
     echo "    ├── logs/                 # 日志目录"

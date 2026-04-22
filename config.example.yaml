@@ -52,3 +52,6 @@ review:
   # Request timeout for a single review run (in seconds).
   # 单次审查超时时间（秒）。
   timeout: 180
+  # Directory containing review skill prompt files.
+  # 审查 skill 提示词目录。
+  skills_dir: "skills/review"

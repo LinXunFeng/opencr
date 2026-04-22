@@ -2,7 +2,7 @@
 
 基于 GitLab Webhook + OpenAI API 的自动化代码审查方案，部署在 Mac 设备上。
 
-Language: [English]([README.md](https://github.com/LinXunFeng/opencr)) | 中文
+Language: [English](./README.md) | 中文
 
 **特色功能**：支持项目内 `config.yaml` 配置（提供 `config.example.yaml` 模板），安装时可交互确认并补齐必填项。
 
@@ -49,6 +49,8 @@ opencr/
 ├── config.example.yaml     # 配置模板（复制为 config.yaml）
 ├── README.md               # 英文文档
 ├── README-zh.md            # 本文档（中文）
+├── skills/                 # 审查技能目录
+│   └── review/             # skill 文档（general/flutter/ts...）
 ├── src/                    # 源代码（已实现）
 │   ├── __init__.py
 │   ├── review_server.py    # Flask 主服务
@@ -58,6 +60,7 @@ opencr/
 # 安装后生成的目录
 ~/opencr/
 ├── src/                    # 从项目复制
+├── skills/                 # 从项目复制（自动 skill 路由依赖）
 ├── logs/                   # 日志目录
 ├── venv/                   # Python 虚拟环境
 ├── config.yaml             # 运行时配置文件
@@ -101,7 +104,7 @@ chmod +x install.sh
 安装脚本会自动完成：
 - ✅ 检查系统要求（Python3、pip、curl）
 - ✅ 读取项目 `config.yaml`（若存在）并交互确认配置项
-- ✅ 复制源码到 `~/opencr/`
+- ✅ 复制源码和 `skills/` 到 `~/opencr/`
 - ✅ 创建 Python 虚拟环境并安装依赖
 - ✅ 生成启动脚本和 launchd 配置
 - ✅ 启动服务并验证
@@ -131,6 +134,7 @@ pip install openai flask gunicorn python-dotenv requests
 
 # 复制源码
 cp -r /path/to/opencr/src ./
+cp -r /path/to/opencr/skills ./
 ```
 
 #### 3. 配置 `config.yaml`
@@ -158,6 +162,7 @@ server:
 review:
   max_diff_size: 50000
   timeout: 180
+  skills_dir: "skills/review"
 ```
 
 #### 4. 启动服务
@@ -234,7 +239,7 @@ curl http://localhost:5000/health
 # 手动触发审查
 curl -X POST http://localhost:5000/manual-review \
   -H "Content-Type: application/json" \
-  -d '{"project_id": 123, "mr_iid": 456}'
+  -d '{"project_id": 123, "mr_iid": 456, "review_mode": "file"}'
 ```
 
 ### 更新部署
@@ -244,6 +249,7 @@ cd ~/opencr
 
 # 更新源码（从项目目录复制新版本）
 cp -r /path/to/new/src/* src/
+cp -r /path/to/new/skills/* skills/
 
 # 重启服务
 launchctl stop com.opencr.server
@@ -273,7 +279,18 @@ launchctl start com.opencr.server
 以下情况会自动跳过审查：
 - MR 标题包含 `WIP`、`Draft`、`skip-review`
 - 源分支为 `dependabot/*`
-- MR 动作为 `update`（非 open/reopen）
+
+MR 事件与审查模式映射：
+- `open`：执行整体 + 文件级审查
+- `update` 且有新提交：仅针对本次新增提交区间执行文件级审查（行内评论）
+- `reopen`：忽略（不触发审查）
+
+- 审查策略由 webhook 事件与手动接口共同决定
+- 审查模式由 MR 事件（`open/update`）或手动接口 `review_mode` 控制
+- skill 由 AI 自动选择，依据：
+  - `skills/review/*.md` 的描述
+  - 本次变更的文件路径与 diff 内容
+- 若无命中 skill，则对应审查分支会被跳过
 
 ---
 
@@ -386,18 +403,19 @@ Gunicorn 生产环境入口文件。
 
 ## 扩展开发
 
-### 修改审查提示词
+### 自定义审查 Skill
 
-编辑 `src/review_server.py` 中的 `build_review_prompt` 函数：
+将提示词文件放到 `skills/review` 目录。
+服务会根据 skill 描述与代码变更自动选择一个或多个命中 skill。
+若未命中 skill，该审查分支会直接跳过。
 
-```python
-def build_review_prompt(diff: str) -> str:
-    return f"""自定义提示词...
-{diff}
-"""
+示例：
+
+```text
+skills/review/flutter.md
+skills/review/ts.md
+skills/review/security.md
 ```
-
-修改后重启服务生效。
 
 ### 添加自定义过滤规则
 
@@ -406,9 +424,11 @@ def build_review_prompt(diff: str) -> str:
 ```python
 def should_review_mr(data: dict) -> tuple:
     # 添加你的过滤逻辑
-    if "特定标签" in title:
-        return False, "跳过特定标签的 MR"
-    return True, "符合审查条件"
+    attrs = data.get("object_attributes", {})
+    title = (attrs.get("title") or "").lower()
+    if "[skip-review]" in title:
+        return False, "标题命中跳过关键字", ""
+    return True, "符合审查条件", "overall"
 ```
 
 ---
