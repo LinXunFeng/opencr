@@ -46,11 +46,13 @@ def _load_review_dependencies() -> dict:
     )
     from src.review.diff import build_diff_from_changes, normalize_change_diff, truncate_diff
     from src.review.gitlab import (
+        enrich_changes_with_file_info,
         get_compare_changes,
         get_mr_changes,
         get_mr_changes_with_refs,
         get_mr_diff,
         post_mr_comment,
+        post_mr_file_comment,
         post_mr_inline_comment,
         require_gitlab_config,
     )
@@ -85,11 +87,13 @@ def _load_review_dependencies() -> dict:
         "build_diff_from_changes": build_diff_from_changes,
         "normalize_change_diff": normalize_change_diff,
         "truncate_diff": truncate_diff,
+        "enrich_changes_with_file_info": enrich_changes_with_file_info,
         "get_mr_changes": get_mr_changes,
         "get_mr_changes_with_refs": get_mr_changes_with_refs,
         "get_compare_changes": get_compare_changes,
         "get_mr_diff": get_mr_diff,
         "post_mr_comment": post_mr_comment,
+        "post_mr_file_comment": post_mr_file_comment,
         "post_mr_inline_comment": post_mr_inline_comment,
         "require_gitlab_config": require_gitlab_config,
         "_parse_selected_skill": _parse_selected_skill,
@@ -105,6 +109,7 @@ def _load_review_dependencies() -> dict:
 globals().update(_load_review_dependencies())
 
 # 兼容旧私有函数名（供历史调用/测试）
+# 旧测试/历史调用可能仍引用该私有别名，保留以避免破坏兼容性。
 _normalize_review_mode = normalize_review_mode
 _normalize_review_skill = normalize_review_skill
 _normalize_change_diff = normalize_change_diff
@@ -249,6 +254,63 @@ def _post_inline_comment_with_offset(
     raise ReviewError("Inline comment 发布失败（未知错误）")
 
 
+def _build_inline_fallback_comments_by_file(failed_notes: list) -> list:
+    """将行内评论失败的问题按文件拆分为多条 MR 普通评论内容。"""
+    if not failed_notes:
+        return []
+
+    grouped_notes = {}
+    ordered_files = []
+    for item in failed_notes:
+        file_path = str(item.get("file_path") or "unknown")
+        if file_path not in grouped_notes:
+            grouped_notes[file_path] = []
+            ordered_files.append(file_path)
+        grouped_notes[file_path].append(
+            {
+                "line": int(item.get("line") or 0),
+                "body": str(item.get("body") or "").strip(),
+            }
+        )
+
+    comments = []
+    for file_path in ordered_files:
+        lines = [
+            f"### 文件级降级评论｜`{file_path}`",
+            "",
+            "> 行内评论发布失败，以下问题已降级为普通评论展示。",
+            "",
+        ]
+        for note in grouped_notes[file_path]:
+            line = note["line"]
+            body = note["body"]
+            location = f"{file_path}:{line}" if line > 0 else file_path
+            lines.append(f"- **位置**: `{location}`")
+            if body:
+                lines.append(body)
+            lines.append("")
+        comments.append("\n".join(lines).strip())
+
+    return comments
+
+
+def _is_binary_or_non_text_change(change: dict) -> bool:
+    """
+    判断文件变更是否缺少可定位的文本 diff（通常为二进制/非文本文件）。
+    这类文件不应尝试发布行内评论，应直接降级为文件级评论。
+    """
+    normalized_diff = normalize_change_diff(change or {})
+    if not normalized_diff.strip():
+        return True
+
+    diff_lower = normalized_diff.lower()
+    if "binary files" in diff_lower and "differ" in diff_lower:
+        return True
+    if "binary or non-text file changed" in diff_lower:
+        return True
+    return False
+
+
 def process_review_async(
     project_id,
     mr_iid,
@@ -265,6 +327,7 @@ def process_review_async(
         logger.info(f"[Async] Fetching changes for MR !{mr_iid}")
         all_changes, diff_refs = get_mr_changes_with_refs(project_id, mr_iid)
         changes_for_review = all_changes
+        file_info_ref = str(diff_refs.get("head_sha", "") or "").strip()
 
         normalized_mode = normalize_review_mode(review_mode)
         if (
@@ -284,6 +347,7 @@ def process_review_async(
                 )
                 return
             changes_for_review = get_compare_changes(project_id, update_from_sha, target_to_sha)
+            file_info_ref = target_to_sha
             incremental_paths = []
             seen_paths = set()
             for change in changes_for_review:
@@ -319,6 +383,19 @@ def process_review_async(
             logger.info("[Async] No changes to review for MR !%s, skip", mr_iid)
             return
 
+        changes_for_review = enrich_changes_with_file_info(
+            project_id=project_id,
+            changes=changes_for_review,
+            ref=file_info_ref,
+        )
+        size_known_count = sum(1 for c in changes_for_review if c.get("file_size_bytes") is not None)
+        logger.info(
+            "[Async] File metadata attached: total=%s, size_known=%s, ref=%s",
+            len(changes_for_review),
+            size_known_count,
+            file_info_ref[:8] if file_info_ref else "<empty>",
+        )
+
         logger.info(f"[Async] Review mode={review_mode}, skill={review_skill}")
         review_result, inline_notes = review_changes_with_inline_notes(
             changes_for_review,
@@ -339,16 +416,54 @@ def process_review_async(
 
         inline_ok = 0
         inline_fail = 0
+        failed_inline_notes = []
         for note in inline_notes:
             file_path = str(note.get("file_path", "")).strip()
             line = int(note.get("line", 0))
             body = str(note.get("body", "")).strip()
-            if not file_path or line <= 0 or not body:
+            if not file_path or not body:
                 continue
 
             change = path_to_change.get(file_path, {})
             new_path = change.get("new_path") or file_path
             old_path = change.get("old_path") or new_path
+
+            # 二进制/非文本文件，或未提供有效行号的问题，优先尝试文件级 discussion。
+            # 若平台不支持 position_type=file，再降级为 MR 普通评论。
+            if line <= 0 or _is_binary_or_non_text_change(change):
+                try:
+                    post_mr_file_comment(
+                        project_id=project_id,
+                        mr_iid=mr_iid,
+                        content=body,
+                        new_path=new_path,
+                        old_path=old_path,
+                        diff_refs=diff_refs,
+                    )
+                    inline_ok += 1
+                    logger.info(
+                        "[Async] Posted file-level discussion on MR !%s: %s (line=%s)",
+                        mr_iid,
+                        new_path,
+                        line,
+                    )
+                except Exception as e:
+                    inline_fail += 1
+                    failed_inline_notes.append(
+                        {
+                            "file_path": new_path,
+                            "line": 0,
+                            "body": body,
+                        }
+                    )
+                    logger.warning(
+                        "[Async] File-level discussion unavailable for MR !%s at %s (line=%s), fallback to MR note: %s",
+                        mr_iid,
+                        new_path,
+                        line,
+                        e,
+                    )
+                continue
 
             try:
                 _post_inline_comment_with_offset(
@@ -364,6 +479,13 @@ def process_review_async(
                 inline_ok += 1
             except Exception as e:
                 inline_fail += 1
+                failed_inline_notes.append(
+                    {
+                        "file_path": new_path,
+                        "line": line,
+                        "body": body,
+                    }
+                )
                 logger.warning(
                     "Inline comment failed for MR !%s at %s (source_line=%s): %s",
                     mr_iid,
@@ -378,8 +500,22 @@ def process_review_async(
             inline_fail,
             len(inline_notes),
         )
-        if normalized_mode in {REVIEW_MODE_OVERALL, REVIEW_MODE_HYBRID} and review_result.strip():
-            post_mr_comment(project_id, mr_iid, review_result)
+        fallback_comments = _build_inline_fallback_comments_by_file(failed_inline_notes)
+        if fallback_comments:
+            logger.info(
+                "[Async] Inline fallback grouped by file: files=%s, comments=%s",
+                len({str(n.get('file_path') or 'unknown') for n in failed_inline_notes}),
+                len(fallback_comments),
+            )
+
+        if normalized_mode in {REVIEW_MODE_OVERALL, REVIEW_MODE_HYBRID}:
+            if review_result.strip():
+                post_mr_comment(project_id, mr_iid, review_result.strip())
+            for fallback_comment in fallback_comments:
+                post_mr_comment(project_id, mr_iid, fallback_comment)
+        elif normalized_mode == REVIEW_MODE_FILE and fallback_comments:
+            for fallback_comment in fallback_comments:
+                post_mr_comment(project_id, mr_iid, fallback_comment)
         else:
             logger.info(
                 "[Async] Skip MR summary comment: mr_iid=%s, mode=%s, inline_success=%s",
@@ -528,6 +664,19 @@ def manual_review():
         )
 
         changes, diff_refs = get_mr_changes_with_refs(project_id, mr_iid)
+        file_info_ref = str(diff_refs.get("head_sha", "") or "").strip()
+        changes = enrich_changes_with_file_info(
+            project_id=project_id,
+            changes=changes,
+            ref=file_info_ref,
+        )
+        size_known_count = sum(1 for c in changes if c.get("file_size_bytes") is not None)
+        logger.info(
+            "Manual file metadata attached: total=%s, size_known=%s, ref=%s",
+            len(changes),
+            size_known_count,
+            file_info_ref[:8] if file_info_ref else "<empty>",
+        )
         review_result, inline_notes = review_changes_with_inline_notes(
             changes,
             review_mode=review_mode,
@@ -547,16 +696,54 @@ def manual_review():
 
         inline_ok = 0
         inline_fail = 0
+        failed_inline_notes = []
         for note in inline_notes:
             file_path = str(note.get("file_path", "")).strip()
             line = int(note.get("line", 0))
             body = str(note.get("body", "")).strip()
-            if not file_path or line <= 0 or not body:
+            if not file_path or not body:
                 continue
 
             change = path_to_change.get(file_path, {})
             new_path = change.get("new_path") or file_path
             old_path = change.get("old_path") or new_path
+
+            # 二进制/非文本文件，或未提供有效行号的问题，优先尝试文件级 discussion。
+            # 若平台不支持 position_type=file，再降级为 MR 普通评论。
+            if line <= 0 or _is_binary_or_non_text_change(change):
+                try:
+                    post_mr_file_comment(
+                        project_id=project_id,
+                        mr_iid=mr_iid,
+                        content=body,
+                        new_path=new_path,
+                        old_path=old_path,
+                        diff_refs=diff_refs,
+                    )
+                    inline_ok += 1
+                    logger.info(
+                        "Manual posted file-level discussion on MR !%s: %s (line=%s)",
+                        mr_iid,
+                        new_path,
+                        line,
+                    )
+                except Exception as e:
+                    inline_fail += 1
+                    failed_inline_notes.append(
+                        {
+                            "file_path": new_path,
+                            "line": 0,
+                            "body": body,
+                        }
+                    )
+                    logger.warning(
+                        "Manual file-level discussion unavailable for MR !%s at %s (line=%s), fallback to MR note: %s",
+                        mr_iid,
+                        new_path,
+                        line,
+                        e,
+                    )
+                continue
             try:
                 _post_inline_comment_with_offset(
                     project_id=project_id,
@@ -571,6 +758,13 @@ def manual_review():
                 inline_ok += 1
             except Exception as e:
                 inline_fail += 1
+                failed_inline_notes.append(
+                    {
+                        "file_path": new_path,
+                        "line": line,
+                        "body": body,
+                    }
+                )
                 logger.warning(
                     "Manual inline comment failed for MR !%s at %s (source_line=%s): %s",
                     mr_iid,
@@ -586,8 +780,21 @@ def manual_review():
             len(inline_notes),
         )
         normalized_mode = normalize_review_mode(review_mode)
-        if normalized_mode in {REVIEW_MODE_OVERALL, REVIEW_MODE_HYBRID} and review_result.strip():
-            post_mr_comment(project_id, mr_iid, review_result)
+        fallback_comments = _build_inline_fallback_comments_by_file(failed_inline_notes)
+        if fallback_comments:
+            logger.info(
+                "Manual inline fallback grouped by file: files=%s, comments=%s",
+                len({str(n.get('file_path') or 'unknown') for n in failed_inline_notes}),
+                len(fallback_comments),
+            )
+        if normalized_mode in {REVIEW_MODE_OVERALL, REVIEW_MODE_HYBRID}:
+            if review_result.strip():
+                post_mr_comment(project_id, mr_iid, review_result.strip())
+            for fallback_comment in fallback_comments:
+                post_mr_comment(project_id, mr_iid, fallback_comment)
+        elif normalized_mode == REVIEW_MODE_FILE and fallback_comments:
+            for fallback_comment in fallback_comments:
+                post_mr_comment(project_id, mr_iid, fallback_comment)
         else:
             logger.info(
                 "Manual review skip MR summary comment: mr_iid=%s, mode=%s, inline_success=%s",

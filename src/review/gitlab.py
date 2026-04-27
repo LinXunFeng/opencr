@@ -5,7 +5,8 @@ GitLab API 交互
 
 import logging
 from datetime import datetime
-from typing import List
+from typing import List, Optional
+from urllib.parse import quote
 
 from .common import ReviewError
 from .config import load_gitlab_config, load_openai_config
@@ -96,6 +97,82 @@ def get_compare_changes(project_id: int, from_sha: str, to_sha: str) -> List[dic
     except Exception as e:
         logger.error("Failed to fetch compare changes from %s to %s: %s", from_sha, to_sha, e)
         raise ReviewError(f"获取提交区间 diff 失败: {str(e)}")
+
+
+def get_repository_file_info(project_id: int, file_path: str, ref: str) -> dict:
+    """读取仓库文件信息（包含 size）。"""
+    cfg = require_gitlab_config()
+    gitlab_url = cfg["url"]
+    token = cfg["token"]
+
+    encoded_path = quote((file_path or "").strip(), safe="")
+    url = f"{gitlab_url}/api/v4/projects/{project_id}/repository/files/{encoded_path}"
+    headers = {
+        "PRIVATE-TOKEN": token,
+        "Content-Type": "application/json",
+    }
+    params = {"ref": ref}
+
+    import requests
+    import urllib3
+
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    response = requests.get(url, headers=headers, params=params, timeout=30, verify=False)
+    response.raise_for_status()
+    return response.json() or {}
+
+
+def _parse_file_size_bytes(file_info: dict) -> Optional[int]:
+    """从文件详情响应中解析 size 字段，失败时返回 None。"""
+    size_raw = (file_info or {}).get("size")
+    try:
+        return int(size_raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def enrich_changes_with_file_info(
+    project_id: int,
+    changes: List[dict],
+    ref: str,
+) -> List[dict]:
+    """
+    为变更补充文件元信息，供 AI/skill 决策使用。
+    补充字段：
+    - file_size_bytes: Optional[int]
+    - file_size_kb: Optional[float]
+    """
+    safe_ref = (ref or "").strip()
+    cache: dict = {}
+    enriched: List[dict] = []
+
+    for change in changes or []:
+        item = dict(change or {})
+        path = str(item.get("new_path") or item.get("old_path") or "").strip()
+        deleted = bool(item.get("deleted_file"))
+        item["file_size_bytes"] = None
+        item["file_size_kb"] = None
+
+        if not path or deleted or not safe_ref:
+            enriched.append(item)
+            continue
+
+        if path not in cache:
+            try:
+                file_info = get_repository_file_info(project_id, path, safe_ref)
+                cache[path] = _parse_file_size_bytes(file_info)
+            except Exception as e:
+                logger.warning("Skip file size lookup for %s: %s", path, e)
+                cache[path] = None
+
+        size_bytes = cache[path]
+        if size_bytes is not None:
+            item["file_size_bytes"] = size_bytes
+            item["file_size_kb"] = round(size_bytes / 1024.0, 1)
+
+        enriched.append(item)
+
+    return enriched
 
 
 def get_mr_diff(project_id: int, mr_iid: int) -> str:
@@ -191,3 +268,53 @@ def post_mr_inline_comment(
     except Exception as e:
         logger.error("Failed to post inline comment: %s", e)
         raise ReviewError(f"发布行内评论失败: {str(e)}")
+
+
+def post_mr_file_comment(
+    project_id: int,
+    mr_iid: int,
+    content: str,
+    new_path: str,
+    diff_refs: dict,
+    old_path: str = "",
+) -> None:
+    """在 MR 文件级位置发表评论（discussion，position_type=file）。"""
+    cfg = require_gitlab_config()
+    gitlab_url = cfg["url"]
+    token = cfg["token"]
+
+    base_sha = diff_refs.get("base_sha", "")
+    start_sha = diff_refs.get("start_sha", "")
+    head_sha = diff_refs.get("head_sha", "")
+    if not (base_sha and start_sha and head_sha):
+        raise ReviewError("缺少 diff_refs，无法发布文件级评论")
+
+    url = f"{gitlab_url}/api/v4/projects/{project_id}/merge_requests/{mr_iid}/discussions"
+    headers = {
+        "PRIVATE-TOKEN": token,
+        "Content-Type": "application/json",
+    }
+
+    payload = {
+        "body": content,
+        "position": {
+            "position_type": "file",
+            "base_sha": base_sha,
+            "start_sha": start_sha,
+            "head_sha": head_sha,
+            "new_path": new_path,
+            "old_path": old_path or new_path,
+        },
+    }
+
+    try:
+        import requests
+        import urllib3
+
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        response = requests.post(url, headers=headers, json=payload, timeout=30, verify=False)
+        response.raise_for_status()
+        logger.info("Posted file-level comment to MR !%s at %s", mr_iid, new_path)
+    except Exception as e:
+        logger.error("Failed to post file-level comment: %s", e)
+        raise ReviewError(f"发布文件级评论失败: {str(e)}")

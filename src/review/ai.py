@@ -6,7 +6,7 @@ AI 审查调用与聚合
 import json
 import logging
 import re
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import openai
 
@@ -28,6 +28,7 @@ def build_review_prompt(
     diff: str,
     review_mode: str = REVIEW_MODE_OVERALL,
     file_path: str = "",
+    file_metadata: str = "",
     skill_prompt: str = "",
     skill_name: str = "",
 ) -> str:
@@ -35,6 +36,15 @@ def build_review_prompt(
     normalized_mode = normalize_review_mode(review_mode)
     mode_text = "按文件审查" if normalized_mode == REVIEW_MODE_FILE else "整 MR 审查"
     file_context = f"- 当前文件：`{file_path}`\n" if file_path else ""
+    metadata_block = ""
+    if (file_metadata or "").strip():
+        metadata_block = f"""
+## 文件元信息（由程序采集）
+
+```json
+{file_metadata}
+```
+"""
     use_skill_rules = bool(skill_prompt.strip())
 
     if use_skill_rules:
@@ -75,6 +85,7 @@ def build_review_prompt(
 
 - 当前审核模式：{mode_text}
 {file_context}
+{metadata_block}
 
 {review_rules_block}
 
@@ -109,6 +120,7 @@ def call_codex_review(
     diff: str,
     review_mode: str = REVIEW_MODE_OVERALL,
     file_path: str = "",
+    file_metadata: str = "",
     skill_prompt: str = "",
     skill_name: str = "",
 ) -> str:
@@ -134,6 +146,7 @@ def call_codex_review(
                 diff,
                 review_mode=review_mode,
                 file_path=file_path,
+                file_metadata=file_metadata,
                 skill_prompt=skill_prompt,
                 skill_name=skill_name,
             ),
@@ -180,7 +193,7 @@ def call_codex_review(
 def _parse_file_review_issues(review_text: str, default_file_path: str) -> List[Dict[str, object]]:
     """
     从单文件审查文本中提取问题块，输出结构化行内评论候选。
-    仅提取能识别到行号的问题。
+    优先提取带行号的问题；若只给出文件位置，则返回 line=0 的文件级问题。
     """
     if not review_text or "问题" not in review_text:
         return []
@@ -221,13 +234,21 @@ def _parse_file_review_issues(review_text: str, default_file_path: str) -> List[
         else:
             # 若未显式给出文件名，则退回当前文件并尝试抓行号
             line_match = re.search(r"位置\*\*\s*:\s*[^\n]*?L?(\d+)", block, flags=re.IGNORECASE)
-            if not line_match:
-                continue
-            file_path = default_file_path
-            line = int(line_match.group(1))
+            if line_match:
+                file_path = default_file_path
+                line = int(line_match.group(1))
+            else:
+                # 兼容文件级位置：`- **位置**: assets/images/a.png`
+                file_match = re.search(
+                    r"位置\*\*\s*:\s*`?([^\n:`]+(?:/[^\n:`]+)*)`?",
+                    block,
+                    flags=re.IGNORECASE,
+                )
+                file_path = (file_match.group(1).strip() if file_match else default_file_path) or default_file_path
+                line = 0
 
-        if line <= 0:
-            continue
+        if line < 0:
+            line = 0
 
         findings.append(
             {
@@ -238,6 +259,110 @@ def _parse_file_review_issues(review_text: str, default_file_path: str) -> List[
         )
 
     return findings
+
+
+def _resolve_change_type(change: dict) -> str:
+    """将 GitLab change 标记归一化为可读类型。"""
+    if bool(change.get("deleted_file")):
+        return "deleted"
+    if bool(change.get("new_file")):
+        return "new"
+    if bool(change.get("renamed_file")):
+        return "renamed"
+    return "modified"
+
+
+def _coerce_size_bytes(value: object) -> Optional[int]:
+    """将任意 size 值安全转换为字节数，失败时返回 None。"""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _build_change_metadata_payload(change: dict) -> Dict[str, object]:
+    """构造单个文件的结构化元信息，供 prompt 传递给 skill。"""
+    path = str(change.get("new_path") or change.get("old_path") or "unknown")
+    size_bytes = _coerce_size_bytes(change.get("file_size_bytes"))
+    size_kb = None
+    if size_bytes is not None:
+        size_kb = round(size_bytes / 1024.0, 1)
+    return {
+        "path": path,
+        "change_type": _resolve_change_type(change),
+        "file_size_bytes": size_bytes,
+        "file_size_kb": size_kb,
+    }
+
+
+def _build_overall_file_metadata(changes: List[dict], max_items: int = 300) -> str:
+    """构造 MR 级文件元信息 JSON（最多截断到 max_items）。"""
+    payload = [_build_change_metadata_payload(change) for change in (changes or [])[: max(max_items, 1)]]
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def _build_single_file_metadata(change: dict) -> str:
+    """构造单文件审查场景下的元信息 JSON。"""
+    payload = _build_change_metadata_payload(change or {})
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def _build_file_review_diff(change: dict, file_path: str) -> str:
+    """
+    为文件级审查构造输入 diff。
+    文本 diff 为空时，回退为非文本变更占位内容，避免文件被直接跳过。
+    """
+    normalized_diff = normalize_change_diff(change)
+    if normalized_diff:
+        return normalized_diff
+
+    safe_path = file_path or "unknown"
+    return (
+        f"diff --git a/{safe_path} b/{safe_path}\n"
+        "Binary or non-text file changed (no textual diff available)\n"
+    )
+
+
+def _is_explicit_pass_result(result_text: str) -> bool:
+    """
+    判断模型输出是否为“明确通过”结论。
+    只要包含通过语义，且不含整改/风险信号，就视为通过。
+    避免“未发现问题但建议压缩”这类矛盾输出被错误吞掉。
+    """
+    normalized = " ".join(str(result_text or "").split())
+    if not normalized:
+        return False
+
+    pass_phrases = [
+        "✅ 代码审查通过",
+        "代码审查通过",
+        "未发现明显问题",
+        "未发现问题",
+        "无明显问题",
+        "未发现明显风险",
+        "本次未发现高置信度问题",
+    ]
+    if not any(phrase in normalized for phrase in pass_phrases):
+        return False
+
+    issue_markers = [
+        "建议",
+        "修复",
+        "压缩",
+        "超过",
+        "超出",
+        "严重",
+        "警告",
+        "🔴",
+        "🟡",
+        "级别",
+        "位置",
+        "描述",
+    ]
+    if any(marker in normalized for marker in issue_markers):
+        return False
+
+    return True
 
 
 def review_changes_with_inline_notes(
@@ -262,7 +387,6 @@ def review_changes_with_inline_notes(
 
     run_overall = normalized_mode in {REVIEW_MODE_OVERALL, REVIEW_MODE_HYBRID}
     run_file = normalized_mode in {REVIEW_MODE_FILE, REVIEW_MODE_HYBRID}
-
     if run_overall:
         overall_skills = auto_select_review_skills(
             changes,
@@ -295,6 +419,7 @@ def review_changes_with_inline_notes(
                 overall_result = call_codex_review(
                     truncated,
                     review_mode=REVIEW_MODE_OVERALL,
+                    file_metadata=_build_overall_file_metadata(changes),
                     skill_prompt=overall_skill_prompt,
                     skill_name=",".join(overall_skills),
                 )
@@ -309,12 +434,9 @@ def review_changes_with_inline_notes(
         file_hit = 0
         file_miss = 0
         for index, change in enumerate(changes, start=1):
-            normalized_diff = normalize_change_diff(change)
-            if not normalized_diff:
-                continue
-
-            file_total += 1
             file_path = change.get("new_path") or change.get("old_path") or f"file-{index}"
+            review_diff = _build_file_review_diff(change, file_path=file_path)
+            file_total += 1
             file_skills = auto_select_review_skills(
                 [change],
                 fallback_skill=review_skill,
@@ -337,11 +459,12 @@ def review_changes_with_inline_notes(
                 continue
             reviewed_files += 1
             file_hit += 1
-            truncated = truncate_diff(normalized_diff, max_chars=max_diff_size)
+            truncated = truncate_diff(review_diff, max_chars=max_diff_size)
             result = call_codex_review(
                 truncated,
                 review_mode=REVIEW_MODE_FILE,
                 file_path=file_path,
+                file_metadata=_build_single_file_metadata(change),
                 skill_prompt=file_skill_prompt,
                 skill_name=",".join(file_skills),
             )
@@ -352,7 +475,30 @@ def review_changes_with_inline_notes(
                 ",".join(file_skills),
             )
 
-            inline_notes.extend(_parse_file_review_issues(result, default_file_path=file_path))
+            parsed_issues = _parse_file_review_issues(result, default_file_path=file_path)
+            if parsed_issues:
+                inline_notes.extend(parsed_issues)
+            else:
+                result_text = str(result or "").strip()
+                is_explicit_pass = _is_explicit_pass_result(result_text)
+                if result_text and not is_explicit_pass:
+                    # 模型未按结构化格式输出时，保底作为文件级问题，避免整次无评论。
+                    inline_notes.append(
+                        {
+                            "file_path": file_path,
+                            "line": 0,
+                            "body": result_text,
+                        }
+                    )
+                    logger.info(
+                        "Review execution FILE fallback: unstructured issue captured as file-level note, file=%s",
+                        file_path,
+                    )
+                elif result_text:
+                    logger.info(
+                        "Review execution FILE skipped: explicit pass text detected, file=%s",
+                        file_path,
+                    )
 
         if reviewed_files:
             logger.info(
