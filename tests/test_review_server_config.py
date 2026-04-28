@@ -954,6 +954,7 @@ code_platform:
             "object_attributes": {
                 "action": "update",
                 "oldrev": "a" * 40,
+                "state": "opened",
                 "title": "feat: add api",
                 "source_branch": "feature/api",
             }
@@ -962,6 +963,55 @@ code_platform:
         self.assertTrue(should_review)
         self.assertIn("新提交", reason)
         self.assertEqual(mode, "file")
+
+    def test_should_review_mr_update_merge_commit_is_skipped(self):
+        payload = {
+            "object_attributes": {
+                "action": "update",
+                "oldrev": "a" * 40,
+                "state": "opened",
+                "title": "feat: add api",
+                "source_branch": "feature/api",
+                "last_commit": {
+                    "id": "b" * 40,
+                    "message": "Merge branch 'master' into 'feature/api'",
+                },
+            }
+        }
+        should_review, reason, mode = review_server.should_review_mr(payload)
+        self.assertFalse(should_review)
+        self.assertIn("merge commit", reason)
+        self.assertEqual(mode, "")
+
+    def test_should_review_mr_update_closed_is_skipped(self):
+        payload = {
+            "object_attributes": {
+                "action": "update",
+                "oldrev": "a" * 40,
+                "state": "closed",
+                "title": "feat: add api",
+                "source_branch": "feature/api",
+            }
+        }
+        should_review, reason, mode = review_server.should_review_mr(payload)
+        self.assertFalse(should_review)
+        self.assertIn("state=closed", reason)
+        self.assertEqual(mode, "")
+
+    def test_should_review_mr_update_merged_is_skipped(self):
+        payload = {
+            "object_attributes": {
+                "action": "update",
+                "oldrev": "a" * 40,
+                "state": "merged",
+                "title": "feat: add api",
+                "source_branch": "feature/api",
+            }
+        }
+        should_review, reason, mode = review_server.should_review_mr(payload)
+        self.assertFalse(should_review)
+        self.assertIn("state=merged", reason)
+        self.assertEqual(mode, "")
 
     def test_should_review_mr_reopen_is_skipped(self):
         payload = {

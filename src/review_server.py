@@ -144,9 +144,26 @@ def validate_webhook_token(f):
     return decorated
 
 
+def _is_merge_commit_update(attrs: dict) -> bool:
+    """判断 MR update 是否由 merge commit 引起。"""
+    last_commit = attrs.get("last_commit")
+    if not isinstance(last_commit, dict):
+        return False
+
+    message = str(last_commit.get("message") or last_commit.get("title") or "").strip().lower()
+    if not message:
+        return False
+
+    return bool(re.match(r"^merge (branch|remote-tracking branch|commit|pull request)\b", message))
+
+
 def should_review_mr(data: dict) -> tuple:
     """判断是否应该审查此 MR，并返回建议审查模式。"""
     attrs = data.get("object_attributes", {})
+
+    state = (attrs.get("state") or "").strip().lower()
+    if state and state != "opened":
+        return False, f"忽略 state={state} 的 MR（仅处理 opened）", ""
 
     action = (attrs.get("action") or "").strip().lower()
     if action == "open":
@@ -159,6 +176,8 @@ def should_review_mr(data: dict) -> tuple:
         is_commit_update = bool(re.fullmatch(r"[0-9a-f]{40}", oldrev) and oldrev != ("0" * 40))
         if not is_commit_update:
             return False, f"忽略 action=update（非新提交触发）", ""
+        if _is_merge_commit_update(attrs):
+            return False, "忽略 merge commit 导致的 MR 更新", ""
         target_mode = REVIEW_MODE_FILE
         action_reason = f"检测到 MR 新提交 oldrev={oldrev[:8]}，触发文件级审查"
     else:
