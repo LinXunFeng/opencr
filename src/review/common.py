@@ -8,7 +8,7 @@ import re
 REVIEW_MODE_OVERALL = "overall"
 REVIEW_MODE_FILE = "file"
 REVIEW_MODE_HYBRID = "hybrid"
-DEFAULT_REVIEW_SKILLS_DIR = "skills/review"
+DEFAULT_REVIEW_SKILLS_DIR = "skills"
 
 
 class ReviewError(Exception):

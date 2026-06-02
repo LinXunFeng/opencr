@@ -61,6 +61,7 @@ def _load_review_dependencies() -> dict:
         auto_select_review_skill,
         auto_select_review_skills,
         load_available_review_skills,
+        load_review_skill_previews,
         load_review_skill_prompt,
         load_review_skill_prompts,
         resolve_review_options,
@@ -100,6 +101,7 @@ def _load_review_dependencies() -> dict:
         "auto_select_review_skill": auto_select_review_skill,
         "auto_select_review_skills": auto_select_review_skills,
         "load_available_review_skills": load_available_review_skills,
+        "load_review_skill_previews": load_review_skill_previews,
         "load_review_skill_prompt": load_review_skill_prompt,
         "load_review_skill_prompts": load_review_skill_prompts,
         "resolve_review_options": resolve_review_options,
@@ -842,12 +844,12 @@ if __name__ == "__main__":
     app_version = get_app_version()
 
     host = os.getenv("REVIEW_SERVER_HOST") or _pick_config_value(config_data, "server.host", "REVIEW_SERVER_HOST") or "0.0.0.0"
-    port_value = os.getenv("REVIEW_SERVER_PORT") or _pick_config_value(config_data, "server.port", "REVIEW_SERVER_PORT") or "5000"
+    port_value = os.getenv("REVIEW_SERVER_PORT") or _pick_config_value(config_data, "server.port", "REVIEW_SERVER_PORT") or "9034"
     try:
         port = int(port_value)
     except ValueError:
-        logger.warning(f"Invalid REVIEW_SERVER_PORT={port_value}, fallback to 5000")
-        port = 5000
+        logger.warning(f"Invalid REVIEW_SERVER_PORT={port_value}, fallback to 9034")
+        port = 9034
 
     cfg = load_openai_config()
     logger.info(f"Starting OpenCR v{app_version} on {host}:{port}")

@@ -50,7 +50,7 @@ opencr/
 ├── README.md               # 英文文档
 ├── README-zh.md            # 本文档（中文）
 ├── skills/                 # 审查技能目录
-│   └── review/             # skill 文档（general/flutter/ts...）
+│   └── review/             # skill bundle（name/SKILL.md、references、scripts、assets）
 ├── src/                    # 源代码（已实现）
 │   ├── __init__.py
 │   ├── review_server.py    # Flask 主服务
@@ -129,8 +129,11 @@ mkdir -p ~/opencr && cd ~/opencr
 python3 -m venv venv
 source venv/bin/activate
 
+# 复制依赖清单
+cp /path/to/opencr/requirements.txt ./
+
 # 安装依赖
-pip install openai flask gunicorn python-dotenv requests
+pip install -r requirements.txt
 
 # 复制源码
 cp -r /path/to/opencr/src ./
@@ -156,13 +159,15 @@ code_platform:
 
 server:
   host: "0.0.0.0"
-  port: 5000
+  port: 9034
   log_level: "INFO"
 
 review:
   max_diff_size: 50000
   timeout: 180
-  skills_dir: "skills/review"
+  skills_dir: "skills"
+  skill_scripts_enabled: true
+  skill_scripts_timeout: 10
 ```
 
 #### 4. 启动服务
@@ -173,7 +178,7 @@ source venv/bin/activate
 cd src && python3 review_server.py
 
 # 或使用 Gunicorn
-gunicorn --bind 0.0.0.0:5000 --chdir src "review_server:app"
+gunicorn --bind 0.0.0.0:9034 --chdir src "review_server:app"
 ```
 
 ---
@@ -194,7 +199,7 @@ gunicorn --bind 0.0.0.0:5000 --chdir src "review_server:app"
 
 | 配置项 | 值 |
 |--------|-----|
-| URL | `http://你的MacIP:5000/webhook` |
+| URL | `http://你的MacIP:9034/webhook` |
 | Secret Token | 可选，若填写需与 `GITLAB_WEBHOOK_SECRET` 一致 |
 | Trigger | 勾选 **Merge request events** |
 | SSL Verification | 如果是内网 HTTP，取消勾选 |
@@ -234,10 +239,10 @@ tail -f ~/opencr/logs/launchd.err.log
 
 # 手动测试
 # 健康检查
-curl http://localhost:5000/health
+curl http://localhost:9034/health
 
 # 手动触发审查
-curl -X POST http://localhost:5000/manual-review \
+curl -X POST http://localhost:9034/manual-review \
   -H "Content-Type: application/json" \
   -d '{"project_id": 123, "mr_iid": 456, "review_mode": "file"}'
 ```
@@ -288,7 +293,7 @@ MR 事件与审查模式映射：
 - 审查策略由 webhook 事件与手动接口共同决定
 - 审查模式由 MR 事件（`open/update`）或手动接口 `review_mode` 控制
 - skill 由 AI 自动选择，依据：
-  - `skills/review/*.md` 的描述
+  - `skills/<name>/SKILL.md` 元信息，或兼容旧版 `skills/<name>.md` 描述
   - 本次变更的文件路径与 diff 内容
 - 若无命中 skill，则对应审查分支会被跳过
 
@@ -305,7 +310,7 @@ MR 事件与审查模式映射：
 tail -f ~/opencr/logs/launchd.err.log
 
 # 检查端口占用
-lsof -i :5000
+lsof -i :9034
 
 # 手动启动查看错误
 cd ~/opencr && ./start-dev.sh
@@ -332,10 +337,10 @@ curl -H "Authorization: Bearer sk-your-key" \
 
 ```bash
 # 检查服务是否监听
-netstat -an | grep 5000
+netstat -an | grep 9034
 
 # 从其他机器测试
-curl http://你的MacIP:5000/health
+curl http://你的MacIP:9034/health
 
 # 检查防火墙
 sudo /usr/libexec/ApplicationFirewall/socketfilterfw --list
@@ -349,6 +354,7 @@ sudo /usr/libexec/ApplicationFirewall/socketfilterfw --list
 review:
   timeout: 300
   max_diff_size: 30000
+  skill_scripts_timeout: 10
 ```
 
 然后重启服务。
@@ -405,17 +411,23 @@ Gunicorn 生产环境入口文件。
 
 ### 自定义审查 Skill
 
-将提示词文件放到 `skills/review` 目录。
-服务会根据 skill 描述与代码变更自动选择一个或多个命中 skill。
+将标准 skill bundle 放到 `skills` 目录。
+每个 bundle 以 `SKILL.md` 为入口，也可以包含 `references/`、`scripts/`、`assets/`。
+服务会根据 skill 元信息与代码变更自动选择一个或多个命中 skill。
+`scripts/` 下的可执行文件会通过 stdin 收到 JSON 审查上下文，并可输出补充上下文给模型。
 若未命中 skill，该审查分支会直接跳过。
 
 示例：
 
 ```text
-skills/review/flutter.md
-skills/review/ts.md
-skills/review/security.md
+skills/flutter/SKILL.md
+skills/flutter/references/lifecycle.md
+skills/asset/SKILL.md
+skills/asset/scripts/summarize_assets.py
+skills/security/SKILL.md
 ```
+
+旧版 `skills/<name>.md` 仍然兼容，但目录式 bundle 才能使用完整 skill 资源模型。
 
 ### 添加自定义过滤规则
 

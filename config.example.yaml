@@ -38,7 +38,7 @@ server:
   host: "0.0.0.0"
   # Bind port for the review server.
   # 服务监听端口。
-  port: 5000
+  port: 9034
   # Log verbosity level: DEBUG / INFO / WARNING / ERROR.
   # 日志级别：DEBUG / INFO / WARNING / ERROR。
   log_level: "INFO"
@@ -53,5 +53,11 @@ review:
   # 单次审查超时时间（秒）。
   timeout: 180
   # Directory containing review skill prompt files.
-  # 审查 skill 提示词目录。
-  skills_dir: "skills/review"
+  # 审查 skill 目录；支持 legacy *.md，也支持标准 name/SKILL.md bundle。
+  skills_dir: "skills"
+  # Whether executable scripts under a skill's scripts/ directory may add review context.
+  # 是否允许执行 skill/scripts/ 下的可执行脚本来补充审查上下文。
+  skill_scripts_enabled: true
+  # Timeout for each skill script, in seconds.
+  # 单个 skill script 的超时时间（秒）。
+  skill_scripts_timeout: 10

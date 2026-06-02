@@ -50,7 +50,7 @@ opencr/
 ├── README.md               # English documentation
 ├── README-zh.md            # Chinese documentation
 ├── skills/                 # Review skills
-│   └── review/             # Skill markdowns (general/flutter/ts...)
+│   └── review/             # Skill bundles (name/SKILL.md, references, scripts, assets)
 ├── src/                    # Source code
 │   ├── __init__.py
 │   ├── review_server.py    # Flask main service
@@ -129,8 +129,11 @@ mkdir -p ~/opencr && cd ~/opencr
 python3 -m venv venv
 source venv/bin/activate
 
+# Copy dependency manifest
+cp /path/to/opencr/requirements.txt ./
+
 # Install dependencies
-pip install openai flask gunicorn python-dotenv requests
+pip install -r requirements.txt
 
 # Copy source code
 cp -r /path/to/opencr/src ./
@@ -156,13 +159,15 @@ code_platform:
 
 server:
   host: "0.0.0.0"
-  port: 5000
+  port: 9034
   log_level: "INFO"
 
 review:
   max_diff_size: 50000
   timeout: 180
-  skills_dir: "skills/review"
+  skills_dir: "skills"
+  skill_scripts_enabled: true
+  skill_scripts_timeout: 10
 ```
 
 #### 4. Start Service
@@ -173,7 +178,7 @@ source venv/bin/activate
 cd src && python3 review_server.py
 
 # Or use Gunicorn
-gunicorn --bind 0.0.0.0:5000 --chdir src "review_server:app"
+gunicorn --bind 0.0.0.0:9034 --chdir src "review_server:app"
 ```
 
 ---
@@ -194,7 +199,7 @@ Go to Project -> Settings -> Webhooks:
 
 | Field | Value |
 |------|-------|
-| URL | `http://<YourMacIP>:5000/webhook` |
+| URL | `http://<YourMacIP>:9034/webhook` |
 | Secret Token | Optional. If set, it must match `GITLAB_WEBHOOK_SECRET` |
 | Trigger | Enable **Merge request events** |
 | SSL Verification | Disable only if using internal plain HTTP |
@@ -233,10 +238,10 @@ tail -f ~/opencr/logs/launchd.err.log
 ./quick-test.sh
 
 # Manual checks
-curl http://localhost:5000/health
+curl http://localhost:9034/health
 
 # Trigger manual review
-curl -X POST http://localhost:5000/manual-review \
+curl -X POST http://localhost:9034/manual-review \
   -H "Content-Type: application/json" \
   -d '{"project_id": 123, "mr_iid": 456, "review_mode": "file"}'
 ```
@@ -287,7 +292,7 @@ MR event to review mode mapping:
 Review strategy per MR is determined by webhook event and manual API:
 - Mode is controlled by MR event (`open/update`) or manual API `review_mode`
 - Skill is auto-selected by AI based on:
-  - `skills/review/*.md` descriptions
+  - `skills/<name>/SKILL.md` metadata, or legacy `skills/<name>.md` descriptions
   - changed file paths and diff content
 - If no skill matches, that review branch is skipped
 
@@ -304,7 +309,7 @@ Review strategy per MR is determined by webhook event and manual API:
 tail -f ~/opencr/logs/launchd.err.log
 
 # Check port usage
-lsof -i :5000
+lsof -i :9034
 
 # Start manually for debugging
 cd ~/opencr && ./start-dev.sh
@@ -331,10 +336,10 @@ curl -H "Authorization: Bearer sk-your-key" \
 
 ```bash
 # Check service listener
-netstat -an | grep 5000
+netstat -an | grep 9034
 
 # Test from another machine
-curl http://<YourMacIP>:5000/health
+curl http://<YourMacIP>:9034/health
 
 # Check macOS firewall
 sudo /usr/libexec/ApplicationFirewall/socketfilterfw --list
@@ -348,6 +353,7 @@ Edit `~/opencr/config.yaml`:
 review:
   timeout: 300
   max_diff_size: 30000
+  skill_scripts_timeout: 10
 ```
 
 Then restart the service.
@@ -404,17 +410,23 @@ Gunicorn production entry point.
 
 ### Customize Review Skills
 
-Place skill prompt files under `skills/review`.
-The service auto-selects one or more matching skills for each review based on skill descriptions and code changes.
+Place standard skill bundles under `skills`.
+Each bundle uses `SKILL.md` as the entry point and may include `references/`, `scripts/`, and `assets/`.
+The service auto-selects one or more matching skills for each review based on skill metadata and code changes.
+Executable files under `scripts/` receive review context as JSON on stdin and may print extra context for the model.
 If no skill matches, this review branch is skipped.
 
 Example:
 
 ```text
-skills/review/flutter.md
-skills/review/ts.md
-skills/review/security.md
+skills/flutter/SKILL.md
+skills/flutter/references/lifecycle.md
+skills/asset/SKILL.md
+skills/asset/scripts/summarize_assets.py
+skills/security/SKILL.md
 ```
+
+Legacy `skills/<name>.md` files are still supported, but bundle directories unlock the full skill resource model.
 
 ### Add Custom Skip Rules
 

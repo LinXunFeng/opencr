@@ -4,7 +4,10 @@ Skill 路由与提示词加载
 """
 
 import logging
+import json
+import os
 import re
+import subprocess
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -20,6 +23,21 @@ from .diff import normalize_change_diff
 
 logger = logging.getLogger(__name__)
 SKILL_PREVIEW_CHARS = 240
+REFERENCE_TEXT_EXTENSIONS = {
+    ".md",
+    ".markdown",
+    ".txt",
+    ".json",
+    ".yaml",
+    ".yml",
+    ".toml",
+    ".ini",
+    ".cfg",
+    ".csv",
+}
+MAX_REFERENCE_FILE_CHARS = 12000
+MAX_REFERENCES_TOTAL_CHARS = 40000
+MAX_SCRIPT_OUTPUT_CHARS = 20000
 
 
 def resolve_review_options(
@@ -56,6 +74,48 @@ def _resolve_skills_dir(skills_dir: str) -> Path:
     if cwd_path.exists():
         return cwd_path
     return project_root / configured_path
+
+
+def _resolve_skill_source(skill_name: str, skills_dir: str = "") -> Tuple[Optional[Path], Optional[Path]]:
+    """返回 (skill_file, bundle_dir)。兼容 legacy `name.md` 与标准 `name/SKILL.md`。"""
+    safe_skill_name = normalize_review_skill(skill_name)
+    if not safe_skill_name:
+        return None, None
+
+    review_cfg = load_review_config()
+    resolved_dir = _resolve_skills_dir(skills_dir or review_cfg["skills_dir"])
+    bundle_dir = resolved_dir / safe_skill_name
+    bundle_skill = bundle_dir / "SKILL.md"
+    if bundle_skill.exists() and bundle_skill.is_file():
+        return bundle_skill, bundle_dir
+
+    legacy_file = resolved_dir / f"{safe_skill_name}.md"
+    if legacy_file.exists() and legacy_file.is_file():
+        return legacy_file, None
+
+    return None, None
+
+
+def _iter_skill_sources(skills_dir: str = "") -> List[Tuple[str, Path, Optional[Path]]]:
+    """列出所有 skill source；标准 bundle 优先于同名 legacy markdown。"""
+    review_cfg = load_review_config()
+    resolved_dir = _resolve_skills_dir(skills_dir or review_cfg["skills_dir"])
+    if not resolved_dir.exists() or not resolved_dir.is_dir():
+        return []
+
+    sources: Dict[str, Tuple[Path, Optional[Path]]] = {}
+    for path in sorted(resolved_dir.glob("*.md")):
+        skill_name = normalize_review_skill(path.stem)
+        if skill_name:
+            sources[skill_name] = (path, None)
+
+    for skill_dir in sorted(p for p in resolved_dir.iterdir() if p.is_dir()):
+        skill_name = normalize_review_skill(skill_dir.name)
+        skill_file = skill_dir / "SKILL.md"
+        if skill_name and skill_file.exists() and skill_file.is_file():
+            sources[skill_name] = (skill_file, skill_dir)
+
+    return [(name, source[0], source[1]) for name, source in sorted(sources.items())]
 
 
 def _split_skill_meta_and_body(raw_text: str) -> Tuple[Dict[str, str], str]:
@@ -95,6 +155,11 @@ def _split_skill_meta_and_body(raw_text: str) -> Tuple[Dict[str, str], str]:
     return meta, body
 
 
+def _read_skill_file(skill_file: Path) -> Tuple[Dict[str, str], str]:
+    raw = skill_file.read_text(encoding="utf-8")
+    return _split_skill_meta_and_body(raw)
+
+
 def _build_preview_from_meta(meta: Dict[str, str], max_chars: int) -> str:
     """
     从 meta 字段构建路由预览文本。
@@ -117,32 +182,218 @@ def _build_preview_from_meta(meta: Dict[str, str], max_chars: int) -> str:
     return cleaned[:max_chars].strip()
 
 
+def _iter_files_under(directory: Path) -> List[Path]:
+    if not directory.exists() or not directory.is_dir():
+        return []
+    return sorted(path for path in directory.rglob("*") if path.is_file())
+
+
+def _build_references_block(bundle_dir: Optional[Path]) -> str:
+    if not bundle_dir:
+        return ""
+
+    references_dir = bundle_dir / "references"
+    parts: List[str] = []
+    total_chars = 0
+    for path in _iter_files_under(references_dir):
+        if path.suffix.lower() not in REFERENCE_TEXT_EXTENSIONS:
+            logger.info("Skill reference skipped (unsupported extension): %s", path)
+            continue
+        try:
+            content = path.read_text(encoding="utf-8").strip()
+        except UnicodeDecodeError:
+            logger.info("Skill reference skipped (non-utf8): %s", path)
+            continue
+        except Exception as e:
+            logger.warning("Failed to read skill reference %s: %s", path, e)
+            continue
+        if not content:
+            continue
+
+        remaining = MAX_REFERENCES_TOTAL_CHARS - total_chars
+        if remaining <= 0:
+            break
+        clipped = content[: min(MAX_REFERENCE_FILE_CHARS, remaining)]
+        total_chars += len(clipped)
+        rel_path = path.relative_to(bundle_dir).as_posix()
+        parts.append(f"### {rel_path}\n\n{clipped}")
+
+    if not parts:
+        return ""
+
+    return "## Skill References\n\n" + "\n\n".join(parts)
+
+
+def _build_assets_block(bundle_dir: Optional[Path]) -> str:
+    if not bundle_dir:
+        return ""
+
+    assets_dir = bundle_dir / "assets"
+    lines: List[str] = []
+    for path in _iter_files_under(assets_dir):
+        try:
+            size_bytes = path.stat().st_size
+        except OSError:
+            size_bytes = 0
+        rel_path = path.relative_to(bundle_dir).as_posix()
+        lines.append(f"- `{rel_path}` ({size_bytes} bytes)")
+
+    if not lines:
+        return ""
+
+    return "## Skill Assets\n\n" + "\n".join(lines)
+
+
+def _build_script_payload(
+    skill_name: str,
+    changes: Optional[List[dict]] = None,
+    review_mode: str = REVIEW_MODE_OVERALL,
+    file_path: str = "",
+    file_metadata: str = "",
+    diff: str = "",
+) -> str:
+    payload = {
+        "skill_name": skill_name,
+        "review_mode": normalize_review_mode(review_mode),
+        "file_path": file_path,
+        "file_metadata": file_metadata,
+        "diff": diff,
+        "changes": changes or [],
+    }
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def _run_skill_scripts(
+    skill_name: str,
+    bundle_dir: Optional[Path],
+    changes: Optional[List[dict]] = None,
+    review_mode: str = REVIEW_MODE_OVERALL,
+    file_path: str = "",
+    file_metadata: str = "",
+    diff: str = "",
+    timeout: int = 10,
+) -> str:
+    if not bundle_dir:
+        return ""
+
+    scripts_dir = bundle_dir / "scripts"
+    script_paths = [
+        path
+        for path in _iter_files_under(scripts_dir)
+        if os.access(path, os.X_OK)
+    ]
+    if not script_paths:
+        return ""
+
+    payload = _build_script_payload(
+        skill_name=skill_name,
+        changes=changes,
+        review_mode=review_mode,
+        file_path=file_path,
+        file_metadata=file_metadata,
+        diff=diff,
+    )
+    outputs: List[str] = []
+    env = {
+        "PATH": os.environ.get("PATH", "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"),
+        "HOME": os.environ.get("HOME", ""),
+        "LANG": os.environ.get("LANG", "C.UTF-8"),
+        "LC_ALL": os.environ.get("LC_ALL", ""),
+    }
+    env.update(
+        {
+            "OPENCR_SKILL_NAME": skill_name,
+            "OPENCR_SKILL_DIR": str(bundle_dir),
+            "OPENCR_REVIEW_MODE": normalize_review_mode(review_mode),
+            "OPENCR_FILE_PATH": file_path or "",
+        }
+    )
+    safe_timeout = max(int(timeout or 10), 1)
+
+    for script_path in script_paths:
+        rel_path = script_path.relative_to(bundle_dir).as_posix()
+        try:
+            completed = subprocess.run(
+                [str(script_path)],
+                input=payload,
+                text=True,
+                capture_output=True,
+                timeout=safe_timeout,
+                cwd=str(bundle_dir),
+                env=env,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            logger.warning("Skill script timed out: skill=%s script=%s timeout=%s", skill_name, rel_path, safe_timeout)
+            outputs.append(f"### {rel_path}\n\n[timeout after {safe_timeout}s]")
+            continue
+        except Exception as e:
+            logger.warning("Skill script failed to start: skill=%s script=%s error=%s", skill_name, rel_path, e)
+            outputs.append(f"### {rel_path}\n\n[start failed: {e}]")
+            continue
+
+        stdout = (completed.stdout or "").strip()
+        stderr = (completed.stderr or "").strip()
+        body_parts: List[str] = []
+        if completed.returncode != 0:
+            body_parts.append(f"[exit_code={completed.returncode}]")
+        if stdout:
+            body_parts.append(stdout)
+        if stderr:
+            body_parts.append(f"[stderr]\n{stderr}")
+        body = "\n\n".join(body_parts).strip() or "[no output]"
+        outputs.append(f"### {rel_path}\n\n{body[:MAX_SCRIPT_OUTPUT_CHARS]}")
+
+    if not outputs:
+        return ""
+
+    return "## Skill Script Output\n\n" + "\n\n".join(outputs)
+
+
+def _compose_skill_prompt(body: str, bundle_dir: Optional[Path]) -> str:
+    blocks = [body.strip()] if body.strip() else []
+    references_block = _build_references_block(bundle_dir)
+    assets_block = _build_assets_block(bundle_dir)
+    if references_block:
+        blocks.append(references_block)
+    if assets_block:
+        blocks.append(assets_block)
+    return "\n\n".join(blocks).strip()
+
+
 def load_review_skill_prompt(skill_name: str, skills_dir: str = "") -> str:
     """读取指定审查 skill 提示词；加载失败返回空字符串。"""
     safe_skill_name = normalize_review_skill(skill_name)
     if not safe_skill_name:
         return ""
-    review_cfg = load_review_config()
-    resolved_dir = _resolve_skills_dir(skills_dir or review_cfg["skills_dir"])
 
-    requested_file = resolved_dir / f"{safe_skill_name}.md"
-    if not requested_file.exists() or not requested_file.is_file():
-        logger.warning("Skill prompt file not found: skill=%s, file=%s", safe_skill_name, requested_file)
+    skill_file, bundle_dir = _resolve_skill_source(safe_skill_name, skills_dir=skills_dir)
+    if not skill_file:
+        logger.warning("Skill prompt file not found: skill=%s, skills_dir=%s", safe_skill_name, skills_dir or "<auto>")
         return ""
 
     try:
-        raw = requested_file.read_text(encoding="utf-8")
-        _meta, body = _split_skill_meta_and_body(raw)
+        _meta, body = _read_skill_file(skill_file)
         if not body:
-            logger.warning("Skill prompt body empty: skill=%s, file=%s", safe_skill_name, requested_file)
+            logger.warning("Skill prompt body empty: skill=%s, file=%s", safe_skill_name, skill_file)
             return ""
-        return body
+        return _compose_skill_prompt(body, bundle_dir)
     except Exception as e:
-        logger.warning(f"Failed to read review skill file {requested_file}: {e}")
+        logger.warning(f"Failed to read review skill file {skill_file}: {e}")
         return ""
 
 
-def load_review_skill_prompts(skill_names: List[str], skills_dir: str = "") -> str:
+def load_review_skill_prompts(
+    skill_names: List[str],
+    skills_dir: str = "",
+    changes: Optional[List[dict]] = None,
+    review_mode: str = REVIEW_MODE_OVERALL,
+    file_path: str = "",
+    file_metadata: str = "",
+    diff: str = "",
+    scripts_enabled: bool = False,
+    scripts_timeout: int = 10,
+) -> str:
     """读取多个 skill 提示词并拼接。"""
     unique_names: List[str] = []
     seen = set()
@@ -161,6 +412,20 @@ def load_review_skill_prompts(skill_names: List[str], skills_dir: str = "") -> s
         if not prompt.strip():
             logger.warning("Skill prompt skipped (empty): skill=%s", name)
             continue
+        if scripts_enabled:
+            _skill_file, bundle_dir = _resolve_skill_source(name, skills_dir=skills_dir)
+            script_output = _run_skill_scripts(
+                skill_name=name,
+                bundle_dir=bundle_dir,
+                changes=changes,
+                review_mode=review_mode,
+                file_path=file_path,
+                file_metadata=file_metadata,
+                diff=diff,
+                timeout=scripts_timeout,
+            )
+            if script_output:
+                prompt = "\n\n".join([prompt, script_output])
         blocks.append(f"[{name}]\n{prompt}")
 
     return "\n\n".join(blocks)
@@ -168,22 +433,12 @@ def load_review_skill_prompts(skill_names: List[str], skills_dir: str = "") -> s
 
 def load_available_review_skills(skills_dir: str = "") -> Dict[str, str]:
     """加载可用审查 skill（name -> prompt_content）"""
-    review_cfg = load_review_config()
-    resolved_dir = _resolve_skills_dir(skills_dir or review_cfg["skills_dir"])
     skills: Dict[str, str] = {}
-
-    if not resolved_dir.exists() or not resolved_dir.is_dir():
-        return skills
-
-    for path in sorted(resolved_dir.glob("*.md")):
-        skill_name = normalize_review_skill(path.stem)
-        if not skill_name:
-            continue
+    for skill_name, path, bundle_dir in _iter_skill_sources(skills_dir=skills_dir):
         try:
-            raw = path.read_text(encoding="utf-8")
-            _meta, body = _split_skill_meta_and_body(raw)
+            _meta, body = _read_skill_file(path)
             if body:
-                skills[skill_name] = body
+                skills[skill_name] = _compose_skill_prompt(body, bundle_dir)
         except Exception as e:
             logger.warning(f"Failed to read skill file {path}: {e}")
 
@@ -192,27 +447,19 @@ def load_available_review_skills(skills_dir: str = "") -> Dict[str, str]:
 
 def load_review_skill_previews(skills_dir: str = "", max_chars: int = SKILL_PREVIEW_CHARS) -> Dict[str, str]:
     """加载所有 skill 的简要预览（name -> preview）。"""
-    review_cfg = load_review_config()
-    resolved_dir = _resolve_skills_dir(skills_dir or review_cfg["skills_dir"])
     previews: Dict[str, str] = {}
-
-    if not resolved_dir.exists() or not resolved_dir.is_dir():
-        return previews
 
     skipped_missing_meta = 0
     skipped_empty_preview = 0
 
-    for path in sorted(resolved_dir.glob("*.md")):
-        skill_name = normalize_review_skill(path.stem)
-        if not skill_name:
-            continue
+    sources = _iter_skill_sources(skills_dir=skills_dir)
+    for skill_name, path, _bundle_dir in sources:
         try:
-            raw = path.read_text(encoding="utf-8")
+            meta, _body = _read_skill_file(path)
         except Exception as e:
             logger.warning(f"Failed to read skill preview {path}: {e}")
             continue
 
-        meta, _body = _split_skill_meta_and_body(raw)
         if not meta:
             skipped_missing_meta += 1
             logger.info("Skill preview skipped (missing meta): %s", path.name)
@@ -231,7 +478,7 @@ def load_review_skill_previews(skills_dir: str = "", max_chars: int = SKILL_PREV
         len(previews),
         skipped_missing_meta,
         skipped_empty_preview,
-        str(resolved_dir),
+        skills_dir or "<auto>",
     )
 
     return previews
@@ -240,15 +487,12 @@ def load_review_skill_previews(skills_dir: str = "", max_chars: int = SKILL_PREV
 def _load_skill_content_exact(skill_name: str, skills_dir: str = "") -> str:
     """只读取指定 skill 文件内容，不做 fallback。"""
     safe_skill_name = normalize_review_skill(skill_name)
-    review_cfg = load_review_config()
-    resolved_dir = _resolve_skills_dir(skills_dir or review_cfg["skills_dir"])
-    skill_file = resolved_dir / f"{safe_skill_name}.md"
-    if not skill_file.exists() or not skill_file.is_file():
+    skill_file, bundle_dir = _resolve_skill_source(safe_skill_name, skills_dir=skills_dir)
+    if not skill_file:
         return ""
     try:
-        raw = skill_file.read_text(encoding="utf-8")
-        _meta, body = _split_skill_meta_and_body(raw)
-        return body
+        _meta, body = _read_skill_file(skill_file)
+        return _compose_skill_prompt(body, bundle_dir)
     except Exception as e:
         logger.warning(f"Failed to read skill file {skill_file}: {e}")
         return ""

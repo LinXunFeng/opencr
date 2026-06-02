@@ -17,7 +17,7 @@ from .common import (
     ReviewError,
     normalize_review_mode,
 )
-from .config import load_openai_config
+from .config import load_openai_config, load_review_config
 from .diff import build_diff_from_changes, normalize_change_diff, truncate_diff
 from .skills import auto_select_review_skills, load_review_skill_prompts
 
@@ -384,6 +384,9 @@ def review_changes_with_inline_notes(
     )
     sections: List[str] = []
     inline_notes: List[Dict[str, object]] = []
+    review_cfg = load_review_config()
+    skill_scripts_enabled = bool(review_cfg.get("skill_scripts_enabled", True))
+    skill_scripts_timeout = int(review_cfg.get("skill_scripts_timeout", 10))
 
     run_overall = normalized_mode in {REVIEW_MODE_OVERALL, REVIEW_MODE_HYBRID}
     run_file = normalized_mode in {REVIEW_MODE_FILE, REVIEW_MODE_HYBRID}
@@ -401,29 +404,38 @@ def review_changes_with_inline_notes(
         if not overall_skills:
             logger.info("Review execution OVERALL skipped: no matched skills")
         else:
-            overall_skill_prompt = load_review_skill_prompts(overall_skills, skills_dir=skills_dir)
-            if not overall_skill_prompt.strip():
-                logger.info("Review execution OVERALL skipped: matched skills but prompt content empty")
-                overall_skill_prompt = ""
-                continue_overall = False
-            else:
-                continue_overall = True
+            continue_overall = True
             combined_diff = build_diff_from_changes(changes)
             if continue_overall and combined_diff:
                 truncated = truncate_diff(combined_diff, max_chars=max_diff_size)
+                overall_metadata = _build_overall_file_metadata(changes)
+                overall_skill_prompt = load_review_skill_prompts(
+                    overall_skills,
+                    skills_dir=skills_dir,
+                    changes=changes,
+                    review_mode=REVIEW_MODE_OVERALL,
+                    file_metadata=overall_metadata,
+                    diff=truncated,
+                    scripts_enabled=skill_scripts_enabled,
+                    scripts_timeout=skill_scripts_timeout,
+                )
+                if not overall_skill_prompt.strip():
+                    logger.info("Review execution OVERALL skipped: skill prompt empty after script context")
+                    continue_overall = False
                 logger.info(
                     "Review execution OVERALL: combined_diff_chars=%s, truncated_chars=%s",
                     len(combined_diff),
                     len(truncated),
                 )
-                overall_result = call_codex_review(
-                    truncated,
-                    review_mode=REVIEW_MODE_OVERALL,
-                    file_metadata=_build_overall_file_metadata(changes),
-                    skill_prompt=overall_skill_prompt,
-                    skill_name=",".join(overall_skills),
-                )
-                sections.append(overall_result)
+                if continue_overall:
+                    overall_result = call_codex_review(
+                        truncated,
+                        review_mode=REVIEW_MODE_OVERALL,
+                        file_metadata=overall_metadata,
+                        skill_prompt=overall_skill_prompt,
+                        skill_name=",".join(overall_skills),
+                    )
+                    sections.append(overall_result)
             elif continue_overall:
                 logger.warning("Review execution OVERALL: combined diff empty")
 
@@ -452,19 +464,30 @@ def review_changes_with_inline_notes(
                 file_miss += 1
                 logger.info("Review execution FILE skipped for %s: no matched skills", file_path)
                 continue
-            file_skill_prompt = load_review_skill_prompts(file_skills, skills_dir=skills_dir)
+            file_metadata = _build_single_file_metadata(change)
+            truncated = truncate_diff(review_diff, max_chars=max_diff_size)
+            file_skill_prompt = load_review_skill_prompts(
+                file_skills,
+                skills_dir=skills_dir,
+                changes=[change],
+                review_mode=REVIEW_MODE_FILE,
+                file_path=file_path,
+                file_metadata=file_metadata,
+                diff=truncated,
+                scripts_enabled=skill_scripts_enabled,
+                scripts_timeout=skill_scripts_timeout,
+            )
             if not file_skill_prompt.strip():
                 logger.info("Review execution FILE skipped for %s: matched skills but prompt content empty", file_path)
                 file_miss += 1
                 continue
             reviewed_files += 1
             file_hit += 1
-            truncated = truncate_diff(review_diff, max_chars=max_diff_size)
             result = call_codex_review(
                 truncated,
                 review_mode=REVIEW_MODE_FILE,
                 file_path=file_path,
-                file_metadata=_build_single_file_metadata(change),
+                file_metadata=file_metadata,
                 skill_prompt=file_skill_prompt,
                 skill_name=",".join(file_skills),
             )

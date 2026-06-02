@@ -2,6 +2,22 @@
 
 本文件记录项目的重要变更。
 
+## [0.3.0] - 2026-06-02
+
+### Added
+- 新增标准 skill bundle 支持，识别 `skills/<name>/SKILL.md`，并兼容旧版 `skills/<name>.md`。
+- 新增 skill `references/` 与 `assets/` 资源注入能力，将参考资料和资源清单合入审查提示词。
+- 新增 skill `scripts/` 执行能力，可通过 JSON 审查上下文为模型补充动态分析结果。
+- 新增 `requirements.txt` 固定依赖版本，安装脚本改为基于依赖清单安装。
+
+### Changed
+- 调整默认 skill 目录为 `skills`，并将内置 skill 迁移为目录式 bundle。
+- 调整默认服务端口为 `9034`，安装脚本、示例配置、快速测试和 README 同步更新。
+- 调整审查提示词输出约束，要求标题、影响、描述、建议等字段更短。
+
+### Fixed
+- 修复安装生成的启动脚本无法读取配置端口的问题，启动时会优先使用环境变量或 `config.yaml`。
+
 ## [0.2.1] - 2026-04-28
 
 ### Fixed

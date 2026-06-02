@@ -91,18 +91,50 @@ class ReviewServerConfigTests(unittest.TestCase):
         return str(config_path)
 
     def _write_review_skill(self, root_dir: str, name: str, content: str) -> str:
-        skill_dir = Path(root_dir, "skills", "review")
+        skill_dir = Path(root_dir, "skills")
         skill_dir.mkdir(parents=True, exist_ok=True)
         skill_path = skill_dir / f"{name}.md"
         skill_path.write_text(content, encoding="utf-8")
         return str(skill_dir)
 
     def _write_review_skill_with_meta(self, root_dir: str, name: str, meta: str, body: str) -> str:
-        skill_dir = Path(root_dir, "skills", "review")
+        skill_dir = Path(root_dir, "skills")
         skill_dir.mkdir(parents=True, exist_ok=True)
         skill_path = skill_dir / f"{name}.md"
         skill_path.write_text(f"---\n{meta.strip()}\n---\n\n{body.strip()}\n", encoding="utf-8")
         return str(skill_dir)
+
+    def _write_review_skill_bundle(
+        self,
+        root_dir: str,
+        name: str,
+        meta: str,
+        body: str,
+        references: dict = None,
+        assets: dict = None,
+        scripts: dict = None,
+    ) -> str:
+        skill_root = Path(root_dir, "skills")
+        bundle_dir = skill_root / name
+        bundle_dir.mkdir(parents=True, exist_ok=True)
+        (bundle_dir / "SKILL.md").write_text(
+            f"---\n{meta.strip()}\n---\n\n{body.strip()}\n",
+            encoding="utf-8",
+        )
+        for rel_path, content in (references or {}).items():
+            path = bundle_dir / "references" / rel_path
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8")
+        for rel_path, content in (assets or {}).items():
+            path = bundle_dir / "assets" / rel_path
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(content)
+        for rel_path, content in (scripts or {}).items():
+            path = bundle_dir / "scripts" / rel_path
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8")
+            path.chmod(0o755)
+        return str(skill_root)
 
     def test_get_mr_diff_supports_code_platform_env_names(self):
         response = mock.Mock()
@@ -201,6 +233,51 @@ code_platform:
         self.assertEqual(cfg["url"], "https://gitlab.yaml.example")
         self.assertEqual(cfg["token"], "yaml-token")
         self.assertEqual(cfg["webhook_secret"], "yaml-secret")
+
+    def test_load_review_config_defaults_to_skills_root(self):
+        with mock.patch.dict(os.environ, self._env(OPENAI_API_KEY=""), clear=True):
+            with mock.patch("src.review.config.load_file_config", return_value={}):
+                cfg = review_server.load_review_config()
+
+        self.assertEqual(cfg["skills_dir"], "skills")
+
+    def test_install_script_uses_project_requirements_file(self):
+        script = Path(__file__).resolve().parents[1] / "install.sh"
+        content = script.read_text(encoding="utf-8")
+
+        self.assertIn('cp "$SCRIPT_DIR/requirements.txt" "$INSTALL_DIR/requirements.txt"', content)
+        self.assertIn('pip install -q -r requirements.txt', content)
+        self.assertIn('pip install -q -r "$SCRIPT_DIR/requirements.txt"', content)
+        self.assertNotIn("pip install -q openai flask gunicorn", content)
+
+    def test_install_script_keeps_default_port_without_auto_rewrite(self):
+        script = Path(__file__).resolve().parents[1] / "install.sh"
+        content = script.read_text(encoding="utf-8")
+
+        self.assertNotIn("configure_server_port", content)
+        self.assertNotIn("find_available_port", content)
+        self.assertIn("REVIEW_SERVER_PORT=${REVIEW_SERVER_PORT:-9034}", content)
+        self.assertIn("curl -s \"$health_url\"", content)
+
+    def test_generated_start_script_reads_configured_server_port(self):
+        script = Path(__file__).resolve().parents[1] / "install.sh"
+        content = script.read_text(encoding="utf-8")
+
+        self.assertIn('config_port="$(read_config_value "server" "port")"', content)
+        self.assertIn('SERVER_PORT="${REVIEW_SERVER_PORT:-${config_port:-9034}}"', content)
+        self.assertIn('--bind "${SERVER_HOST}:${SERVER_PORT}"', content)
+
+    def test_requirements_are_pinned_to_exact_versions(self):
+        requirements_path = Path(__file__).resolve().parents[1] / "requirements.txt"
+        lines = [
+            line.strip()
+            for line in requirements_path.read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        ]
+
+        self.assertGreater(len(lines), 0)
+        for line in lines:
+            self.assertRegex(line, r"^[A-Za-z0-9_.-]+==[A-Za-z0-9_.!+*-]+$")
 
     def test_env_overrides_config_yaml(self):
         config_path = self._write_config_yaml(
@@ -341,6 +418,71 @@ code_platform:
 
         self.assertEqual(prompt, "Flutter review checklist")
 
+    def test_standard_skill_bundle_prompt_includes_references_and_assets_manifest(self):
+        temp_root = tempfile.mkdtemp(prefix="opencr-review-skill-bundle-")
+        skills_dir = self._write_review_skill_bundle(
+            temp_root,
+            "flutter",
+            'name: flutter\ndescription: Flutter bundle skill',
+            "Flutter review checklist",
+            references={"lifecycle.md": "Dispose controllers in dispose()."},
+            assets={"screenshots/login.png": b"fakepng"},
+        )
+
+        with mock.patch.dict(os.environ, self._env(), clear=True):
+            prompt = review_server.load_review_skill_prompt("flutter", skills_dir)
+
+        self.assertIn("Flutter review checklist", prompt)
+        self.assertIn("## Skill References", prompt)
+        self.assertIn("references/lifecycle.md", prompt)
+        self.assertIn("Dispose controllers in dispose().", prompt)
+        self.assertIn("## Skill Assets", prompt)
+        self.assertIn("assets/screenshots/login.png", prompt)
+
+    def test_standard_skill_bundle_preview_uses_skill_md_metadata(self):
+        temp_root = tempfile.mkdtemp(prefix="opencr-review-skill-bundle-preview-")
+        skills_dir = self._write_review_skill_bundle(
+            temp_root,
+            "flutter",
+            'name: flutter\ndescription: Flutter bundle skill\ntags: dart, widget',
+            "Flutter review checklist",
+        )
+
+        with mock.patch.dict(os.environ, self._env(), clear=True):
+            previews = review_server.load_review_skill_previews(skills_dir)
+
+        self.assertIn("flutter", previews)
+        self.assertIn("Flutter bundle skill", previews["flutter"])
+        self.assertIn("dart, widget", previews["flutter"])
+
+    def test_standard_skill_bundle_scripts_can_add_review_context(self):
+        temp_root = tempfile.mkdtemp(prefix="opencr-review-skill-bundle-script-")
+        script = """#!/bin/sh
+python3 -c 'import json, sys; payload=json.load(sys.stdin); print("script saw " + payload["changes"][0]["new_path"])'
+"""
+        skills_dir = self._write_review_skill_bundle(
+            temp_root,
+            "ts",
+            'name: ts\ndescription: TypeScript bundle skill',
+            "TS review checklist",
+            scripts={"summarize.sh": script},
+        )
+
+        with mock.patch.dict(os.environ, self._env(), clear=True):
+            prompt = review_server.load_review_skill_prompts(
+                ["ts"],
+                skills_dir=skills_dir,
+                changes=[{"new_path": "src/app.ts", "diff": "+const a = 1;"}],
+                review_mode="file",
+                scripts_enabled=True,
+                scripts_timeout=5,
+            )
+
+        self.assertIn("TS review checklist", prompt)
+        self.assertIn("## Skill Script Output", prompt)
+        self.assertIn("scripts/summarize.sh", prompt)
+        self.assertIn("script saw src/app.ts", prompt)
+
     def test_parse_selected_skill_uses_fallback_when_invalid(self):
         allowed = ["general", "flutter", "ts"]
         self.assertEqual(
@@ -476,7 +618,7 @@ code_platform:
         with mock.patch.object(
             review_server,
             "load_review_config",
-            return_value={"max_diff_size": 50000, "skills_dir": "skills/review"},
+            return_value={"max_diff_size": 50000, "skills_dir": "skills"},
         ):
             with mock.patch.object(
                 review_server,
@@ -527,7 +669,7 @@ code_platform:
         with mock.patch.object(
             review_server,
             "load_review_config",
-            return_value={"max_diff_size": 50000, "skills_dir": "skills/review"},
+            return_value={"max_diff_size": 50000, "skills_dir": "skills"},
         ):
             with mock.patch.object(
                 review_server,
@@ -624,7 +766,7 @@ code_platform:
         with mock.patch.object(
             review_server,
             "load_review_config",
-            return_value={"max_diff_size": 50000, "skills_dir": "skills/review"},
+            return_value={"max_diff_size": 50000, "skills_dir": "skills"},
         ):
             with mock.patch.object(
                 review_server,
@@ -684,7 +826,7 @@ code_platform:
         with mock.patch.object(
             review_server,
             "load_review_config",
-            return_value={"max_diff_size": 50000, "skills_dir": "skills/review"},
+            return_value={"max_diff_size": 50000, "skills_dir": "skills"},
         ):
             with mock.patch.object(
                 review_server,
@@ -748,7 +890,7 @@ code_platform:
                         review_mode="file",
                         review_skill="",
                         max_diff_size=50000,
-                        skills_dir="skills/review",
+                        skills_dir="skills",
                     )
 
         self.assertEqual(len(inline_notes), 1)
@@ -782,7 +924,7 @@ code_platform:
                         review_mode="file",
                         review_skill="",
                         max_diff_size=50000,
-                        skills_dir="skills/review",
+                        skills_dir="skills",
                     )
 
         self.assertEqual(len(inline_notes), 1)
@@ -812,7 +954,7 @@ code_platform:
                         review_mode="file",
                         review_skill="",
                         max_diff_size=50000,
-                        skills_dir="skills/review",
+                        skills_dir="skills",
                     )
 
         self.assertEqual(inline_notes, [])
@@ -842,7 +984,7 @@ code_platform:
                         review_mode="file",
                         review_skill="",
                         max_diff_size=50000,
-                        skills_dir="skills/review",
+                        skills_dir="skills",
                     )
 
         self.assertEqual(inline_notes, [])
@@ -871,7 +1013,7 @@ code_platform:
                         review_mode="file",
                         review_skill="",
                         max_diff_size=50000,
-                        skills_dir="skills/review",
+                        skills_dir="skills",
                     )
 
         self.assertEqual(len(inline_notes), 1)
@@ -900,7 +1042,7 @@ code_platform:
         with mock.patch.object(
             review_server,
             "load_review_config",
-            return_value={"max_diff_size": 50000, "skills_dir": "skills/review"},
+            return_value={"max_diff_size": 50000, "skills_dir": "skills"},
         ):
             with mock.patch.object(
                 review_server,

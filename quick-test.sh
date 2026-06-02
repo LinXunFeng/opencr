@@ -27,20 +27,20 @@ fi
 # 2. 检查端口监听
 echo ""
 echo -e "${BLUE}[2/5] 检查端口监听${NC}"
-if netstat -an 2>/dev/null | grep -q ".5000 " || lsof -i :5000 2>/dev/null | grep -q LISTEN; then
-    echo -e "${GREEN}✓${NC} 端口 5000 正在监听"
+if netstat -an 2>/dev/null | grep -q ".9034 " || lsof -i :9034 2>/dev/null | grep -q LISTEN; then
+    echo -e "${GREEN}✓${NC} 端口 9034 正在监听"
 else
-    echo -e "${RED}✗${NC} 端口 5000 未监听"
+    echo -e "${RED}✗${NC} 端口 9034 未监听"
 fi
 
 # 3. 健康检查
 echo ""
 echo -e "${BLUE}[3/5] 健康检查${NC}"
-if curl -s http://localhost:5000/health > /dev/null 2>&1; then
+if curl -s http://localhost:9034/health > /dev/null 2>&1; then
     echo -e "${GREEN}✓${NC} 健康检查通过"
     echo ""
     echo "响应内容:"
-    curl -s http://localhost:5000/health | python3 -m json.tool 2>/dev/null || curl -s http://localhost:5000/health
+    curl -s http://localhost:9034/health | python3 -m json.tool 2>/dev/null || curl -s http://localhost:9034/health
 else
     echo -e "${RED}✗${NC} 健康检查失败"
 fi
@@ -128,7 +128,7 @@ echo "  启动服务: launchctl start com.opencr.server"
 echo "  停止服务: launchctl stop com.opencr.server"
 echo "  查看错误日志: tail -f ~/opencr/logs/error.log"
 echo "  查看访问日志: tail -f ~/opencr/logs/access.log"
-echo "  手动触发: curl -X POST http://localhost:5000/manual-review \\"
+echo "  手动触发: curl -X POST http://localhost:9034/manual-review \\"
 echo "            -H 'Content-Type: application/json' \\"
 echo "            -d '{\"project_id\": 123, \"mr_iid\": 1}'"
 echo -e "${BLUE}================================${NC}"

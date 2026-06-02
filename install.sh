@@ -149,6 +149,9 @@ load_project_config_file() {
 
         REVIEW_MAX_DIFF_SIZE=$(read_yaml_value "$config_yaml" "review" "max_diff_size")
         REVIEW_TIMEOUT=$(read_yaml_value "$config_yaml" "review" "timeout")
+        REVIEW_SKILLS_DIR=$(read_yaml_value "$config_yaml" "review" "skills_dir")
+        REVIEW_SKILL_SCRIPTS_ENABLED=$(read_yaml_value "$config_yaml" "review" "skill_scripts_enabled")
+        REVIEW_SKILL_SCRIPTS_TIMEOUT=$(read_yaml_value "$config_yaml" "review" "skill_scripts_timeout")
 
         print_info "已从 config.yaml 预填配置项"
         return
@@ -288,6 +291,15 @@ copy_files() {
         print_warning "自动 skill 选择将无法命中，审查分支会被跳过"
     fi
 
+    # 复制 Python 依赖清单
+    if [[ -f "$SCRIPT_DIR/requirements.txt" ]]; then
+        cp "$SCRIPT_DIR/requirements.txt" "$INSTALL_DIR/requirements.txt"
+        print_success "复制 requirements.txt"
+    else
+        print_error "未找到依赖清单: $SCRIPT_DIR/requirements.txt"
+        exit 1
+    fi
+
     # 设置可执行权限
     chmod +x "$INSTALL_DIR/src/review_server.py"
 }
@@ -305,7 +317,7 @@ setup_venv() {
 
     print_info "安装依赖包..."
     pip install -q --upgrade pip
-    pip install -q openai flask gunicorn python-dotenv requests
+    pip install -q -r requirements.txt
 
     print_success "依赖安装完成"
     deactivate
@@ -326,6 +338,36 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
+read_config_value() {
+    local section="$1"
+    local key="$2"
+    local file_path="$SCRIPT_DIR/config.yaml"
+    [[ -f "$file_path" ]] || return 0
+
+    awk -v section="$section" -v key="$key" '
+        /^[[:space:]]*#/ { next }
+        /^[[:space:]]*$/ { next }
+        /^[^[:space:]][^:]*:[[:space:]]*$/ {
+            current = $0
+            sub(/:[[:space:]]*$/, "", current)
+            gsub(/[[:space:]]/, "", current)
+            in_section = (current == section)
+            next
+        }
+        in_section && $0 ~ ("^[[:space:]]{2}" key ":[[:space:]]*") {
+            value = $0
+            sub(("^[[:space:]]{2}" key ":[[:space:]]*"), "", value)
+            sub(/[[:space:]]*#.*/, "", value)
+            gsub(/^["'\''"]|["'\''"]$/, "", value)
+            print value
+            exit
+        }
+        in_section && $0 ~ /^[^[:space:]]/ {
+            in_section = 0
+        }
+    ' "$file_path"
+}
+
 # 确保日志目录存在（使用绝对路径）
 mkdir -p "$SCRIPT_DIR/logs"
 touch "$SCRIPT_DIR/logs/error.log"
@@ -340,18 +382,23 @@ source "$SCRIPT_DIR/venv/bin/activate"
 # 检查 Python 依赖
 python3 -c "import openai, flask, requests" 2>/dev/null || {
     echo "Installing dependencies..."
-    pip install -q openai flask gunicorn requests python-dotenv
+    pip install -q -r "$SCRIPT_DIR/requirements.txt"
 }
 
+config_host="$(read_config_value "server" "host")"
+config_port="$(read_config_value "server" "port")"
+SERVER_HOST="${REVIEW_SERVER_HOST:-${config_host:-0.0.0.0}}"
+SERVER_PORT="${REVIEW_SERVER_PORT:-${config_port:-9034}}"
+
 echo "Starting OpenCR server..."
-echo "Host: ${REVIEW_SERVER_HOST:-0.0.0.0}"
-echo "Port: ${REVIEW_SERVER_PORT:-5000}"
+echo "Host: ${SERVER_HOST}"
+echo "Port: ${SERVER_PORT}"
 
 # 计算工作进程数
 workers=$(( $(sysctl -n hw.ncpu) * 2 + 1 ))
 
 exec gunicorn \
-    --bind "${REVIEW_SERVER_HOST:-0.0.0.0}:${REVIEW_SERVER_PORT:-5000}" \
+    --bind "${SERVER_HOST}:${SERVER_PORT}" \
     --chdir "$SCRIPT_DIR/src" \
     --workers $workers \
     --timeout 300 \
@@ -392,11 +439,13 @@ generate_config_file() {
     print_step "生成配置文件"
 
     REVIEW_SERVER_HOST=${REVIEW_SERVER_HOST:-0.0.0.0}
-    REVIEW_SERVER_PORT=${REVIEW_SERVER_PORT:-5000}
+    REVIEW_SERVER_PORT=${REVIEW_SERVER_PORT:-9034}
     REVIEW_LOG_LEVEL=${REVIEW_LOG_LEVEL:-INFO}
     REVIEW_MAX_DIFF_SIZE=${REVIEW_MAX_DIFF_SIZE:-50000}
     REVIEW_TIMEOUT=${REVIEW_TIMEOUT:-180}
-    REVIEW_SKILLS_DIR=${REVIEW_SKILLS_DIR:-skills/review}
+    REVIEW_SKILLS_DIR=${REVIEW_SKILLS_DIR:-skills}
+    REVIEW_SKILL_SCRIPTS_ENABLED=${REVIEW_SKILL_SCRIPTS_ENABLED:-true}
+    REVIEW_SKILL_SCRIPTS_TIMEOUT=${REVIEW_SKILL_SCRIPTS_TIMEOUT:-10}
     OPENAI_REASONING_EFFORT=${OPENAI_REASONING_EFFORT:-medium}
 
     cat > "$INSTALL_DIR/config.yaml" << CONFIG_EOF
@@ -425,6 +474,8 @@ review:
   max_diff_size: ${REVIEW_MAX_DIFF_SIZE}
   timeout: ${REVIEW_TIMEOUT}
   skills_dir: "${REVIEW_SKILLS_DIR}"
+  skill_scripts_enabled: ${REVIEW_SKILL_SCRIPTS_ENABLED}
+  skill_scripts_timeout: ${REVIEW_SKILL_SCRIPTS_TIMEOUT}
 CONFIG_EOF
 
     chmod 600 "$INSTALL_DIR/config.yaml"
@@ -508,9 +559,10 @@ start_service() {
     sleep 2
 
     # 健康检查
-    if curl -s http://localhost:5000/health > /dev/null 2>&1; then
+    local health_url="http://localhost:${REVIEW_SERVER_PORT}/health"
+    if curl -s "$health_url" > /dev/null 2>&1; then
         print_success "服务启动成功!"
-        print_info "健康检查: curl http://localhost:5000/health"
+        print_info "健康检查: curl $health_url"
     else
         print_warning "服务可能尚未完全启动"
         print_info "请稍后检查: tail -f ${INSTALL_DIR}/logs/launchd.err.log"
@@ -549,11 +601,11 @@ show_summary() {
     echo "  tail -f ${INSTALL_DIR}/logs/server.log"
     echo ""
     echo "Webhook 配置:"
-    echo "  URL: http://$(hostname -s | head -1).local:5000/webhook"
-    echo "  或:  http://$(ifconfig | grep 'inet ' | grep -v 127.0.0.1 | head -1 | awk '{print $2}'):5000/webhook"
+    echo "  URL: http://$(hostname -s | head -1).local:${REVIEW_SERVER_PORT}/webhook"
+    echo "  或:  http://$(ifconfig | grep 'inet ' | grep -v 127.0.0.1 | head -1 | awk '{print $2}'):${REVIEW_SERVER_PORT}/webhook"
     echo ""
     echo "测试命令:"
-    echo "  curl http://localhost:5000/health"
+    echo "  curl http://localhost:${REVIEW_SERVER_PORT}/health"
     echo ""
     echo "========================================"
 }

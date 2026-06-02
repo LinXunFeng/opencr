@@ -274,10 +274,23 @@ def load_review_config() -> dict:
     skills_dir = _pick_config_value(config_data, "review.skills_dir", "REVIEW_SKILLS_DIR")
     max_diff_size = _pick_config_int(config_data, 50000, "review.max_diff_size", "REVIEW_MAX_DIFF_SIZE")
     timeout = _pick_config_int(config_data, 180, "review.timeout", "REVIEW_TIMEOUT")
+    skill_scripts_enabled_raw = _pick_config_value(
+        config_data,
+        "review.skill_scripts_enabled",
+        "REVIEW_SKILL_SCRIPTS_ENABLED",
+    )
+    skill_scripts_timeout = _pick_config_int(
+        config_data,
+        10,
+        "review.skill_scripts_timeout",
+        "REVIEW_SKILL_SCRIPTS_TIMEOUT",
+    )
 
     env_skills_dir = os.getenv("REVIEW_SKILLS_DIR", "").strip()
     env_max_diff_size = os.getenv("REVIEW_MAX_DIFF_SIZE", "").strip()
     env_timeout = os.getenv("REVIEW_TIMEOUT", "").strip()
+    env_skill_scripts_enabled = os.getenv("REVIEW_SKILL_SCRIPTS_ENABLED", "").strip()
+    env_skill_scripts_timeout = os.getenv("REVIEW_SKILL_SCRIPTS_TIMEOUT", "").strip()
 
     if env_skills_dir:
         skills_dir = env_skills_dir
@@ -291,16 +304,34 @@ def load_review_config() -> dict:
             timeout = int(env_timeout)
         except ValueError:
             logger.warning(f"Invalid REVIEW_TIMEOUT={env_timeout}, fallback to {timeout}")
+    if env_skill_scripts_enabled:
+        skill_scripts_enabled_raw = env_skill_scripts_enabled
+    if env_skill_scripts_timeout:
+        try:
+            skill_scripts_timeout = int(env_skill_scripts_timeout)
+        except ValueError:
+            logger.warning(
+                f"Invalid REVIEW_SKILL_SCRIPTS_TIMEOUT={env_skill_scripts_timeout}, "
+                f"fallback to {skill_scripts_timeout}"
+            )
+
+    skill_scripts_enabled = str(skill_scripts_enabled_raw or "true").strip().lower()
+    skill_scripts_enabled_bool = skill_scripts_enabled not in {"0", "false", "no", "off", "disabled"}
 
     resolved = {
         "skills_dir": skills_dir or DEFAULT_REVIEW_SKILLS_DIR,
         "max_diff_size": max_diff_size,
         "timeout": timeout,
+        "skill_scripts_enabled": skill_scripts_enabled_bool,
+        "skill_scripts_timeout": max(skill_scripts_timeout, 1),
     }
     logger.info(
-        "Review config resolved: skills_dir=%s, max_diff_size=%s, timeout=%s",
+        "Review config resolved: skills_dir=%s, max_diff_size=%s, timeout=%s, "
+        "skill_scripts_enabled=%s, skill_scripts_timeout=%s",
         resolved["skills_dir"],
         resolved["max_diff_size"],
         resolved["timeout"],
+        resolved["skill_scripts_enabled"],
+        resolved["skill_scripts_timeout"],
     )
     return resolved
