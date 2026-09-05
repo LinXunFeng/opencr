@@ -270,7 +270,7 @@ copy_files() {
     print_step "安装项目文件"
 
     # 创建目录
-    mkdir -p "$INSTALL_DIR"/{src,skills,logs,scripts}
+    mkdir -p "$INSTALL_DIR"/{src,skills,logs,scripts,data,migrations}
     print_success "创建目录: $INSTALL_DIR"
 
     # 复制源码
@@ -289,6 +289,16 @@ copy_files() {
     else
         print_warning "未找到 skills 目录: $SCRIPT_DIR/skills"
         print_warning "自动 skill 选择将无法命中，审查分支会被跳过"
+    fi
+
+    # 复制数据库迁移（start.sh 启动前会执行 alembic upgrade head）
+    if [[ -d "$SCRIPT_DIR/migrations" && -f "$SCRIPT_DIR/alembic.ini" ]]; then
+        cp -r "$SCRIPT_DIR/migrations/." "$INSTALL_DIR/migrations/"
+        cp "$SCRIPT_DIR/alembic.ini" "$INSTALL_DIR/alembic.ini"
+        print_success "复制数据库迁移"
+    else
+        print_error "未找到 migrations/ 或 alembic.ini，无法初始化数据库"
+        exit 1
     fi
 
     # 复制 Python 依赖清单
@@ -380,7 +390,7 @@ echo "[$(date)] Logs directory: $SCRIPT_DIR/logs"
 source "$SCRIPT_DIR/venv/bin/activate"
 
 # 检查 Python 依赖
-python3 -c "import openai, flask, requests" 2>/dev/null || {
+python3 -c "import openai, flask, requests, sqlalchemy, alembic" 2>/dev/null || {
     echo "Installing dependencies..."
     pip install -q -r "$SCRIPT_DIR/requirements.txt"
 }
@@ -394,8 +404,15 @@ echo "Starting OpenCR server..."
 echo "Host: ${SERVER_HOST}"
 echo "Port: ${SERVER_PORT}"
 
-# 计算工作进程数
-workers=$(( $(sysctl -n hw.ncpu) * 2 + 1 ))
+# 本服务是 IO bound 且几乎无 QPS（每个 MR 事件一次审查），worker 多了只会
+# 放大 SQLite 锁竞争。留 2 个是为了单个慢请求不阻塞健康检查。
+workers="${GUNICORN_WORKERS:-2}"
+
+# 迁移在启动前跑一次，而不是在每个 worker 里 —— 多个进程同时执行 DDL 只会互相抢锁
+(cd "$SCRIPT_DIR" && python3 -m src.storage.migrate) || {
+    echo "[opencr] 数据库迁移失败，服务未启动" >&2
+    exit 1
+}
 
 exec gunicorn \
     --bind "${SERVER_HOST}:${SERVER_PORT}" \
@@ -447,6 +464,13 @@ generate_config_file() {
     REVIEW_SKILL_SCRIPTS_ENABLED=${REVIEW_SKILL_SCRIPTS_ENABLED:-true}
     REVIEW_SKILL_SCRIPTS_TIMEOUT=${REVIEW_SKILL_SCRIPTS_TIMEOUT:-10}
     OPENAI_REASONING_EFFORT=${OPENAI_REASONING_EFFORT:-medium}
+    OPENCR_ADMIN_ENABLED=${OPENCR_ADMIN_ENABLED:-false}
+    OPENCR_ADMIN_TOKEN=${OPENCR_ADMIN_TOKEN:-}
+    OPENCR_ADMIN_BIND_LOCAL_ONLY=${OPENCR_ADMIN_BIND_LOCAL_ONLY:-false}
+    OPENCR_DATABASE_URL=${OPENCR_DATABASE_URL:-}
+    OPENCR_RETENTION_DAYS=${OPENCR_RETENTION_DAYS:-90}
+    OPENCR_STALE_AFTER_SECONDS=${OPENCR_STALE_AFTER_SECONDS:-600}
+    OPENCR_RECONCILE_INTERVAL_SECONDS=${OPENCR_RECONCILE_INTERVAL_SECONDS:-300}
 
     cat > "$INSTALL_DIR/config.yaml" << CONFIG_EOF
 # OpenCR - 自动代码审查服务配置
@@ -476,6 +500,18 @@ review:
   skills_dir: "${REVIEW_SKILLS_DIR}"
   skill_scripts_enabled: ${REVIEW_SKILL_SCRIPTS_ENABLED}
   skill_scripts_timeout: ${REVIEW_SKILL_SCRIPTS_TIMEOUT}
+
+# 后台管理：默认关闭。开启需同时填写 token，否则服务会拒绝启动。
+admin:
+  enabled: ${OPENCR_ADMIN_ENABLED}
+  token: "${OPENCR_ADMIN_TOKEN}"
+  bind_local_only: ${OPENCR_ADMIN_BIND_LOCAL_ONLY}
+
+storage:
+  database_url: "${OPENCR_DATABASE_URL}"
+  retention_days: ${OPENCR_RETENTION_DAYS}
+  stale_after_seconds: ${OPENCR_STALE_AFTER_SECONDS}
+  reconcile_interval_seconds: ${OPENCR_RECONCILE_INTERVAL_SECONDS}
 CONFIG_EOF
 
     chmod 600 "$INSTALL_DIR/config.yaml"

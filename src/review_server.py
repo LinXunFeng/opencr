@@ -2,6 +2,9 @@
 """
 OpenCR - 自动代码审查服务（入口与路由）
 优先读取 config.yaml，支持环境变量覆盖，兼容 ~/.codex 回退
+
+审查执行逻辑在 src/review/runner.py，采纳结算在 src/review/settlement.py，
+本文件只负责 HTTP 路由、线程调度与后台任务。
 """
 
 import logging
@@ -9,10 +12,13 @@ import os
 import re
 import sys
 import threading
+import time
 from datetime import datetime
 from functools import wraps
+from pathlib import Path
 
 from flask import Flask, jsonify, request
+
 
 def _load_review_dependencies() -> dict:
     """
@@ -20,12 +26,11 @@ def _load_review_dependencies() -> dict:
     脚本模式（cd src && python3 review_server.py）下先补齐项目根路径。
     """
     if __package__ in {None, ""}:
-        from pathlib import Path
-
         project_root = str(Path(__file__).resolve().parent.parent)
         if project_root not in sys.path:
             sys.path.insert(0, project_root)
 
+    from src.admin.routes import admin_bp
     from src.review.ai import build_review_prompt, call_codex_review, review_changes, review_changes_with_inline_notes
     from src.review.common import (
         DEFAULT_REVIEW_SKILLS_DIR,
@@ -39,10 +44,12 @@ def _load_review_dependencies() -> dict:
     from src.review.config import (
         _pick_config_value,
         get_app_version,
+        load_admin_config,
         load_file_config,
         load_gitlab_config,
         load_openai_config,
         load_review_config,
+        load_storage_config,
     )
     from src.review.diff import build_diff_from_changes, normalize_change_diff, truncate_diff
     from src.review.gitlab import (
@@ -51,11 +58,15 @@ def _load_review_dependencies() -> dict:
         get_mr_changes,
         get_mr_changes_with_refs,
         get_mr_diff,
+        get_mr_discussions,
+        get_mr_state,
         post_mr_comment,
         post_mr_file_comment,
         post_mr_inline_comment,
         require_gitlab_config,
     )
+    from src.review.runner import execute_review_run
+    from src.review.settlement import settle_mr
     from src.review.skills import (
         _parse_selected_skill,
         auto_select_review_skill,
@@ -66,8 +77,15 @@ def _load_review_dependencies() -> dict:
         load_review_skill_prompts,
         resolve_review_options,
     )
+    from src.storage import repo
+    from src.storage.models import (
+        TRIGGER_MANUAL,
+        TRIGGER_WEBHOOK_OPEN,
+        TRIGGER_WEBHOOK_UPDATE,
+    )
 
     return {
+        "admin_bp": admin_bp,
         "build_review_prompt": build_review_prompt,
         "call_codex_review": call_codex_review,
         "review_changes": review_changes,
@@ -81,10 +99,12 @@ def _load_review_dependencies() -> dict:
         "normalize_review_skill": normalize_review_skill,
         "_pick_config_value": _pick_config_value,
         "get_app_version": get_app_version,
+        "load_admin_config": load_admin_config,
         "load_file_config": load_file_config,
         "load_gitlab_config": load_gitlab_config,
         "load_openai_config": load_openai_config,
         "load_review_config": load_review_config,
+        "load_storage_config": load_storage_config,
         "build_diff_from_changes": build_diff_from_changes,
         "normalize_change_diff": normalize_change_diff,
         "truncate_diff": truncate_diff,
@@ -93,10 +113,18 @@ def _load_review_dependencies() -> dict:
         "get_mr_changes_with_refs": get_mr_changes_with_refs,
         "get_compare_changes": get_compare_changes,
         "get_mr_diff": get_mr_diff,
+        "get_mr_discussions": get_mr_discussions,
+        "get_mr_state": get_mr_state,
         "post_mr_comment": post_mr_comment,
         "post_mr_file_comment": post_mr_file_comment,
         "post_mr_inline_comment": post_mr_inline_comment,
         "require_gitlab_config": require_gitlab_config,
+        "execute_review_run": execute_review_run,
+        "settle_mr": settle_mr,
+        "repo": repo,
+        "TRIGGER_MANUAL": TRIGGER_MANUAL,
+        "TRIGGER_WEBHOOK_OPEN": TRIGGER_WEBHOOK_OPEN,
+        "TRIGGER_WEBHOOK_UPDATE": TRIGGER_WEBHOOK_UPDATE,
         "_parse_selected_skill": _parse_selected_skill,
         "auto_select_review_skill": auto_select_review_skill,
         "auto_select_review_skills": auto_select_review_skills,
@@ -116,18 +144,51 @@ _normalize_review_mode = normalize_review_mode
 _normalize_review_skill = normalize_review_skill
 _normalize_change_diff = normalize_change_diff
 
-# 配置日志
+
+def _build_log_handlers() -> list:
+    """
+    日志落盘目录不存在时自动创建。
+
+    容器里 ~/opencr/logs 不会预先存在，缺了这一步服务会在 import 阶段就崩。
+    仍然失败时退回仅标准输出 —— 拿不到文件日志也好过起不来。
+    """
+    handlers = [logging.StreamHandler(sys.stdout)]
+    log_path = Path(os.getenv("OPENCR_LOG_FILE", "~/opencr/logs/server.log")).expanduser()
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        handlers.append(logging.FileHandler(log_path))
+    except OSError as e:
+        print(f"[opencr] file logging disabled ({log_path}): {e}", file=sys.stderr)
+    return handlers
+
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler(os.path.expanduser("~/opencr/logs/server.log")),
-    ],
+    handlers=_build_log_handlers(),
 )
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
+app.register_blueprint(admin_bp)
+
+
+def _verify_admin_config() -> None:
+    """
+    启用后台却没配 token 时直接拒绝启动。
+
+    静默放行等于把一个无鉴权的管理面板挂在 webhook 端口上，
+    而这个端口按部署方式通常是内网可达的。
+    """
+    cfg = load_admin_config()
+    if cfg["enabled"] and not cfg["token"]:
+        raise RuntimeError(
+            "admin.enabled=true 但 admin.token 为空。"
+            "请在 config.yaml 中配置 admin.token，或设置 OPENCR_ADMIN_TOKEN 环境变量。"
+        )
+
+
+_verify_admin_config()
 
 
 def validate_webhook_token(f):
@@ -135,6 +196,7 @@ def validate_webhook_token(f):
 
     @wraps(f)
     def decorated(*args, **kwargs):
+        """未配置 webhook_secret 时不做校验，保持与旧版本的兼容行为。"""
         secret_token = load_gitlab_config()["webhook_secret"]
         if secret_token:
             header_token = request.headers.get("X-Gitlab-Token")
@@ -198,6 +260,36 @@ def should_review_mr(data: dict) -> tuple:
     return True, action_reason, target_mode
 
 
+def _is_settlement_event(data: dict) -> str:
+    """
+    判断这次 webhook 是否是 MR 到达终态。返回终态名，否则空串。
+
+    合并/关闭事件原先在 should_review_mr 的第一行就被挡掉了，
+    结算必须插在它之前 —— 这是采纳统计唯一的触发时机。
+    """
+    attrs = data.get("object_attributes", {})
+    action = (attrs.get("action") or "").strip().lower()
+    state = (attrs.get("state") or "").strip().lower()
+    if action == "merge" or state == "merged":
+        return "merged"
+    if action == "close" or state == "closed":
+        return "closed"
+    return ""
+
+
+def _is_reviewable_event(data: dict) -> bool:
+    """
+    这次事件本来有没有可能触发审查。
+
+    只有 opened 状态下的 open/update 才值得为"被跳过"留痕（WIP、dependabot、merge commit 等）。
+    merge/close/reopen 不被审查是理所当然的，记下来只会把面板刷满噪音。
+    """
+    attrs = data.get("object_attributes", {})
+    state = (attrs.get("state") or "").strip().lower()
+    action = (attrs.get("action") or "").strip().lower()
+    return state in {"", "opened"} and action in {"open", "update"}
+
+
 @app.route("/health", methods=["GET"])
 def health_check():
     """健康检查端点"""
@@ -213,126 +305,8 @@ def health_check():
     )
 
 
-def _post_inline_comment_with_offset(
-    project_id: int,
-    mr_iid: int,
-    content: str,
-    new_path: str,
-    old_path: str,
-    source_line: int,
-    diff_refs: dict,
-    log_prefix: str = "",
-) -> int:
-    """
-    行内评论优先发布到问题行的下一行，避免评论遮挡目标代码。
-    若下一行定位失败，则自动回退到原始行。
-    返回最终成功发布的行号。
-    """
-    preferred_line = max(int(source_line) + 1, 1)
-    candidate_lines = [preferred_line]
-    if source_line not in candidate_lines:
-        candidate_lines.append(int(source_line))
-
-    last_error = None
-    for target_line in candidate_lines:
-        try:
-            post_mr_inline_comment(
-                project_id=project_id,
-                mr_iid=mr_iid,
-                content=content,
-                new_path=new_path,
-                old_path=old_path,
-                new_line=target_line,
-                diff_refs=diff_refs,
-            )
-            if target_line != source_line:
-                logger.info(
-                    "%s Inline note line shifted for MR !%s: %s source_line=%s -> target_line=%s",
-                    log_prefix,
-                    mr_iid,
-                    new_path,
-                    source_line,
-                    target_line,
-                )
-            return target_line
-        except Exception as e:
-            last_error = e
-            if target_line != source_line:
-                logger.warning(
-                    "%s Inline note next-line placement failed for MR !%s at %s:%s, fallback to source line %s: %s",
-                    log_prefix,
-                    mr_iid,
-                    new_path,
-                    target_line,
-                    source_line,
-                    e,
-                )
-                continue
-            raise
-
-    if last_error:
-        raise last_error
-    raise ReviewError("Inline comment 发布失败（未知错误）")
-
-
-def _build_inline_fallback_comments_by_file(failed_notes: list) -> list:
-    """将行内评论失败的问题按文件拆分为多条 MR 普通评论内容。"""
-    if not failed_notes:
-        return []
-
-    grouped_notes = {}
-    ordered_files = []
-    for item in failed_notes:
-        file_path = str(item.get("file_path") or "unknown")
-        if file_path not in grouped_notes:
-            grouped_notes[file_path] = []
-            ordered_files.append(file_path)
-        grouped_notes[file_path].append(
-            {
-                "line": int(item.get("line") or 0),
-                "body": str(item.get("body") or "").strip(),
-            }
-        )
-
-    comments = []
-    for file_path in ordered_files:
-        lines = [
-            f"### 文件级降级评论｜`{file_path}`",
-            "",
-            "> 行内评论发布失败，以下问题已降级为普通评论展示。",
-            "",
-        ]
-        for note in grouped_notes[file_path]:
-            line = note["line"]
-            body = note["body"]
-            location = f"{file_path}:{line}" if line > 0 else file_path
-            lines.append(f"- **位置**: `{location}`")
-            if body:
-                lines.append(body)
-            lines.append("")
-        comments.append("\n".join(lines).strip())
-
-    return comments
-
-
-def _is_binary_or_non_text_change(change: dict) -> bool:
-    """
-    判断文件变更是否缺少可定位的文本 diff（通常为二进制/非文本文件）。
-    这类文件不应尝试发布行内评论，应直接降级为文件级评论。
-    """
-    normalized_diff = normalize_change_diff(change or {})
-    if not normalized_diff.strip():
-        return True
-
-    diff_lower = normalized_diff.lower()
-    if "binary files" in diff_lower and "differ" in diff_lower:
-        return True
-    if "binary or non-text file changed" in diff_lower:
-        return True
-    return False
-
-
 def process_review_async(
+    run_uid,
     project_id,
     mr_iid,
     mr_title,
@@ -341,220 +315,48 @@ def process_review_async(
     action="",
     update_from_sha="",
     update_to_sha="",
+    log_prefix="[Async]",
 ):
-    """后台线程处理审查"""
-    try:
-        review_cfg = load_review_config()
-        logger.info(f"[Async] Fetching changes for MR !{mr_iid}")
-        all_changes, diff_refs = get_mr_changes_with_refs(project_id, mr_iid)
-        changes_for_review = all_changes
-        file_info_ref = str(diff_refs.get("head_sha", "") or "").strip()
+    """后台线程入口：直接委托给统一的 ReviewRun 执行器。"""
+    execute_review_run(
+        run_uid=run_uid,
+        project_id=project_id,
+        mr_iid=mr_iid,
+        mr_title=mr_title,
+        review_mode=review_mode,
+        review_skill=review_skill,
+        action=action,
+        update_from_sha=update_from_sha,
+        update_to_sha=update_to_sha,
+        log_prefix=log_prefix,
+    )
 
-        normalized_mode = normalize_review_mode(review_mode)
-        if (
-            action == "update"
-            and normalized_mode == REVIEW_MODE_FILE
-            and update_from_sha
-        ):
-            target_to_sha = (update_to_sha or diff_refs.get("head_sha", "")).strip()
-            if not target_to_sha:
-                logger.warning("[Async] Incremental review skipped: missing update_to_sha for MR !%s", mr_iid)
-                return
-            if update_from_sha == target_to_sha:
-                logger.info(
-                    "[Async] Incremental review skipped: from_sha equals to_sha for MR !%s (%s)",
-                    mr_iid,
-                    update_from_sha[:8],
-                )
-                return
-            changes_for_review = get_compare_changes(project_id, update_from_sha, target_to_sha)
-            file_info_ref = target_to_sha
-            incremental_paths = []
-            seen_paths = set()
-            for change in changes_for_review:
-                path = (
-                    str(change.get("new_path") or "").strip()
-                    or str(change.get("old_path") or "").strip()
-                    or "unknown"
-                )
-                if path in seen_paths:
-                    continue
-                seen_paths.add(path)
-                incremental_paths.append(path)
 
-            preview_limit = 30
-            preview_paths = incremental_paths[:preview_limit]
-            if len(incremental_paths) > preview_limit:
-                preview_paths.append(f"...(+{len(incremental_paths) - preview_limit} more)")
-            logger.info(
-                "[Async] Incremental changes resolved for MR !%s: from=%s to=%s count=%s",
-                mr_iid,
-                update_from_sha[:8],
-                target_to_sha[:8],
-                len(changes_for_review),
-            )
-            logger.info(
-                "[Async] Incremental file list for MR !%s: unique_count=%s, files=%s",
-                mr_iid,
-                len(incremental_paths),
-                ", ".join(preview_paths) if preview_paths else "<empty>",
-            )
+def _start_review_thread(**kwargs) -> None:
+    """把一次 ReviewRun 丢到后台线程，让 HTTP 请求立刻返回。"""
+    thread = threading.Thread(target=process_review_async, kwargs=kwargs)
+    thread.daemon = True
+    thread.start()
 
-        if not changes_for_review:
-            logger.info("[Async] No changes to review for MR !%s, skip", mr_iid)
-            return
 
-        changes_for_review = enrich_changes_with_file_info(
-            project_id=project_id,
-            changes=changes_for_review,
-            ref=file_info_ref,
-        )
-        size_known_count = sum(1 for c in changes_for_review if c.get("file_size_bytes") is not None)
-        logger.info(
-            "[Async] File metadata attached: total=%s, size_known=%s, ref=%s",
-            len(changes_for_review),
-            size_known_count,
-            file_info_ref[:8] if file_info_ref else "<empty>",
-        )
+def _settle_async(project_id: int, mr_iid: int, mr_state: str) -> None:
+    """
+    异步结算一个已到终态的 MR。
 
-        logger.info(f"[Async] Review mode={review_mode}, skill={review_skill}")
-        review_result, inline_notes = review_changes_with_inline_notes(
-            changes_for_review,
-            review_mode=review_mode,
-            review_skill=review_skill,
-            max_diff_size=review_cfg["max_diff_size"],
-            skills_dir=review_cfg["skills_dir"],
-        )
+    结算要逐条查 award emoji，一个有 20 条发现的 MR 就是 20 次 API 调用；
+    放在 webhook 请求里同步做会让 GitLab 侧超时重发。
+    """
 
-        path_to_change = {}
-        for change in changes_for_review:
-            np = change.get("new_path")
-            op = change.get("old_path")
-            if np:
-                path_to_change[np] = change
-            if op and op not in path_to_change:
-                path_to_change[op] = change
-
-        inline_ok = 0
-        inline_fail = 0
-        failed_inline_notes = []
-        for note in inline_notes:
-            file_path = str(note.get("file_path", "")).strip()
-            line = int(note.get("line", 0))
-            body = str(note.get("body", "")).strip()
-            if not file_path or not body:
-                continue
-
-            change = path_to_change.get(file_path, {})
-            new_path = change.get("new_path") or file_path
-            old_path = change.get("old_path") or new_path
-
-            # 二进制/非文本文件，或未提供有效行号的问题，优先尝试文件级 discussion。
-            # 若平台不支持 position_type=file，再降级为 MR 普通评论。
-            if line <= 0 or _is_binary_or_non_text_change(change):
-                try:
-                    post_mr_file_comment(
-                        project_id=project_id,
-                        mr_iid=mr_iid,
-                        content=body,
-                        new_path=new_path,
-                        old_path=old_path,
-                        diff_refs=diff_refs,
-                    )
-                    inline_ok += 1
-                    logger.info(
-                        "[Async] Posted file-level discussion on MR !%s: %s (line=%s)",
-                        mr_iid,
-                        new_path,
-                        line,
-                    )
-                except Exception as e:
-                    inline_fail += 1
-                    failed_inline_notes.append(
-                        {
-                            "file_path": new_path,
-                            "line": 0,
-                            "body": body,
-                        }
-                    )
-                    logger.warning(
-                        "[Async] File-level discussion unavailable for MR !%s at %s (line=%s), fallback to MR note: %s",
-                        mr_iid,
-                        new_path,
-                        line,
-                        e,
-                    )
-                continue
-
-            try:
-                _post_inline_comment_with_offset(
-                    project_id=project_id,
-                    mr_iid=mr_iid,
-                    content=body,
-                    new_path=new_path,
-                    old_path=old_path,
-                    diff_refs=diff_refs,
-                    source_line=line,
-                    log_prefix="[Async]",
-                )
-                inline_ok += 1
-            except Exception as e:
-                inline_fail += 1
-                failed_inline_notes.append(
-                    {
-                        "file_path": new_path,
-                        "line": line,
-                        "body": body,
-                    }
-                )
-                logger.warning(
-                    "Inline comment failed for MR !%s at %s (source_line=%s): %s",
-                    mr_iid,
-                    new_path,
-                    line,
-                    e,
-                )
-
-        logger.info(
-            "[Async] Inline comments posted: success=%s, failed=%s, extracted=%s",
-            inline_ok,
-            inline_fail,
-            len(inline_notes),
-        )
-        fallback_comments = _build_inline_fallback_comments_by_file(failed_inline_notes)
-        if fallback_comments:
-            logger.info(
-                "[Async] Inline fallback grouped by file: files=%s, comments=%s",
-                len({str(n.get('file_path') or 'unknown') for n in failed_inline_notes}),
-                len(fallback_comments),
-            )
-
-        if normalized_mode in {REVIEW_MODE_OVERALL, REVIEW_MODE_HYBRID}:
-            if review_result.strip():
-                post_mr_comment(project_id, mr_iid, review_result.strip())
-            for fallback_comment in fallback_comments:
-                post_mr_comment(project_id, mr_iid, fallback_comment)
-        elif normalized_mode == REVIEW_MODE_FILE and fallback_comments:
-            for fallback_comment in fallback_comments:
-                post_mr_comment(project_id, mr_iid, fallback_comment)
-        else:
-            logger.info(
-                "[Async] Skip MR summary comment: mr_iid=%s, mode=%s, inline_success=%s",
-                mr_iid,
-                normalized_mode,
-                inline_ok,
-            )
-
-        logger.info(f"[Async] Successfully reviewed MR !{mr_iid}")
-
-    except ReviewError as e:
-        logger.error(f"[Async] Review failed for MR !{mr_iid}: {e}")
+    def _run():
+        """结算失败只记录不重抛：兜底的 reconciler 下一轮还会再试。"""
         try:
-            post_mr_comment(project_id, mr_iid, f"❌ 代码审查失败\n\n```\n{str(e)}\n```")
+            settle_mr(project_id, mr_iid, mr_state)
         except Exception:
-            pass
-    except Exception:
-        logger.exception(f"[Async] Unexpected error for MR !{mr_iid}")
+            logger.exception("Settlement failed for MR !%s", mr_iid)
+
+    thread = threading.Thread(target=_run)
+    thread.daemon = True
+    thread.start()
 
 
 @app.route("/webhook", methods=["POST"])
@@ -574,6 +376,7 @@ def handle_webhook():
     project = data.get("project", {})
 
     project_id = project.get("id")
+    project_path = str(project.get("path_with_namespace") or "")
     mr_iid = attrs.get("iid")
     mr_title = attrs.get("title")
 
@@ -585,12 +388,33 @@ def handle_webhook():
         attrs.get("action"),
     )
 
+    # 结算必须在 should_review_mr 之前 —— 后者会把所有非 opened 的 MR 直接挡掉
+    settlement_state = _is_settlement_event(data)
+    if settlement_state and project_id and mr_iid:
+        logger.info("MR !%s reached %s, scheduling settlement", mr_iid, settlement_state)
+        _settle_async(int(project_id), int(mr_iid), settlement_state)
+
     should_review, reason, trigger_mode = should_review_mr(data)
     if not should_review:
         logger.info(f"Skipping MR !{mr_iid}: {reason}")
+        if project_id and mr_iid and _is_reviewable_event(data):
+            try:
+                repo.record_skipped_run(
+                    project_id=int(project_id),
+                    mr_iid=int(mr_iid),
+                    trigger=(
+                        TRIGGER_WEBHOOK_OPEN
+                        if (attrs.get("action") or "").strip().lower() == "open"
+                        else TRIGGER_WEBHOOK_UPDATE
+                    ),
+                    skip_reason=reason,
+                    mr_title=mr_title or "",
+                    project_path=project_path,
+                )
+            except Exception:
+                logger.warning("Failed to record skipped run for MR !%s", mr_iid, exc_info=True)
         return jsonify({"message": f"Skipped: {reason}"}), 200
 
-    review_cfg = load_review_config()
     review_mode, review_skill = resolve_review_options(
         data,
         default_skill="",
@@ -620,27 +444,34 @@ def handle_webhook():
         update_to_sha[:8] if update_to_sha else "<empty>",
     )
 
-    thread = threading.Thread(
-        target=process_review_async,
-        args=(
-            project_id,
-            mr_iid,
-            mr_title,
-            review_mode,
-            review_skill,
-            action,
-            update_from_sha,
-            update_to_sha,
-        ),
+    run_uid = repo.start_run(
+        project_id=int(project_id),
+        mr_iid=int(mr_iid),
+        trigger=TRIGGER_WEBHOOK_OPEN if action == "open" else TRIGGER_WEBHOOK_UPDATE,
+        review_mode=review_mode,
+        mr_title=mr_title or "",
+        project_path=project_path,
     )
-    thread.daemon = True
-    thread.start()
 
-    logger.info(f"Started async review for MR !{mr_iid}")
+    _start_review_thread(
+        run_uid=run_uid,
+        project_id=project_id,
+        mr_iid=mr_iid,
+        mr_title=mr_title,
+        review_mode=review_mode,
+        review_skill=review_skill,
+        action=action,
+        update_from_sha=update_from_sha,
+        update_to_sha=update_to_sha,
+        log_prefix="[Async]",
+    )
+
+    logger.info(f"Started async review for MR !{mr_iid} (run={run_uid})")
     return (
         jsonify(
             {
                 "message": "Review started",
+                "run_uid": run_uid,
                 "mr_iid": mr_iid,
                 "status": "processing",
                 "review_mode": review_mode,
@@ -653,7 +484,12 @@ def handle_webhook():
 
 @app.route("/manual-review", methods=["POST"])
 def manual_review():
-    """手动触发审查"""
+    """
+    手动触发审查。
+
+    与 webhook 走同一条执行路径，因此同样是异步的：立即返回 202 与 run_uid，
+    进度到 /admin 或 /api/admin/runs/<run_uid> 查看。
+    """
     data = request.json or {}
     project_id = data.get("project_id")
     mr_iid = data.get("mr_iid")
@@ -670,7 +506,6 @@ def manual_review():
     )
 
     try:
-        review_cfg = load_review_config()
         review_mode, review_skill = resolve_review_options(
             {},
             default_skill="",
@@ -678,165 +513,127 @@ def manual_review():
             manual_skill=str(data.get("review_skill", "")),
         )
         logger.info(
-            "Manual review resolved options: mode=%s, skill=%s, default_skill=%s",
+            "Manual review resolved options: mode=%s, skill=%s",
             review_mode,
             review_skill,
-            "<empty>",
         )
 
-        changes, diff_refs = get_mr_changes_with_refs(project_id, mr_iid)
-        file_info_ref = str(diff_refs.get("head_sha", "") or "").strip()
-        changes = enrich_changes_with_file_info(
+        run_uid = repo.start_run(
+            project_id=int(project_id),
+            mr_iid=int(mr_iid),
+            trigger=TRIGGER_MANUAL,
+            review_mode=review_mode,
+            mr_title=str(data.get("mr_title") or ""),
+            project_path=str(data.get("project_path") or ""),
+        )
+        _start_review_thread(
+            run_uid=run_uid,
             project_id=project_id,
-            changes=changes,
-            ref=file_info_ref,
-        )
-        size_known_count = sum(1 for c in changes if c.get("file_size_bytes") is not None)
-        logger.info(
-            "Manual file metadata attached: total=%s, size_known=%s, ref=%s",
-            len(changes),
-            size_known_count,
-            file_info_ref[:8] if file_info_ref else "<empty>",
-        )
-        review_result, inline_notes = review_changes_with_inline_notes(
-            changes,
+            mr_iid=mr_iid,
+            mr_title=str(data.get("mr_title") or ""),
             review_mode=review_mode,
             review_skill=review_skill,
-            max_diff_size=review_cfg["max_diff_size"],
-            skills_dir=review_cfg["skills_dir"],
+            log_prefix="[Manual]",
         )
-
-        path_to_change = {}
-        for change in changes:
-            np = change.get("new_path")
-            op = change.get("old_path")
-            if np:
-                path_to_change[np] = change
-            if op and op not in path_to_change:
-                path_to_change[op] = change
-
-        inline_ok = 0
-        inline_fail = 0
-        failed_inline_notes = []
-        for note in inline_notes:
-            file_path = str(note.get("file_path", "")).strip()
-            line = int(note.get("line", 0))
-            body = str(note.get("body", "")).strip()
-            if not file_path or not body:
-                continue
-
-            change = path_to_change.get(file_path, {})
-            new_path = change.get("new_path") or file_path
-            old_path = change.get("old_path") or new_path
-
-            # 二进制/非文本文件，或未提供有效行号的问题，优先尝试文件级 discussion。
-            # 若平台不支持 position_type=file，再降级为 MR 普通评论。
-            if line <= 0 or _is_binary_or_non_text_change(change):
-                try:
-                    post_mr_file_comment(
-                        project_id=project_id,
-                        mr_iid=mr_iid,
-                        content=body,
-                        new_path=new_path,
-                        old_path=old_path,
-                        diff_refs=diff_refs,
-                    )
-                    inline_ok += 1
-                    logger.info(
-                        "Manual posted file-level discussion on MR !%s: %s (line=%s)",
-                        mr_iid,
-                        new_path,
-                        line,
-                    )
-                except Exception as e:
-                    inline_fail += 1
-                    failed_inline_notes.append(
-                        {
-                            "file_path": new_path,
-                            "line": 0,
-                            "body": body,
-                        }
-                    )
-                    logger.warning(
-                        "Manual file-level discussion unavailable for MR !%s at %s (line=%s), fallback to MR note: %s",
-                        mr_iid,
-                        new_path,
-                        line,
-                        e,
-                    )
-                continue
-            try:
-                _post_inline_comment_with_offset(
-                    project_id=project_id,
-                    mr_iid=mr_iid,
-                    content=body,
-                    new_path=new_path,
-                    old_path=old_path,
-                    diff_refs=diff_refs,
-                    source_line=line,
-                    log_prefix="[Manual]",
-                )
-                inline_ok += 1
-            except Exception as e:
-                inline_fail += 1
-                failed_inline_notes.append(
-                    {
-                        "file_path": new_path,
-                        "line": line,
-                        "body": body,
-                    }
-                )
-                logger.warning(
-                    "Manual inline comment failed for MR !%s at %s (source_line=%s): %s",
-                    mr_iid,
-                    new_path,
-                    line,
-                    e,
-                )
-
-        logger.info(
-            "Manual inline comments posted: success=%s, failed=%s, extracted=%s",
-            inline_ok,
-            inline_fail,
-            len(inline_notes),
-        )
-        normalized_mode = normalize_review_mode(review_mode)
-        fallback_comments = _build_inline_fallback_comments_by_file(failed_inline_notes)
-        if fallback_comments:
-            logger.info(
-                "Manual inline fallback grouped by file: files=%s, comments=%s",
-                len({str(n.get('file_path') or 'unknown') for n in failed_inline_notes}),
-                len(fallback_comments),
-            )
-        if normalized_mode in {REVIEW_MODE_OVERALL, REVIEW_MODE_HYBRID}:
-            if review_result.strip():
-                post_mr_comment(project_id, mr_iid, review_result.strip())
-            for fallback_comment in fallback_comments:
-                post_mr_comment(project_id, mr_iid, fallback_comment)
-        elif normalized_mode == REVIEW_MODE_FILE and fallback_comments:
-            for fallback_comment in fallback_comments:
-                post_mr_comment(project_id, mr_iid, fallback_comment)
-        else:
-            logger.info(
-                "Manual review skip MR summary comment: mr_iid=%s, mode=%s, inline_success=%s",
-                mr_iid,
-                normalized_mode,
-                inline_ok,
-            )
         return (
             jsonify(
                 {
-                    "message": "Manual review completed",
+                    "message": "Review started",
+                    "run_uid": run_uid,
+                    "mr_iid": mr_iid,
+                    "status": "processing",
                     "review_mode": review_mode,
                     "review_skill": review_skill,
                 }
             ),
-            200,
+            202,
         )
 
     except Exception as e:
-        logger.exception("Manual review failed")
+        logger.exception("Manual review failed to start")
         return jsonify({"error": str(e)}), 500
+
+
+# ---------------------------------------------------------------------------
+# Reconciler：兜底结算 + 保留期清理
+# ---------------------------------------------------------------------------
+
+RECONCILER_LEASE = "reconciler"
+
+
+def _reconcile_once() -> None:
+    """
+    兜底一轮：结算错过 webhook 的 MR，并清理过期数据。
+
+    服务宕机期间收不到 merge 事件，没有这一轮那些 Finding 会永远停在 undecided。
+    """
+    storage_cfg = load_storage_config()
+    holder = f"{os.getpid()}@{os.uname().nodename}"
+    interval = int(storage_cfg["reconcile_interval_seconds"])
+
+    # 多 worker 下只让一个进程干活；租约 TTL 取一个周期多一点，避免抢锁抖动
+    if not repo.acquire_lease(RECONCILER_LEASE, holder, interval + 60):
+        return
+
+    pending = repo.list_mrs_pending_settlement(limit=50)
+    for item in pending:
+        try:
+            settle_mr(item["project_id"], item["mr_iid"])
+        except Exception:
+            logger.warning(
+                "Reconcile settlement failed for MR !%s", item["mr_iid"], exc_info=True
+            )
+
+    purged = repo.purge_old_runs(int(storage_cfg["retention_days"]))
+    if purged:
+        logger.info("Reconciler purged %s runs beyond retention", purged)
+
+
+def _reconciler_loop() -> None:
+    """
+    兜底循环。先睡再干，避免服务启动瞬间就抢锁、拖慢首个请求。
+
+    单轮异常不退出循环：reconciler 挂掉是静默故障，比多打一行日志危险得多。
+    """
+    interval = int(load_storage_config()["reconcile_interval_seconds"])
+    while True:
+        time.sleep(interval)
+        try:
+            _reconcile_once()
+        except Exception:
+            logger.exception("Reconciler iteration failed")
+
+
+_reconciler_started = False
+_reconciler_lock = threading.Lock()
+
+
+def start_reconciler() -> None:
+    """
+    启动 reconciler 后台线程（每个进程至多一个）。
+
+    刻意在首个请求时才启动，而不是在 import 阶段：gunicorn 的 --preload 会先 import
+    再 fork，import 期启动的线程不会被子进程继承，结果只有 master 里有这个线程。
+    延迟到请求期启动，无论是否 preload、是容器还是 launchd，行为都一致；
+    真正的互斥由数据库租约保证，多个进程各起一个线程也只有一个会干活。
+    """
+    global _reconciler_started
+    if os.getenv("OPENCR_DISABLE_RECONCILER", "").strip().lower() in {"1", "true", "yes", "on"}:
+        return
+    with _reconciler_lock:
+        if _reconciler_started:
+            return
+        _reconciler_started = True
+    thread = threading.Thread(target=_reconciler_loop, name="opencr-reconciler")
+    thread.daemon = True
+    thread.start()
+    logger.info("Reconciler thread started (pid=%s)", os.getpid())
+
+
+@app.before_request
+def _ensure_reconciler_running():
+    """每个请求前确认本进程的 reconciler 已启动（内部有幂等保护）。"""
+    start_reconciler()
 
 
 if __name__ == "__main__":
@@ -860,5 +657,8 @@ if __name__ == "__main__":
     gitlab_token = gitlab_cfg["token"]
     logger.info(f"GitLab URL: {gitlab_url[:30] if gitlab_url else 'NOT SET'}...")
     logger.info(f"GitLab Token: {'SET' if gitlab_token else 'NOT SET'}")
+
+    admin_cfg = load_admin_config()
+    logger.info(f"Admin console: {'ENABLED at /admin' if admin_cfg['enabled'] else 'disabled'}")
 
     app.run(host=host, port=port, debug=False)

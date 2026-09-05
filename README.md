@@ -15,8 +15,9 @@ Language: English | [中文](https://github.com/LinXunFeng/opencr/blob/main/READ
 3. [Architecture Overview](#architecture-overview)
 4. [Installation](#installation)
 5. [GitLab Configuration](#gitlab-configuration)
-6. [Operations and Maintenance](#operations-and-maintenance)
-7. [Troubleshooting](#troubleshooting)
+6. [Admin Console](#admin-console)
+7. [Operations and Maintenance](#operations-and-maintenance)
+8. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -51,16 +52,28 @@ opencr/
 ├── README-zh.md            # Chinese documentation
 ├── skills/                 # Review skills
 │   └── review/             # Skill bundles (name/SKILL.md, references, scripts, assets)
+├── Dockerfile              # Container image
+├── docker-compose.yml      # Container orchestration (recommended deployment)
+├── alembic.ini             # Database migration config
+├── migrations/             # Database migration scripts
+├── CONTEXT.md              # Domain glossary
+├── docs/adr/               # Architecture decision records
 ├── src/                    # Source code
-│   ├── __init__.py
-│   ├── review_server.py    # Flask main service
-│   └── wsgi.py             # WSGI production entry
+│   ├── review_server.py    # Flask routing and thread scheduling
+│   ├── wsgi.py             # WSGI production entry
+│   ├── review/             # Review execution, settlement, GitLab client
+│   │   ├── runner.py       # Unified ReviewRun entry point
+│   │   └── settlement.py   # Acceptance verdict logic
+│   ├── storage/            # Persistence (SQLAlchemy)
+│   └── admin/              # Admin routes and pages
 └── .gitignore
 
 # Generated after installation
 ~/opencr/
 ├── src/                    # Copied source
 ├── skills/                 # Copied skills for auto skill routing
+├── migrations/             # Copied database migrations
+├── data/                   # SQLite database (review history and acceptance stats)
 ├── logs/                   # Log directory
 ├── venv/                   # Python virtual environment
 ├── config.yaml             # Runtime configuration file
@@ -93,7 +106,42 @@ opencr/
 
 ## Installation
 
-### Method 1: One-click Installer (Recommended)
+Two options are supported: **Docker** (recommended, cross-platform) and the
+**macOS one-click script** (launchd, for running it on your own Mac).
+
+### Method 1: Docker (Recommended)
+
+```bash
+# 1. Prepare the config (required first - step 2 exits immediately without it)
+cp config.example.yaml config.yaml
+# Edit config.yaml, especially the openai and code_platform sections.
+# For the admin console, also set admin.enabled to true and fill in admin.token.
+
+# 2. Build and start
+docker compose up -d
+
+# 3. Check logs and health
+docker compose logs -f
+curl http://localhost:9034/health
+```
+
+`docker-compose.yml` defines four mounts:
+
+| Mount | Purpose |
+|-------|---------|
+| `./config.yaml` -> `/app/config.yaml` | Read-only. **Required** - the container exits with a message if it is missing |
+| `./skills` -> `/app/skills` | Read-only. **Replaces** the default skills baked into the image; changing a review rule needs no rebuild |
+| `opencr-data` -> `/app/data` | Review history and acceptance statistics. **Deleting it resets all statistics, and they cannot be backfilled** |
+| `opencr-logs` -> `/app/logs` | Runtime logs |
+
+Database migrations (`alembic upgrade head`) run automatically at container start,
+so upgrading the image needs no manual step.
+
+> **Note**: scripts under `skills/*/scripts/` execute **inside the container**, and the
+> image only guarantees `python3`. If your custom skill scripts need another runtime
+> (Node, Dart, ...), build your own image on top of this one.
+
+### Method 2: macOS One-click Installer
 
 ```bash
 # Add execute permission and run installer
@@ -212,6 +260,81 @@ After saving the webhook, click **Test** -> **Merge requests**.
 
 ---
 
+## Admin Console
+
+The console is **disabled by default**. To enable it, set both values in `config.yaml`:
+
+```yaml
+admin:
+  enabled: true
+  token: "replace-with-a-long-random-string"
+  # The webhook port is usually reachable from the intranet.
+  # Turn this on if you only access the console from the host itself.
+  bind_local_only: false
+```
+
+> If `admin.enabled` is `true` but `token` is empty, the service **refuses to start**
+> rather than silently allowing access - otherwise you would be exposing an
+> unauthenticated admin panel on an intranet-reachable port.
+
+Access (same token for all three):
+
+```bash
+# Browser: pass ?token= once, a cookie is set and /admin works directly afterwards
+open "http://localhost:9034/admin?token=YOUR_TOKEN"
+
+# API
+curl -H "X-Admin-Token: YOUR_TOKEN" http://localhost:9034/api/admin/overview
+curl -H "X-Admin-Token: YOUR_TOKEN" http://localhost:9034/api/admin/runs/<run_uid>
+```
+
+### What the console shows
+
+| Section | Contents |
+|---------|----------|
+| In progress | Running reviews, current phase, per-file progress |
+| Error statistics | Failed / degraded / skipped counts over the last 7 days |
+| Acceptance | Verdict distribution, acceptance rate and coverage over the last 30 days |
+| Recent runs | Last 50 review runs, including skipped ones and why |
+
+### Read these definitions before reading the numbers
+
+**Progress**: `overall` mode is a single model call with no observable midpoint, so it
+reports a phase and no percentage. `file` mode iterates over changed files and adds a
+`3/17` file counter. There is no invented progress bar anywhere.
+
+**"In progress" vs "stale"**: the service runs multiple processes, and no single process
+can assert that another process's review has died. A heartbeat timeout
+(600s by default, `storage.stale_after_seconds`) therefore only **labels** a run as stale;
+it never rewrites it to failed - the run may simply be stuck in an unusually slow model call.
+
+**Failed / degraded / skipped are three different things**:
+
+- **Failed**: the review did not complete (model or platform call failed, uncaught exception)
+- **Degraded**: the run finished but quality suffered - an inline comment failed to post and was
+  downgraded to a plain comment (the content still reached the user), or the diff was truncated
+- **Skipped**: Draft/WIP, dependabot, merge-commit updates. **This is not an error**
+
+**The acceptance rate is an approximation.** It is derived from GitLab discussion resolved
+state and 👍/👎 reactions. This version does **not** verify whether the code actually changed,
+so "resolved" counts as accepted even though in practice it sometimes only means "I read it".
+The full trade-off is recorded in
+[ADR-0001](./docs/adr/0001-suggestion-acceptance-via-discussion-state.md).
+
+**Coverage must be read alongside the acceptance rate.** Only findings published as GitLab
+discussions can be settled. The single summary comment produced by `overall` mode goes through
+a **plain note, which cannot be resolved**, and so do inline comments that failed and were
+downgraded. Both still count toward total output, which is why the console shows both
+"9 of 12 accepted" and "40 findings produced, 12 of them trackable".
+
+### Data retention
+
+Review records are kept for 90 days by default (`storage.retention_days`) and purged by a
+background task. **Acceptance data cannot be backfilled** - MRs from before this feature
+shipped will never have verdicts, and purged data is equally unrecoverable.
+
+---
+
 ## Operations and Maintenance
 
 ### Service Management
@@ -240,24 +363,34 @@ tail -f ~/opencr/logs/launchd.err.log
 # Manual checks
 curl http://localhost:9034/health
 
-# Trigger manual review
+# Trigger a manual review (asynchronous: returns 202 with a run_uid)
 curl -X POST http://localhost:9034/manual-review \
   -H "Content-Type: application/json" \
   -d '{"project_id": 123, "mr_iid": 456, "review_mode": "file"}'
+# => {"message":"Review started","run_uid":"...","status":"processing", ...}
+
+# Check progress and results for that run
+curl -H "X-Admin-Token: YOUR_TOKEN" http://localhost:9034/api/admin/runs/<run_uid>
 ```
+
+> **Since 0.4.0 `/manual-review` is asynchronous**: it no longer returns the review
+> content synchronously, but a `202` with a `run_uid`. This puts it on the same
+> execution path as the webhook, so the state machine exists in exactly one place.
 
 ### Update Deployment
 
+Docker:
+
 ```bash
-cd ~/opencr
+git pull && docker compose up -d --build
+# Migrations run automatically at container start
+```
 
-# Copy updated source files
-cp -r /path/to/new/src/* src/
-cp -r /path/to/new/skills/* skills/
+macOS launchd:
 
-# Restart service
-launchctl stop com.opencr.server
-launchctl start com.opencr.server
+```bash
+# Just re-run the installer. The database migrates automatically and existing data is kept.
+./install.sh
 ```
 
 ---

@@ -261,6 +261,41 @@ def _parse_file_review_issues(review_text: str, default_file_path: str) -> List[
     return findings
 
 
+SEVERITY_PATTERNS = (
+    ("critical", ("🔴", "严重")),
+    ("warning", ("🟡", "警告")),
+    ("advice", ("🟢", "建议")),
+)
+
+
+def parse_severity(body: str) -> str:
+    """
+    从问题块里解析严重度。
+
+    模型不总是按模板输出，解析不到就是 unknown —— 不做推断兜底，
+    宁可在后台如实显示 unknown，也不要编一个看起来合理的级别。
+    """
+    match = re.search(r"级别\*\*\s*[:：]\s*([^\n]+)", str(body or ""))
+    if not match:
+        return "unknown"
+    text = match.group(1)
+    for severity, markers in SEVERITY_PATTERNS:
+        if any(marker in text for marker in markers):
+            return severity
+    return "unknown"
+
+
+def parse_summary_findings(review_text: str) -> List[Dict[str, object]]:
+    """
+    从整体评论里切分出 Finding。
+
+    这些 Finding 走的是不可 resolve 的普通 note，永远不可追踪；
+    抽出来只为让 Coverage 的分母诚实 —— 否则面板会把"12 条中采纳 9 条"
+    显示成全部产出，而实际产出可能是 40 条。
+    """
+    return _parse_file_review_issues(review_text, default_file_path="")
+
+
 def _resolve_change_type(change: dict) -> str:
     """将 GitLab change 标记归一化为可读类型。"""
     if bool(change.get("deleted_file")):
@@ -371,8 +406,14 @@ def review_changes_with_inline_notes(
     review_skill: str,
     max_diff_size: int,
     skills_dir: str = "",
+    progress_cb=None,
 ) -> Tuple[str, List[Dict[str, object]]]:
-    """按审查模式执行审查，并返回可用于行内评论的结构化问题列表。"""
+    """
+    按审查模式执行审查，并返回可用于行内评论的结构化问题列表。
+
+    `progress_cb(done, total)` 在 file 模式下每处理完一个文件调用一次；
+    overall 模式是单次模型调用，没有中间可观测点，因此不会触发。
+    """
     normalized_mode = normalize_review_mode(review_mode)
     total_changes = len(changes or [])
     logger.info(
@@ -445,7 +486,19 @@ def review_changes_with_inline_notes(
         file_total = 0
         file_hit = 0
         file_miss = 0
+        def _report_progress(done: int) -> None:
+            if not callable(progress_cb):
+                return
+            try:
+                progress_cb(done, total_changes)
+            except Exception:
+                # 进度上报失败绝不能影响审查本身
+                logger.warning("Progress callback failed at done=%s", done, exc_info=True)
+
         for index, change in enumerate(changes, start=1):
+            # 在轮次开头上报已完成数：循环体内有多处 continue（未命中 skill 等），
+            # 放在末尾上报会把这些文件漏掉。
+            _report_progress(index - 1)
             file_path = change.get("new_path") or change.get("old_path") or f"file-{index}"
             review_diff = _build_file_review_diff(change, file_path=file_path)
             file_total += 1
@@ -522,6 +575,8 @@ def review_changes_with_inline_notes(
                         "Review execution FILE skipped: explicit pass text detected, file=%s",
                         file_path,
                     )
+
+        _report_progress(total_changes)
 
         if reviewed_files:
             logger.info(

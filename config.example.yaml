@@ -61,3 +61,35 @@ review:
   # Timeout for each skill script, in seconds.
   # 单个 skill script 的超时时间（秒）。
   skill_scripts_timeout: 10
+
+# Admin console settings. Disabled by default.
+# 后台管理配置。默认关闭 —— 从旧版本升级上来的实例不会平白多出一个管理面板。
+admin:
+  # Enable the /admin console and /api/admin/* endpoints.
+  # 是否启用 /admin 后台与 /api/admin/* 接口。
+  enabled: false
+  # Shared token required by every admin request. Mandatory when enabled is true;
+  # the service refuses to start if it is missing.
+  # 后台访问令牌。enabled 为 true 时必填，缺失将拒绝启动，而不是静默放行。
+  # 通过 X-Admin-Token 请求头，或首次访问时用 ?token=xxx 带上（成功后会种 cookie）。
+  token: ""
+  # Reject admin requests that do not come from loopback.
+  # 是否只允许本机访问后台。Webhook 端口通常内网可达，开启这项可缩小暴露面。
+  bind_local_only: false
+
+# Persistence settings for review history and acceptance statistics.
+# 审查历史与采纳统计的持久化配置。
+storage:
+  # SQLAlchemy database URL. Leave empty to use ~/opencr/data/opencr.db.
+  # 数据库连接串；留空则使用 ~/opencr/data/opencr.db。容器内固定为 /app/data/opencr.db。
+  database_url: ""
+  # Days to keep review runs before the reconciler purges them.
+  # 审查记录保留天数，超期由后台任务清理。注意：采纳数据无法回填，清理后不可恢复。
+  retention_days: 90
+  # A running review with no heartbeat for this long is shown as "stale".
+  # 心跳超过该秒数未更新的审查会在后台显示为「疑似中断」。
+  # 只标注不改写状态 —— 多进程下无法断言其他进程的审查已死。
+  stale_after_seconds: 600
+  # Interval of the background reconciler (settles missed merges, purges old data).
+  # 后台兜底任务的执行间隔（秒）：结算错过 webhook 的 MR，并清理过期数据。
+  reconcile_interval_seconds: 300

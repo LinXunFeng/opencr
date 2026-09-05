@@ -1,0 +1,225 @@
+{#
+  后台总览页。
+
+  刻意不引入任何外部 JS/CSS：GitLab 实例是自签证书的内网部署（见 gitlab.py 里的
+  verify=False），内网通常访问不到 CDN，引外部资源会让面板在真实部署环境里直接白屏。
+  因此图表用纯 CSS 条形图，交互用原生 fetch 轮询，样式全部内联。
+#}
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OpenCR 后台</title>
+<style>
+:root {
+  --bg: #f6f7f9; --card: #fff; --ink: #1c2024; --muted: #6b7280;
+  --line: #e5e7eb; --ok: #16a34a; --warn: #d97706; --bad: #dc2626; --info: #2563eb;
+}
+* { box-sizing: border-box; }
+body { margin: 0; padding: 24px; background: var(--bg); color: var(--ink);
+  font: 14px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; }
+h1 { font-size: 20px; margin: 0 0 4px; }
+h2 { font-size: 15px; margin: 0 0 12px; }
+a { color: var(--info); text-decoration: none; }
+a:hover { text-decoration: underline; }
+.wrap { max-width: 1180px; margin: 0 auto; }
+.sub { color: var(--muted); margin: 0 0 20px; font-size: 13px; }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 16px; margin-bottom: 16px; }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
+.stat { border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
+.stat .n { font-size: 22px; font-weight: 600; }
+.stat .l { color: var(--muted); font-size: 12px; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { color: var(--muted); font-weight: 500; white-space: nowrap; }
+.scroll { overflow-x: auto; }
+.tag { display: inline-block; padding: 1px 7px; border-radius: 999px; font-size: 12px; border: 1px solid var(--line); white-space: nowrap; }
+.t-succeeded { color: var(--ok); border-color: #bbf7d0; background: #f0fdf4; }
+.t-failed { color: var(--bad); border-color: #fecaca; background: #fef2f2; }
+.t-running { color: var(--info); border-color: #bfdbfe; background: #eff6ff; }
+.t-skipped { color: var(--muted); background: #f9fafb; }
+.t-stale { color: var(--warn); border-color: #fde68a; background: #fffbeb; }
+.bar { display: flex; height: 10px; border-radius: 999px; overflow: hidden; background: var(--line); margin: 8px 0; }
+.bar > span { display: block; height: 100%; }
+.legend { display: flex; flex-wrap: wrap; gap: 12px; font-size: 12px; color: var(--muted); }
+.legend i { display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 5px; vertical-align: middle; }
+.prog { background: var(--line); border-radius: 999px; height: 6px; width: 110px; overflow: hidden; }
+.prog > span { display: block; height: 100%; background: var(--info); }
+.note { color: var(--muted); font-size: 12px; margin-top: 10px; padding-top: 10px; border-top: 1px dashed var(--line); }
+.empty { color: var(--muted); padding: 12px 0; }
+.head { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+code { background: #f3f4f6; padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>OpenCR 后台</h1>
+  <p class="sub" id="svc">加载中…</p>
+
+  <div class="card">
+    <div class="head"><h2>进行中</h2><span class="sub" id="active-note"></span></div>
+    <div class="scroll"><table id="active"><thead><tr><th>开始</th><th>项目</th><th>MR</th><th>状态</th><th>进度</th></tr></thead><tbody></tbody></table></div>
+  </div>
+
+  <div class="card">
+    <h2>错误统计（近 7 天）</h2>
+    <div class="grid" id="err-stats"></div>
+    <div id="err-detail"></div>
+    <p class="note">失败 = 审查未完成（模型/平台调用失败或未捕获异常）。降级 = 流程走完但质量受损，例如行内评论投递失败后已降级为普通评论、diff 被截断。跳过不是错误。</p>
+  </div>
+
+  <div class="card">
+    <h2>建议采纳情况（近 30 天）</h2>
+    <div class="grid" id="verdict-stats"></div>
+    <div class="bar" id="verdict-bar"></div>
+    <div class="legend" id="verdict-legend"></div>
+    <p class="note" id="verdict-note"></p>
+  </div>
+
+  <div class="card">
+    <h2>最近运行</h2>
+    <div class="scroll"><table id="recent"><thead><tr>
+      <th>开始</th><th>项目</th><th>MR</th><th>触发</th><th>模式</th><th>状态</th><th>进度</th><th>说明</th>
+    </tr><tbody></tbody></thead></table></div>
+  </div>
+</div>
+
+<script>
+const VERDICT_LABEL = {
+  accepted: "已采纳", rejected: "未采纳", dismissed: "已关闭未改",
+  ignored: "未处理", undecided: "待结算", untrackable: "不可追踪"
+};
+const VERDICT_COLOR = {
+  accepted: "#16a34a", rejected: "#dc2626", dismissed: "#d97706",
+  ignored: "#9ca3af", undecided: "#2563eb", untrackable: "#d1d5db"
+};
+const STATUS_LABEL = { succeeded: "成功", failed: "失败", running: "进行中", skipped: "跳过" };
+const PHASE_LABEL = {
+  fetching: "拉取变更", matching_skill: "匹配 Skill", reviewing: "调用模型",
+  publishing: "发布评论", done: "完成"
+};
+const DEGRADE_LABEL = {
+  inline_post_failed: "行内评论投递失败（已降级）",
+  diff_truncated: "diff 被截断",
+  skill_script_failed: "Skill 脚本执行失败"
+};
+const ERROR_LABEL = { review_error: "审查错误", unexpected: "未捕获异常" };
+
+const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g,
+  (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+function fmtTime(iso) {
+  if (!iso) return "-";
+  const d = new Date(iso + (iso.endsWith("Z") ? "" : "Z"));
+  if (isNaN(d)) return iso;
+  return d.toLocaleString("zh-CN", { hour12: false });
+}
+
+function pct(v) { return v == null ? "—" : (v * 100).toFixed(1) + "%"; }
+
+function stat(n, l) {
+  return '<div class="stat"><div class="n">' + esc(n) + '</div><div class="l">' + esc(l) + "</div></div>";
+}
+
+function statusTag(run) {
+  if (run.is_stale) return '<span class="tag t-stale">疑似中断</span>';
+  const cls = "t-" + run.status;
+  return '<span class="tag ' + cls + '">' + esc(STATUS_LABEL[run.status] || run.status) + "</span>";
+}
+
+function progressCell(run) {
+  const phase = PHASE_LABEL[run.phase] || run.phase || "-";
+  if (!run.files_total) return esc(phase);
+  const ratio = Math.min(run.files_done / run.files_total, 1);
+  return esc(phase) + ' <span class="prog"><span style="width:' + (ratio * 100).toFixed(0) + '%"></span></span> '
+    + run.files_done + "/" + run.files_total;
+}
+
+function runNote(run) {
+  if (run.status === "skipped") return esc(run.skip_reason);
+  if (run.status === "failed") return '<span style="color:var(--bad)">' + esc(run.error_message.slice(0, 160)) + "</span>";
+  const d = (run.degradations || []).map((x) => (DEGRADE_LABEL[x.kind] || x.kind) + " ×" + x.count);
+  return d.length ? '<span style="color:var(--warn)">' + esc(d.join("；")) + "</span>" : "";
+}
+
+function mrCell(run) {
+  return '<a href="/admin/runs/' + esc(run.run_uid) + '">!' + esc(run.mr_iid) + "</a> "
+    + '<span class="l" style="color:var(--muted)">' + esc((run.mr_title || "").slice(0, 60)) + "</span>";
+}
+
+function render(data) {
+  const s = data.service;
+  document.getElementById("svc").innerHTML =
+    "v" + esc(s.version) + " · 模型 <code>" + esc(s.model) + "</code> · " + esc(s.base_url)
+    + " · 心跳超时 " + s.stale_after_seconds + "s";
+
+  // 进行中
+  const active = data.active_runs || [];
+  const abody = document.querySelector("#active tbody");
+  document.getElementById("active-note").textContent =
+    active.length ? active.length + " 个审查进行中" : "";
+  abody.innerHTML = active.length
+    ? active.map((r) => "<tr><td>" + fmtTime(r.started_at) + "</td><td>" + esc(r.project_path || r.project_id)
+        + "</td><td>" + mrCell(r) + "</td><td>" + statusTag(r) + "</td><td>" + progressCell(r) + "</td></tr>").join("")
+    : '<tr><td colspan="5" class="empty">当前没有审查在进行</td></tr>';
+
+  // 错误
+  const e = data.errors;
+  document.getElementById("err-stats").innerHTML =
+    stat(e.total_runs, "总运行") + stat(e.succeeded, "成功") + stat(e.failed, "失败")
+    + stat(e.degraded_runs, "含降级") + stat(e.skipped, "跳过");
+  const errRows = Object.entries(e.by_error_kind).map(([k, v]) => (ERROR_LABEL[k] || k) + "：" + v)
+    .concat(Object.entries(e.by_degradation).map(([k, v]) => (DEGRADE_LABEL[k] || k) + "：" + v));
+  document.getElementById("err-detail").innerHTML = errRows.length
+    ? '<p style="margin:12px 0 0;font-size:13px">' + esc(errRows.join(" ｜ ")) + "</p>" : "";
+
+  // 采纳
+  const v = data.verdicts;
+  document.getElementById("verdict-stats").innerHTML =
+    stat(v.total_findings, "审查发现总数") + stat(v.trackable_findings, "可追踪")
+    + stat(v.settled_findings, "已结算") + stat(pct(v.acceptance_rate), "采纳率")
+    + stat(pct(v.coverage_rate), "覆盖率");
+
+  const order = ["accepted", "rejected", "dismissed", "ignored", "undecided", "untrackable"];
+  const total = v.total_findings || 0;
+  document.getElementById("verdict-bar").innerHTML = total
+    ? order.map((k) => {
+        const n = v.by_verdict[k] || 0;
+        if (!n) return "";
+        return '<span style="width:' + ((n / total) * 100).toFixed(2) + "%;background:" + VERDICT_COLOR[k] + '"></span>';
+      }).join("")
+    : "";
+  document.getElementById("verdict-legend").innerHTML = order
+    .filter((k) => v.by_verdict[k])
+    .map((k) => '<span><i style="background:' + VERDICT_COLOR[k] + '"></i>' + VERDICT_LABEL[k] + " " + v.by_verdict[k] + "</span>")
+    .join("");
+  document.getElementById("verdict-note").innerHTML =
+    "采纳率分母是<b>已结算</b>的审查发现（" + v.settled_findings + " 条），"
+    + "口径为「有 👍 表态，或对应 discussion 已 resolved」——本版本不做代码改动验证，因此该数字是<b>近似值</b>。<br>"
+    + "覆盖率 = 可追踪 / 全部产出。整体评论中的 " + v.summary_only_findings
+    + " 条发现走的是不可 resolve 的普通评论，降级投递的发现同理，两者都无法结算。";
+
+  // 最近运行
+  const recent = data.recent_runs || [];
+  document.querySelector("#recent tbody").innerHTML = recent.length
+    ? recent.map((r) => "<tr><td>" + fmtTime(r.started_at) + "</td><td>" + esc(r.project_path || r.project_id)
+        + "</td><td>" + mrCell(r) + "</td><td>" + esc(r.trigger) + "</td><td>" + esc(r.review_mode || "-")
+        + "</td><td>" + statusTag(r) + "</td><td>" + progressCell(r) + "</td><td>" + runNote(r) + "</td></tr>").join("")
+    : '<tr><td colspan="8" class="empty">暂无记录</td></tr>';
+}
+
+async function tick() {
+  try {
+    const res = await fetch("/api/admin/overview", { headers: { "Accept": "application/json" } });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    render(await res.json());
+  } catch (err) {
+    document.getElementById("svc").textContent = "加载失败：" + err.message;
+  }
+}
+tick();
+setInterval(tick, 5000);
+</script>
+</body>
+</html>

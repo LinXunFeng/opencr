@@ -2,6 +2,21 @@
 
 本文件记录项目的重要变更。
 
+## [0.4.0] - 2026-09-05
+
+### Added
+- 新增后台管理面板 `/admin`：查看进行中的审查及其阶段/文件进度、最近运行记录、错误统计与建议采纳统计。默认关闭，需在 `config.yaml` 中设置 `admin.enabled` 与 `admin.token`。
+- 新增审查发现（Finding）采纳统计：在 MR 合并/关闭时依据 GitLab discussion 的 resolved 状态与 👍/👎 表态结算，判定口径见 `docs/adr/0001-suggestion-acceptance-via-discussion-state.md`。
+- 新增 SQLite 持久化层（SQLAlchemy + Alembic），记录每次 ReviewRun 与其产出，支持保留期自动清理。
+- 新增 Docker 安装方式：`Dockerfile`、`docker-compose.yml` 与 `docker-entrypoint.sh`，macOS launchd 安装方式继续保留。
+- 新增 `CONTEXT.md` 领域术语表与 `docs/adr/` 架构决策记录。
+
+### Changed
+- **破坏性变更**：`/manual-review` 改为异步执行，返回 `202` 与 `run_uid`，不再同步返回审查结果。审查进度改由 `/admin` 或 `/api/admin/runs/<run_uid>` 查看。
+- 审查执行逻辑从 `review_server.py` 抽出到 `src/review/runner.py`，webhook 与手动触发合并为同一执行路径。
+- gunicorn worker 数由 `CPU 核数 × 2 + 1` 降为 `2`：本服务 IO bound 且几乎无 QPS，过多 worker 只会放大 SQLite 锁竞争。
+- 术语统一：AI 产出的每一条统称「审查发现 / Finding」，「建议」一词只保留给严重度最低档与修复方案字段。
+
 ## [0.3.0] - 2026-06-02
 
 ### Added

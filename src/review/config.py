@@ -335,3 +335,95 @@ def load_review_config() -> dict:
         resolved["skill_scripts_timeout"],
     )
     return resolved
+
+
+def _resolve_default_data_dir() -> Path:
+    """默认数据目录：优先安装目录 ~/opencr/data，其次项目根 data/。"""
+    installed = Path.home() / "opencr"
+    if installed.is_dir():
+        return installed / "data"
+    # src/review/config.py -> src -> 项目根
+    return Path(__file__).resolve().parent.parent.parent / "data"
+
+
+def load_storage_config() -> dict:
+    """读取持久化配置：默认值 + config.yaml + 环境变量覆盖"""
+    config_data = load_file_config()
+
+    database_url = _pick_config_value(config_data, "storage.database_url", "OPENCR_DATABASE_URL")
+    retention_days = _pick_config_int(config_data, 90, "storage.retention_days", "OPENCR_RETENTION_DAYS")
+    stale_after_seconds = _pick_config_int(
+        config_data, 600, "storage.stale_after_seconds", "OPENCR_STALE_AFTER_SECONDS"
+    )
+    reconcile_interval = _pick_config_int(
+        config_data, 300, "storage.reconcile_interval_seconds", "OPENCR_RECONCILE_INTERVAL_SECONDS"
+    )
+
+    env_database_url = os.getenv("OPENCR_DATABASE_URL", "").strip()
+    if env_database_url:
+        database_url = env_database_url
+
+    if not database_url:
+        data_dir = _resolve_default_data_dir()
+        database_url = f"sqlite:///{data_dir / 'opencr.db'}"
+
+    resolved = {
+        "database_url": database_url,
+        "retention_days": max(retention_days, 1),
+        "stale_after_seconds": max(stale_after_seconds, 60),
+        "reconcile_interval_seconds": max(reconcile_interval, 30),
+    }
+    logger.info(
+        "Storage config resolved: database_url=%s, retention_days=%s, "
+        "stale_after_seconds=%s, reconcile_interval_seconds=%s",
+        resolved["database_url"],
+        resolved["retention_days"],
+        resolved["stale_after_seconds"],
+        resolved["reconcile_interval_seconds"],
+    )
+    return resolved
+
+
+def load_admin_config() -> dict:
+    """
+    读取后台管理配置。
+
+    默认 enabled=false —— 升级上来的老用户不该平白多出一个管理面板。
+    启用时 token 必填；缺失时由调用方拒绝启动，而不是静默放行。
+    """
+    config_data = load_file_config()
+
+    enabled_raw = _pick_config_value(config_data, "admin.enabled", "OPENCR_ADMIN_ENABLED")
+    token = _pick_config_value(config_data, "admin.token", "OPENCR_ADMIN_TOKEN")
+    bind_local_only_raw = _pick_config_value(
+        config_data, "admin.bind_local_only", "OPENCR_ADMIN_BIND_LOCAL_ONLY"
+    )
+
+    env_enabled = os.getenv("OPENCR_ADMIN_ENABLED", "").strip()
+    env_token = os.getenv("OPENCR_ADMIN_TOKEN", "").strip()
+    env_bind_local_only = os.getenv("OPENCR_ADMIN_BIND_LOCAL_ONLY", "").strip()
+
+    if env_enabled:
+        enabled_raw = env_enabled
+    if env_token:
+        token = env_token
+    if env_bind_local_only:
+        bind_local_only_raw = env_bind_local_only
+
+    truthy = lambda v, default: (  # noqa: E731
+        default if not str(v or "").strip()
+        else str(v).strip().lower() not in {"0", "false", "no", "off", "disabled"}
+    )
+
+    resolved = {
+        "enabled": truthy(enabled_raw, False),
+        "token": token,
+        "bind_local_only": truthy(bind_local_only_raw, False),
+    }
+    logger.info(
+        "Admin config resolved: enabled=%s, token=%s, bind_local_only=%s",
+        resolved["enabled"],
+        "<set>" if resolved["token"] else "<empty>",
+        resolved["bind_local_only"],
+    )
+    return resolved

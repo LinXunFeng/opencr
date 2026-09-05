@@ -226,8 +226,8 @@ def post_mr_inline_comment(
     new_line: int,
     diff_refs: dict,
     old_path: str = "",
-) -> None:
-    """在 MR 的文件行位置发表评论（discussion）"""
+) -> dict:
+    """在 MR 的文件行位置发表评论（discussion）。返回 discussion 身份。"""
     cfg = require_gitlab_config()
     gitlab_url = cfg["url"]
     token = cfg["token"]
@@ -265,6 +265,9 @@ def post_mr_inline_comment(
         response = requests.post(url, headers=headers, json=payload, timeout=30, verify=False)
         response.raise_for_status()
         logger.info("Posted inline comment to MR !%s at %s:%s", mr_iid, new_path, new_line)
+        return _extract_discussion_identity(response)
+    except ReviewError:
+        raise
     except Exception as e:
         logger.error("Failed to post inline comment: %s", e)
         raise ReviewError(f"发布行内评论失败: {str(e)}")
@@ -277,8 +280,8 @@ def post_mr_file_comment(
     new_path: str,
     diff_refs: dict,
     old_path: str = "",
-) -> None:
-    """在 MR 文件级位置发表评论（discussion，position_type=file）。"""
+) -> dict:
+    """在 MR 文件级位置发表评论（discussion，position_type=file）。返回 discussion 身份。"""
     cfg = require_gitlab_config()
     gitlab_url = cfg["url"]
     token = cfg["token"]
@@ -315,6 +318,113 @@ def post_mr_file_comment(
         response = requests.post(url, headers=headers, json=payload, timeout=30, verify=False)
         response.raise_for_status()
         logger.info("Posted file-level comment to MR !%s at %s", mr_iid, new_path)
+        return _extract_discussion_identity(response)
+    except ReviewError:
+        raise
     except Exception as e:
         logger.error("Failed to post file-level comment: %s", e)
         raise ReviewError(f"发布文件级评论失败: {str(e)}")
+
+
+def _extract_discussion_identity(response) -> dict:
+    """
+    从 discussions 接口的响应里取出 discussion_id 与首条 note_id。
+
+    这是 Finding 能否被追踪的唯一依据 —— 拿不到就意味着这条建议永远无法结算，
+    因此解析失败时返回空值而不是抛错：评论本身已经发出去了，不该因为解析失败而回滚。
+    """
+    try:
+        payload = response.json()
+    except Exception:
+        logger.warning("Discussion response is not JSON, finding will be untrackable")
+        return {"discussion_id": "", "note_id": None}
+
+    if not isinstance(payload, dict):
+        return {"discussion_id": "", "note_id": None}
+
+    discussion_id = str(payload.get("id") or "").strip()
+    note_id = None
+    notes = payload.get("notes")
+    if isinstance(notes, list) and notes:
+        first = notes[0]
+        if isinstance(first, dict):
+            try:
+                note_id = int(first.get("id"))
+            except (TypeError, ValueError):
+                note_id = None
+
+    if not discussion_id:
+        logger.warning("Discussion response missing id, finding will be untrackable")
+    return {"discussion_id": discussion_id, "note_id": note_id}
+
+
+def _gitlab_get(path: str, params: dict = None, timeout: int = 30):
+    """GitLab GET 的统一封装。"""
+    import requests
+    import urllib3
+
+    cfg = require_gitlab_config()
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    url = f"{cfg['url']}/api/v4{path}"
+    response = requests.get(
+        url,
+        headers={"PRIVATE-TOKEN": cfg["token"]},
+        params=params or {},
+        timeout=timeout,
+        verify=False,
+    )
+    response.raise_for_status()
+    return response
+
+
+def get_mr_state(project_id: int, mr_iid: int) -> dict:
+    """读取 MR 当前状态，用于判断是否到了结算时机。"""
+    response = _gitlab_get(f"/projects/{project_id}/merge_requests/{mr_iid}")
+    data = response.json() or {}
+    return {
+        "state": str(data.get("state") or "").strip().lower(),
+        "merged_at": data.get("merged_at") or "",
+        "closed_at": data.get("closed_at") or "",
+        "title": data.get("title") or "",
+    }
+
+
+def get_mr_discussions(project_id: int, mr_iid: int, max_pages: int = 10) -> List[dict]:
+    """分页拉取 MR 的全部 discussion。"""
+    discussions: List[dict] = []
+    for page in range(1, max(int(max_pages), 1) + 1):
+        response = _gitlab_get(
+            f"/projects/{project_id}/merge_requests/{mr_iid}/discussions",
+            params={"per_page": 100, "page": page},
+        )
+        batch = response.json() or []
+        if not isinstance(batch, list) or not batch:
+            break
+        discussions.extend(batch)
+        if len(batch) < 100:
+            break
+    return discussions
+
+
+def get_note_award_emoji(project_id: int, mr_iid: int, note_id: int) -> List[str]:
+    """
+    读取某条 note 上的表态 emoji。
+
+    GitLab 的 discussions 接口不返回 emoji，只能逐条查 —— 一个有 20 条建议的 MR
+    会产生 20 次调用。因此只在结算时刻打一次，绝不对进行中的 MR 轮询。
+    单条失败按"无表态"降级，不让整个结算失败。
+    """
+    try:
+        response = _gitlab_get(
+            f"/projects/{project_id}/merge_requests/{mr_iid}/notes/{note_id}/award_emoji",
+            params={"per_page": 100},
+            timeout=15,
+        )
+        payload = response.json() or []
+    except Exception as e:
+        logger.warning("Failed to read award emoji for note %s: %s", note_id, e)
+        return []
+
+    if not isinstance(payload, list):
+        return []
+    return [str(item.get("name") or "").strip() for item in payload if isinstance(item, dict)]
