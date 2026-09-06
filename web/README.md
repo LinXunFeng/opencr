@@ -81,6 +81,7 @@ pnpm build    # 产出到 ../backend/admin/static/
 src/
 ├── common/
 │   ├── apis/opencr.ts      接口契约与 TS 类型（前后端的唯一约定）
+│   ├── assets/styles/theme 主题（皮肤），新增皮肤见该目录的 README
 │   ├── components/Chart/   ECharts 封装
 │   └── constants/opencr.ts 枚举文案、配色、口径说明
 ├── layouts/                布局（来自模板）

@@ -1,0 +1,113 @@
+// 皮肤共用的「质感」层：形状变量 + 组件细节。
+//
+// 只定义 mixin，本身不产出任何样式，所以默认主题（normal / dark / dark-blue）
+// 完全不受影响——这也是新增皮肤而不是改默认样式的前提。
+//
+// 需要皮肤自己提供的变量：
+//   --sk-border        卡片与分隔线颜色
+//   --sk-shadow        卡片常态阴影
+//   --sk-shadow-hover  卡片 hover 阴影
+//   --sk-login-bg      登录页背景
+
+@mixin v3-skin-polish {
+  // ---- 形状：圆角比 Element Plus 默认的 4px 更柔和 ----
+  --el-border-radius-base: 8px;
+  --el-border-radius-small: 6px;
+  --el-card-border-radius: 14px;
+  --el-tag-border-radius: 6px;
+
+  // ---- 表格：表头用填充色压住，避免和卡片底融成一片 ----
+  --el-table-header-bg-color: var(--el-fill-color);
+  --el-table-border-color: var(--sk-border);
+  --el-table-row-hover-bg-color: var(--el-fill-color-light);
+
+  // ---- 标签页 ----
+  --v3-tagsview-tag-border-radius: 6px;
+
+  // 卡片：业务页面统一写了 shadow="never"，这里把阴影补回来。
+  // 带上 .is-never-shadow 是为了权重高过 Element Plus 自己的 box-shadow: none
+  .el-card,
+  .el-card.is-never-shadow,
+  .el-card.is-always-shadow,
+  .el-card.is-hover-shadow {
+    border: 1px solid var(--sk-border);
+    box-shadow: var(--sk-shadow);
+  }
+
+  .el-card__header {
+    font-weight: 600;
+    border-bottom: 1px solid var(--sk-border);
+  }
+
+  // 概览页的统计卡：原本只有「数字 + 文字」，补一条语义色强调边和 hover 抬升
+  .stat-card {
+    position: relative;
+    transition:
+      box-shadow 0.2s ease,
+      transform 0.2s ease;
+
+    &::before {
+      content: "";
+      position: absolute;
+      top: 0;
+      bottom: 0;
+      left: 0;
+      width: 3px;
+      background-color: var(--el-color-primary);
+    }
+
+    // 强调边跟随卡片自身的语义色；不支持 :has() 的浏览器退化成主色，不影响可读性
+    &:has(.tone-danger)::before {
+      background-color: var(--el-color-danger);
+    }
+    &:has(.tone-warning)::before {
+      background-color: var(--el-color-warning);
+    }
+    &:has(.tone-success)::before {
+      background-color: var(--el-color-success);
+    }
+    &:has(.tone-info)::before {
+      background-color: var(--el-color-info);
+    }
+
+    &:hover {
+      box-shadow: var(--sk-shadow-hover);
+      transform: translateY(-2px);
+    }
+  }
+
+  .el-table th.el-table__cell {
+    font-weight: 600;
+  }
+
+  // 侧边栏菜单。
+  // el-menu 的 background-color / text-color 这几个 prop 是组件挂载时用 JS
+  // 读一次 CSS 变量算出来的，之后以 inline style 写死，运行时切主题不会更新。
+  // 所以这里用 !important 覆盖内联变量，否则切到本皮肤时菜单还留着上一套的配色。
+  .app-wrapper .sidebar-container .el-menu {
+    --el-menu-bg-color: transparent !important;
+    --el-menu-text-color: var(--v3-sidebar-menu-text-color) !important;
+    --el-menu-active-color: var(--v3-sidebar-menu-active-text-color) !important;
+    --el-menu-hover-bg-color: var(--v3-sidebar-menu-hover-bg-color) !important;
+  }
+
+  // 侧边栏收起后，二级菜单是 teleport 到 body 的 popper
+  .el-popper .el-menu {
+    --el-menu-bg-color: var(--el-bg-color-overlay);
+    --el-menu-text-color: var(--v3-sidebar-menu-text-color);
+    --el-menu-active-color: var(--v3-sidebar-menu-active-text-color);
+    --el-menu-hover-bg-color: var(--v3-sidebar-menu-hover-bg-color);
+
+    border: none;
+  }
+
+  // 登录页背景是写死的浅色渐变，深色皮肤下会刺眼，交给皮肤自己定
+  .login-page {
+    background: var(--sk-login-bg);
+  }
+
+  .login-card {
+    border: 1px solid var(--sk-border);
+    box-shadow: var(--sk-shadow-hover);
+  }
+}
