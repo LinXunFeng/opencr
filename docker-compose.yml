@@ -11,10 +11,12 @@ services:
       # 配置：必须存在。用长语法 + create_host_path: false，
       # 否则 Docker 会在缺失时自动创建一个名为 config.yaml 的「目录」，
       # 容器随后 crash-loop，而用户 cp 配置时又会拷进那个目录里，极难排查。
+      # 刻意**不**设 read_only：首次启动时服务要把 config.yaml 里的明文密码
+      # 就地替换成哈希。若你坚持只读挂载，服务仍能正常运行（哈希留在内存里），
+      # 但每次启动都会警告明文未清理。
       - type: bind
         source: ./config.yaml
         target: /app/config.yaml
-        read_only: true
         bind:
           create_host_path: false
       # 审查规则：挂载后整体覆盖镜像内置的默认 skills，

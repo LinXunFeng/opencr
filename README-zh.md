@@ -54,25 +54,24 @@ opencr/
 │   └── review/             # skill bundle（name/SKILL.md、references、scripts、assets）
 ├── Dockerfile              # 容器镜像
 ├── docker-compose.yml      # 容器编排（推荐的部署方式）
-├── alembic.ini             # 数据库迁移配置
-├── migrations/             # 数据库迁移脚本
 ├── CONTEXT.md              # 领域术语表
 ├── docs/adr/               # 架构决策记录
-├── src/                    # 源代码（已实现）
+├── backend/                # 后端源码（Python 包）
 │   ├── review_server.py    # Flask 路由与线程调度
 │   ├── wsgi.py             # WSGI 生产入口
 │   ├── review/             # 审查执行、结算、GitLab 交互
 │   │   ├── runner.py       # ReviewRun 统一执行入口
 │   │   └── settlement.py   # 采纳结论判定
 │   ├── storage/            # 持久化（SQLAlchemy）
+│   ├── migrations/         # Alembic 迁移脚本
+│   ├── alembic.ini         # 迁移配置
 │   └── admin/              # 后台管理路由与页面
 └── .gitignore
 
 # 安装后生成的目录
 ~/opencr/
-├── src/                    # 从项目复制
+├── backend/                # 从项目复制
 ├── skills/                 # 从项目复制（自动 skill 路由依赖）
-├── migrations/             # 从项目复制（数据库迁移）
 ├── data/                   # SQLite 数据库（审查历史与采纳统计）
 ├── logs/                   # 日志目录
 ├── venv/                   # Python 虚拟环境
@@ -259,43 +258,60 @@ gunicorn --bind 0.0.0.0:9034 --chdir src "review_server:app"
 
 ## 后台管理
 
-后台**默认关闭**。启用需要在 `config.yaml` 中同时设置：
+后台是一个 Vue 3 单页应用（Element Plus + ECharts），挂在 `/admin` 下，由 Flask 自己托管，
+不依赖任何 CDN —— 内网访问不到外网也能正常显示。
+
+### 启用
+
+后台**默认关闭**。启用需要在 `config.yaml` 中设置：
 
 ```yaml
 admin:
   enabled: true
-  token: "换成一个足够长的随机串"
+  username: "admin"
+  # 直接写明文即可。服务首次启动时会就地把它替换成 scrypt 哈希，
+  # 并在上方加一行注释。想改密码就把这一行换回明文再重启。
+  password: "换成一个足够长的密码"
   # webhook 端口通常内网可达；只在本机访问后台时建议打开这项
   bind_local_only: false
 ```
 
-> `admin.enabled` 为 `true` 但 `token` 为空时，服务会**拒绝启动**而不是静默放行 ——
+> `admin.enabled` 为 `true` 但 `password` 为空时，服务会**拒绝启动** ——
 > 否则等于把一个无鉴权的管理面板挂在内网可达的端口上。
 
-访问方式（三选一，token 相同）：
+> **从 0.4.0 升级**：`admin.token` 已被移除，改为 `username` + `password`。
+> 命中旧字段时服务会拒绝启动并直接告诉你怎么改。
 
-```bash
-# 浏览器：首次带上 ?token=，成功后会种 cookie，之后直接访问 /admin
-open "http://localhost:9034/admin?token=你的token"
+启用后访问 `http://localhost:9034/admin` 即可。
 
-# 接口
-curl -H "X-Admin-Token: 你的token" http://localhost:9034/api/admin/overview
-curl -H "X-Admin-Token: 你的token" http://localhost:9034/api/admin/runs/<run_uid>
-```
+### 游客浏览
 
-### 面板内容
+后台支持**游客浏览**，默认开启：未登录的同事可以直接查看审查状态，不需要账号。
 
-| 区块 | 说明 |
-|------|------|
-| 进行中 | 正在执行的审查、当前阶段、文件级进度 |
-| 错误统计 | 近 7 天的失败 / 降级 / 跳过分档 |
-| 建议采纳情况 | 近 30 天审查发现的采纳结论分布、采纳率与覆盖率 |
-| 最近运行 | 最近 50 次审查运行，含被跳过的及其原因 |
+游客能看到运行状态、进度、错误统计与采纳统计；**看不到审查发现的正文**。
+因为正文包含 AI 对私有仓库代码的具体描述（文件路径、行号、问题与修复建议），
+而 webhook 端口按部署方式通常是内网可达的。
+
+这个开关在后台的「系统设置」里改，立即生效，是本项目唯一不在 `config.yaml` 里的配置项 ——
+它的使用场景天然是临时性的（"今天有外部人员来，先关一下"），要求改文件加重启就等于没人会用。
+
+完整取舍见 [ADR-0002](./docs/adr/0002-guest-read-scope.md)。
+
+### 功能模块
+
+| 模块 | 内容 | 游客可见 |
+|------|------|:---:|
+| 控制台 | 关键指标卡片、进行中的审查、运行趋势图、采纳分布图 | ✅ |
+| 审查记录 | 运行列表（可筛状态、搜项目/MR）与运行详情 | ✅（正文除外）|
+| 审查发现 | 跨运行的发现列表，可按项目/采纳结论/严重度/时间窗筛选 | ✅（正文除外）|
+| 统计分析 | 采纳分析（采纳率、覆盖率、按投递方式拆解）、错误分析（趋势、失败原因、降级明细）| ✅ |
+| Skill 管理 | 已加载的 skill 及近期命中次数 | ✅ |
+| 系统设置 | 当前生效配置（密钥只显示"已配置"）、可写子集 | ❌ |
 
 ### 几个口径必须先看懂
 
 **进度**：`overall` 模式是单次大模型调用，中间没有可观测点，只报阶段不报百分比；
-`file` 模式逐文件调用，额外给出 `已处理 3/17` 的文件计数。面板上不会出现编造的进度条。
+`file` 模式逐文件调用，额外给出 `3/17` 的文件计数。面板上不会出现编造的进度条。
 
 **「进行中」与「疑似中断」**：服务是多进程运行的，任何一个进程都无法断言其他进程的审查已经死了。
 因此心跳超时（默认 600 秒，`storage.stale_after_seconds`）只会把状态**标注**为「疑似中断」，
@@ -320,6 +336,25 @@ curl -H "X-Admin-Token: 你的token" http://localhost:9034/api/admin/runs/<run_u
 
 审查记录默认保留 90 天（`storage.retention_days`），由后台任务自动清理。
 **采纳数据无法回填** —— 本功能上线前的历史 MR 永远不会有采纳结论，被清理掉的数据同样不可恢复。
+
+### 二次开发
+
+前端源码在 `web/`，是独立的构建单元：
+
+```bash
+cd web
+pnpm install
+pnpm dev      # 开发模式，自动把 /api/admin 代理到本地 9034
+pnpm build    # 构建到 backend/admin/static/
+```
+
+**构建产物不进 Git**（仓库保持干净），它由部署流程各自生成：
+
+- **Docker**：`Dockerfile` 多阶段构建里编译，Node 只存在于构建阶段，不进最终镜像
+- **launchd**：`install.sh` 在安装时编译；机器上没有 Node/pnpm 时会跳过并提示，
+  审查服务照常可用，只是 `/admin` 会返回一条"产物缺失"的说明，补装 Node 后重跑 `./install.sh` 即可
+
+因此改完前端**只需提交源码**。更多约定见 [`web/README.md`](./web/README.md)。
 
 ---
 
@@ -493,7 +528,7 @@ review:
 
 ## 源码说明
 
-### `src/review_server.py`
+### `backend/review_server.py`
 
 主要功能模块：
 
@@ -505,7 +540,7 @@ review:
 | `handle_webhook()` | 处理 GitLab Webhook 事件 |
 | `should_review_mr()` | 判断是否需要审查（过滤 Draft 等） |
 
-### `src/wsgi.py`
+### `backend/wsgi.py`
 
 Gunicorn 生产环境入口文件。
 

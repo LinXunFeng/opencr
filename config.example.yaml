@@ -68,14 +68,24 @@ admin:
   # Enable the /admin console and /api/admin/* endpoints.
   # 是否启用 /admin 后台与 /api/admin/* 接口。
   enabled: false
-  # Shared token required by every admin request. Mandatory when enabled is true;
-  # the service refuses to start if it is missing.
-  # 后台访问令牌。enabled 为 true 时必填，缺失将拒绝启动，而不是静默放行。
-  # 通过 X-Admin-Token 请求头，或首次访问时用 ?token=xxx 带上（成功后会种 cookie）。
-  token: ""
+  # Administrator account name. There is exactly one admin account.
+  # 管理员用户名。系统只有这一个管理账号，没有用户表也没有角色。
+  username: "admin"
+  # Password. Write it in PLAIN TEXT here; on first start the service replaces
+  # it in place with a scrypt hash and leaves a comment above the line.
+  # 密码。**直接写明文**即可：服务首次启动时会就地把它替换成 scrypt 哈希，
+  # 并在上方加一行注释。想改密码就把这一行换回明文再重启。
+  # 若配置文件不可写（例如只读挂载），服务照常运行，但每次启动都会警告明文未清理。
+  password: ""
   # Reject admin requests that do not come from loopback.
   # 是否只允许本机访问后台。Webhook 端口通常内网可达，开启这项可缩小暴露面。
   bind_local_only: false
+
+# 注意：是否允许游客（未登录）浏览由后台界面控制，**不在这个文件里**。
+# 它默认开启，存在数据库中、改动立即生效 —— 因为它的使用场景天然是临时性的
+# （"今天有外部人员来，先关一下"），要求改文件加重启就等于没人会用。
+# 游客能看到运行状态与聚合统计，但看不到审查发现的正文；
+# 完整取舍见 docs/adr/0002-guest-read-scope.md。
 
 # Persistence settings for review history and acceptance statistics.
 # 审查历史与采纳统计的持久化配置。

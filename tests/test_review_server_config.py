@@ -13,11 +13,29 @@ Path(TEST_HOME, "opencr", "logs").mkdir(parents=True, exist_ok=True)
 os.environ["HOME"] = TEST_HOME
 # 这组测试只覆盖配置解析，不需要后台 reconciler 线程；数据库也隔离到临时目录
 os.environ["OPENCR_DISABLE_RECONCILER"] = "1"
-os.environ.setdefault("OPENCR_DATABASE_URL", f"sqlite:///{Path(TEST_HOME, 'opencr-test.db')}")
+# 显式指向一个空配置：否则会读到开发机仓库根目录下的 config.yaml，
+# 测试结果就取决于开发者本地怎么配，而不是代码本身。
+_EMPTY_CONFIG = Path(TEST_HOME, "empty-config.yaml")
+_EMPTY_CONFIG.write_text("openai:\n  model: \"test\"\n", encoding="utf-8")
+os.environ["OPENCR_CONFIG_PATH"] = str(_EMPTY_CONFIG)
+
+
+def _module_available(name: str) -> bool:
+    """真依赖装上了就用真的，桩只在缺库的环境里兜底。
+
+    原先无条件塞桩，导致每次给路由层加一个 flask 符号（Blueprint、session、
+    current_app……）都要回来补桩，而桩越补越不像真库。
+    """
+    import importlib.util
+
+    try:
+        return importlib.util.find_spec(name) is not None
+    except (ImportError, ValueError):
+        return False
 
 
 def _install_stub_modules():
-    if "flask" not in sys.modules:
+    if "flask" not in sys.modules and not _module_available("flask"):
         flask_stub = types.ModuleType("flask")
 
         class DummyFlask:
@@ -68,7 +86,7 @@ def _install_stub_modules():
         flask_stub.make_response = make_response
         sys.modules["flask"] = flask_stub
 
-    if "openai" not in sys.modules:
+    if "openai" not in sys.modules and not _module_available("openai"):
         openai_stub = types.ModuleType("openai")
 
         class DummyOpenAI:
@@ -78,7 +96,7 @@ def _install_stub_modules():
         openai_stub.OpenAI = DummyOpenAI
         sys.modules["openai"] = openai_stub
 
-    if "requests" not in sys.modules:
+    if "requests" not in sys.modules and not _module_available("requests"):
         requests_stub = types.ModuleType("requests")
 
         def _placeholder(*args, **kwargs):
@@ -88,7 +106,7 @@ def _install_stub_modules():
         requests_stub.post = _placeholder
         sys.modules["requests"] = requests_stub
 
-    if "urllib3" not in sys.modules:
+    if "urllib3" not in sys.modules and not _module_available("urllib3"):
         urllib3_stub = types.ModuleType("urllib3")
 
         class _Exceptions:
@@ -103,18 +121,43 @@ def _install_stub_modules():
 
 
 _install_stub_modules()
-opencr_package = importlib.import_module("src")
-review_server = importlib.import_module("src.review_server")
-review_runner = importlib.import_module("src.review.runner")
+opencr_package = importlib.import_module("backend")
+review_server = importlib.import_module("backend.review_server")
+review_runner = importlib.import_module("backend.review.runner")
 
-# ReviewRun 埋点会写库，先把表建出来
-_storage_db = importlib.import_module("src.storage.db")
-importlib.import_module("src.storage.models").Base.metadata.create_all(_storage_db.get_engine())
+_TEST_DB_URL = f"sqlite:///{Path(TEST_HOME, 'opencr-test.db')}"
+
+
+def _ensure_test_database():
+    """
+    把持久化层指向本模块专用的库并建表。
+
+    engine 是进程内单例，其他测试模块的 tearDown 会重置它、并清掉
+    OPENCR_DATABASE_URL，所以不能只在 import 期建一次 —— 每个用例都要自己保证。
+    """
+    os.environ["OPENCR_DATABASE_URL"] = _TEST_DB_URL
+    storage_db = importlib.import_module("backend.storage.db")
+    storage_db.reset_engine_for_tests(_TEST_DB_URL)
+    importlib.import_module("backend.storage.models").Base.metadata.create_all(storage_db.get_engine())
+
+
+_ensure_test_database()
+
+
+def _health_payload() -> dict:
+    """
+    调用 /health 并取回 JSON。
+
+    jsonify 需要应用上下文，因此不能直接调视图函数；走 test_client 也更贴近真实行为。
+    """
+    with review_server.app.test_client() as client:
+        return client.get("/health").get_json()
 
 
 class ReviewServerConfigTests(unittest.TestCase):
     def setUp(self):
-        from src.storage import repo
+        _ensure_test_database()
+        from backend.storage import repo
 
         self.run_uid = repo.start_run(
             project_id=1022, mr_iid=8, trigger="manual", review_mode="file"
@@ -277,7 +320,7 @@ code_platform:
 
     def test_load_review_config_defaults_to_skills_root(self):
         with mock.patch.dict(os.environ, self._env(OPENAI_API_KEY=""), clear=True):
-            with mock.patch("src.review.config.load_file_config", return_value={}):
+            with mock.patch("backend.review.config.load_file_config", return_value={}):
                 cfg = review_server.load_review_config()
 
         self.assertEqual(cfg["skills_dir"], "skills")
@@ -353,7 +396,7 @@ code_platform:
             self._env(OPENAI_MODEL="gpt-4.1"),
             clear=True,
         ):
-            payload = review_server.health_check()
+            payload = _health_payload()
 
         self.assertIn("version", payload)
         self.assertEqual(payload["version"], opencr_package.__version__)
@@ -364,7 +407,7 @@ code_platform:
             self._env(OPENAI_MODEL="gpt-4.1", OPENCR_VERSION="9.9.9"),
             clear=True,
         ):
-            payload = review_server.health_check()
+            payload = _health_payload()
 
         self.assertEqual(payload["version"], opencr_package.__version__)
 
@@ -918,10 +961,10 @@ python3 -c 'import json, sys; payload=json.load(sys.stdin); print("script saw " 
             "file_size_kb": 620.0,
         }
 
-        with mock.patch("src.review.ai.auto_select_review_skills", return_value=["general"]):
-            with mock.patch("src.review.ai.load_review_skill_prompts", return_value="general rules"):
+        with mock.patch("backend.review.ai.auto_select_review_skills", return_value=["general"]):
+            with mock.patch("backend.review.ai.load_review_skill_prompts", return_value="general rules"):
                 with mock.patch(
-                    "src.review.ai.call_codex_review",
+                    "backend.review.ai.call_codex_review",
                     return_value=(
                         "#### 问题 : 图片体积过大\n"
                         "- **位置**: `assets/images/a.png:1`\n"
@@ -955,10 +998,10 @@ python3 -c 'import json, sys; payload=json.load(sys.stdin); print("script saw " 
             "file_size_kb": 620.0,
         }
 
-        with mock.patch("src.review.ai.auto_select_review_skills", return_value=["general"]):
-            with mock.patch("src.review.ai.load_review_skill_prompts", return_value="general rules"):
+        with mock.patch("backend.review.ai.auto_select_review_skills", return_value=["general"]):
+            with mock.patch("backend.review.ai.load_review_skill_prompts", return_value="general rules"):
                 with mock.patch(
-                    "src.review.ai.call_codex_review",
+                    "backend.review.ai.call_codex_review",
                     return_value=(
                         "### 详细审查结果\n"
                         "- 该图片文件体积超过 300KB，建议压缩后提交。\n"
@@ -988,10 +1031,10 @@ python3 -c 'import json, sys; payload=json.load(sys.stdin); print("script saw " 
             "file_size_kb": 120.0,
         }
 
-        with mock.patch("src.review.ai.auto_select_review_skills", return_value=["general"]):
-            with mock.patch("src.review.ai.load_review_skill_prompts", return_value="general rules"):
+        with mock.patch("backend.review.ai.auto_select_review_skills", return_value=["general"]):
+            with mock.patch("backend.review.ai.load_review_skill_prompts", return_value="general rules"):
                 with mock.patch(
-                    "src.review.ai.call_codex_review",
+                    "backend.review.ai.call_codex_review",
                     return_value="✅ 代码审查通过，未发现明显问题。",
                 ):
                     _summary, inline_notes = review_server.review_changes_with_inline_notes(
@@ -1015,10 +1058,10 @@ python3 -c 'import json, sys; payload=json.load(sys.stdin); print("script saw " 
             "file_size_kb": 120.0,
         }
 
-        with mock.patch("src.review.ai.auto_select_review_skills", return_value=["general"]):
-            with mock.patch("src.review.ai.load_review_skill_prompts", return_value="general rules"):
+        with mock.patch("backend.review.ai.auto_select_review_skills", return_value=["general"]):
+            with mock.patch("backend.review.ai.load_review_skill_prompts", return_value="general rules"):
                 with mock.patch(
-                    "src.review.ai.call_codex_review",
+                    "backend.review.ai.call_codex_review",
                     return_value=(
                         "### 总体评价\n"
                         "本次未发现高置信度问题，代码逻辑清晰，结构完整，未发现明显风险，保持当前实现即可。"
@@ -1045,10 +1088,10 @@ python3 -c 'import json, sys; payload=json.load(sys.stdin); print("script saw " 
             "file_size_kb": 620.0,
         }
 
-        with mock.patch("src.review.ai.auto_select_review_skills", return_value=["general"]):
-            with mock.patch("src.review.ai.load_review_skill_prompts", return_value="general rules"):
+        with mock.patch("backend.review.ai.auto_select_review_skills", return_value=["general"]):
+            with mock.patch("backend.review.ai.load_review_skill_prompts", return_value="general rules"):
                 with mock.patch(
-                    "src.review.ai.call_codex_review",
+                    "backend.review.ai.call_codex_review",
                     return_value=(
                         "本次未发现高置信度问题，但该图片体积偏大，建议压缩后提交。"
                     ),

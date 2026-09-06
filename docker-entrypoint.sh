@@ -17,7 +17,7 @@ fi
 
 # 迁移在这里跑一次，而不是在每个 gunicorn worker 里 ——
 # 多个进程同时执行 DDL 只会互相抢锁。
-python3 -m src.storage.migrate
+python3 -m backend.storage.migrate
 
 SERVER_HOST="${REVIEW_SERVER_HOST:-0.0.0.0}"
 SERVER_PORT="${REVIEW_SERVER_PORT:-9034}"
@@ -28,7 +28,7 @@ WORKERS="${GUNICORN_WORKERS:-2}"
 echo "[opencr] starting on ${SERVER_HOST}:${SERVER_PORT} with ${WORKERS} workers"
 exec gunicorn \
     --bind "${SERVER_HOST}:${SERVER_PORT}" \
-    --chdir /app/src \
+    --chdir /app/backend \
     --workers "${WORKERS}" \
     --timeout 300 \
     --access-logfile - \

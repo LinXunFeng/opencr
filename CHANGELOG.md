@@ -2,6 +2,25 @@
 
 本文件记录项目的重要变更。
 
+## [0.5.0] - 2026-09-06
+
+### Added
+- 后台管理改为 Vue 3 单页应用（基于 [v3-admin-vite](https://github.com/un-pany/v3-admin-vite) + Element Plus + ECharts 6），包含控制台、审查记录、审查发现、统计分析、Skill 管理与系统设置六个模块。
+- 新增账号密码登录。`admin.password` 直接写明文即可，服务首次启动时会就地把它替换为 scrypt 哈希并加上注释说明；配置文件不可写时服务照常运行，但每次启动会警告明文未清理。
+- 新增**游客浏览**开关（默认开启）：未登录者可查看运行状态与聚合统计，但看不到审查发现的正文。开关存在数据库中、后台可改、立即生效。判定边界见 `docs/adr/0002-guest-read-scope.md`。
+- 新增跨审查运行的「审查发现」列表，支持按项目 / 采纳结论 / 严重度 / 时间窗筛选——用于回答"这个项目所有被忽略的严重问题"这类单看某次运行问不出来的问题。
+- 新增 Skill 管理页，展示已加载的 skill 及其近期命中次数（命中为 0 的 skill 等于没生效）。
+- 新增 `/api/admin/*` 接口族：login、logout、me、dashboard、runs、findings、stats/verdicts、stats/errors、skills、settings。
+
+### Changed
+- **破坏性变更**：`admin.token` 共享令牌已移除，改为 `admin.username` + `admin.password`。命中旧字段时服务会拒绝启动并给出具体的迁移指引。
+- 移除 Jinja 模板后台，`/admin` 改为托管 Vue 打包产物。`backend/admin/static/` 的构建产物**提交进 Git**，因此部署端不需要 Node。
+- Docker 中 `config.yaml` 不再只读挂载，以便首次启动时写回密码哈希。
+- 测试不再无条件使用 flask/openai/requests 桩：真依赖可用时用真的，桩只在缺库环境兜底。测试也不再读取开发机的 `config.yaml`。
+
+### Fixed
+- 修复多 worker 同时启动时 `PRAGMA journal_mode=WAL` 报 `database is locked` 的问题：`busy_timeout` 现在先于 `journal_mode` 设置，且 WAL 切换失败不再导致进程退出。
+
 ## [0.4.0] - 2026-09-05
 
 ### Added
@@ -13,7 +32,7 @@
 
 ### Changed
 - **破坏性变更**：`/manual-review` 改为异步执行，返回 `202` 与 `run_uid`，不再同步返回审查结果。审查进度改由 `/admin` 或 `/api/admin/runs/<run_uid>` 查看。
-- 审查执行逻辑从 `review_server.py` 抽出到 `src/review/runner.py`，webhook 与手动触发合并为同一执行路径。
+- 审查执行逻辑从 `review_server.py` 抽出到 `backend/review/runner.py`，webhook 与手动触发合并为同一执行路径。
 - gunicorn worker 数由 `CPU 核数 × 2 + 1` 降为 `2`：本服务 IO bound 且几乎无 QPS，过多 worker 只会放大 SQLite 锁竞争。
 - 术语统一：AI 产出的每一条统称「审查发现 / Finding」，「建议」一词只保留给严重度最低档与修复方案字段。
 

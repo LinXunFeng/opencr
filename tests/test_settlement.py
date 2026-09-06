@@ -12,12 +12,12 @@ PROJECT_ROOT = str(Path(__file__).resolve().parent.parent)
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-from src.review.settlement import (  # noqa: E402
+from backend.review.settlement import (  # noqa: E402
     classify_finding,
     has_human_reply,
     is_discussion_resolved,
 )
-from src.storage.models import (  # noqa: E402
+from backend.storage.models import (  # noqa: E402
     REASON_DISCUSSION_MISSING,
     REASON_HUMAN_REPLIED,
     REASON_MERGED_UNRESOLVED,
@@ -133,7 +133,7 @@ class ClassifyFindingTests(unittest.TestCase):
 
 class SettleMrTests(unittest.TestCase):
     def test_open_mr_is_not_settled(self):
-        from src.review import settlement
+        from backend.review import settlement
 
         with mock.patch.object(settlement.repo, "list_undecided_findings",
                                return_value=[{"id": 1, "discussion_id": "d", "note_id": 2,
@@ -151,7 +151,7 @@ class SettleMrTests(unittest.TestCase):
         逐条查 emoji 的调用会失败（网络/权限）。单条失败按"无表态"降级，
         不能让整个 MR 的结算跟着挂掉。
         """
-        from src.review import settlement
+        from backend.review import settlement
 
         pending = [{"id": 7, "discussion_id": "abc", "note_id": 5, "file_path": "a.py", "line": 1}]
         applied = {}

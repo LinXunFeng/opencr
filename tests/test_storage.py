@@ -17,20 +17,20 @@ class StorageTestCase(unittest.TestCase):
         self.tmpdir = tempfile.mkdtemp(prefix="opencr-db-")
         os.environ["OPENCR_DATABASE_URL"] = f"sqlite:///{Path(self.tmpdir, 'test.db')}"
 
-        from src.storage import db
+        from backend.storage import db
 
         db.reset_engine_for_tests(os.environ["OPENCR_DATABASE_URL"])
 
-        from src.storage.models import Base
+        from backend.storage.models import Base
 
         Base.metadata.create_all(db.get_engine())
 
-        from src.storage import repo
+        from backend.storage import repo
 
         self.repo = repo
 
     def tearDown(self):
-        from src.storage import db
+        from backend.storage import db
 
         db.reset_engine_for_tests()
         os.environ.pop("OPENCR_DATABASE_URL", None)
@@ -38,7 +38,7 @@ class StorageTestCase(unittest.TestCase):
 
 class ReviewRunLifecycleTests(StorageTestCase):
     def test_run_progresses_and_finishes(self):
-        from src.storage.models import PHASE_REVIEWING, RUN_SUCCEEDED
+        from backend.storage.models import PHASE_REVIEWING, RUN_SUCCEEDED
 
         run_uid = self.repo.start_run(
             project_id=7, mr_iid=42, trigger="webhook_open", review_mode="hybrid",
@@ -57,7 +57,7 @@ class ReviewRunLifecycleTests(StorageTestCase):
 
     def test_degradations_accumulate_without_changing_status(self):
         """降级与失败正交：一次 run 可以既成功又带多条降级。"""
-        from src.storage.models import DEGRADE_DIFF_TRUNCATED, DEGRADE_INLINE_POST_FAILED, RUN_SUCCEEDED
+        from backend.storage.models import DEGRADE_DIFF_TRUNCATED, DEGRADE_INLINE_POST_FAILED, RUN_SUCCEEDED
 
         run_uid = self.repo.start_run(project_id=1, mr_iid=1, trigger="manual", review_mode="file")
         self.repo.add_degradation(run_uid, DEGRADE_INLINE_POST_FAILED, 2)
@@ -75,8 +75,8 @@ class ReviewRunLifecycleTests(StorageTestCase):
         """
         心跳超时只标注、不改写状态：多进程下本进程无法断言别的进程的 run 已死。
         """
-        from src.storage import db
-        from src.storage.models import ReviewRun, RUN_RUNNING, utcnow
+        from backend.storage import db
+        from backend.storage.models import ReviewRun, RUN_RUNNING, utcnow
 
         run_uid = self.repo.start_run(project_id=1, mr_iid=1, trigger="manual", review_mode="file")
         with db.session_scope() as session:
@@ -90,7 +90,7 @@ class ReviewRunLifecycleTests(StorageTestCase):
         self.assertEqual(active[0]["status"], RUN_RUNNING)
 
     def test_skipped_run_keeps_reason(self):
-        from src.storage.models import RUN_SKIPPED
+        from backend.storage.models import RUN_SKIPPED
 
         run_uid = self.repo.record_skipped_run(
             project_id=3, mr_iid=9, trigger="webhook_update", skip_reason="标题包含跳过标记: wip",
@@ -105,7 +105,7 @@ class FindingAccountingTests(StorageTestCase):
         return self.repo.start_run(project_id=5, mr_iid=11, trigger="webhook_open", review_mode="hybrid")
 
     def test_trackable_finding_starts_undecided(self):
-        from src.storage.models import DELIVERY_INLINE, VERDICT_UNDECIDED
+        from backend.storage.models import DELIVERY_INLINE, VERDICT_UNDECIDED
 
         run_uid = self._run()
         self.repo.record_finding(run_uid, "a.py", 10, "问题", DELIVERY_INLINE,
@@ -121,7 +121,7 @@ class FindingAccountingTests(StorageTestCase):
         整体评论与降级评论走的是不可 resolve 的普通 note，永远无法结算，
         但仍然入库 —— 它们要计入 Coverage 的分母。
         """
-        from src.storage.models import DELIVERY_FALLBACK_NOTE, DELIVERY_SUMMARY_ONLY, VERDICT_UNTRACKABLE
+        from backend.storage.models import DELIVERY_FALLBACK_NOTE, DELIVERY_SUMMARY_ONLY, VERDICT_UNTRACKABLE
 
         run_uid = self._run()
         self.repo.record_finding(run_uid, "b.py", 0, "整体评论问题", DELIVERY_SUMMARY_ONLY)
@@ -134,7 +134,7 @@ class FindingAccountingTests(StorageTestCase):
 
     def test_inline_finding_without_discussion_id_is_untrackable(self):
         """拿不到 discussion_id 就没有身份，即使投递方式是 inline 也无法结算。"""
-        from src.storage.models import DELIVERY_INLINE, VERDICT_UNTRACKABLE
+        from backend.storage.models import DELIVERY_INLINE, VERDICT_UNTRACKABLE
 
         run_uid = self._run()
         self.repo.record_finding(run_uid, "d.py", 5, "问题", DELIVERY_INLINE, discussion_id="")
@@ -143,7 +143,7 @@ class FindingAccountingTests(StorageTestCase):
 
 class StatsTests(StorageTestCase):
     def test_acceptance_denominator_excludes_untrackable_and_undecided(self):
-        from src.storage.models import (
+        from backend.storage.models import (
             DELIVERY_INLINE,
             DELIVERY_SUMMARY_ONLY,
             VERDICT_ACCEPTED,
@@ -187,7 +187,7 @@ class StatsTests(StorageTestCase):
         self.assertIsNone(stats["coverage_rate"])
 
     def test_error_stats_separates_failed_degraded_skipped(self):
-        from src.storage.models import (
+        from backend.storage.models import (
             DEGRADE_INLINE_POST_FAILED,
             ERROR_REVIEW,
             RUN_FAILED,
@@ -219,8 +219,8 @@ class StatsTests(StorageTestCase):
 
 class MaintenanceTests(StorageTestCase):
     def test_purge_removes_old_runs_and_their_findings(self):
-        from src.storage import db
-        from src.storage.models import DELIVERY_INLINE, Finding, ReviewRun, utcnow
+        from backend.storage import db
+        from backend.storage.models import DELIVERY_INLINE, Finding, ReviewRun, utcnow
 
         old = self.repo.start_run(project_id=1, mr_iid=1, trigger="manual", review_mode="file")
         self.repo.record_finding(old, "a.py", 1, "x", DELIVERY_INLINE, discussion_id="d1")
@@ -246,8 +246,8 @@ class MaintenanceTests(StorageTestCase):
 
         # 过期后其他进程可以接管
         self.assertTrue(self.repo.acquire_lease("reconciler", "pid-1", ttl_seconds=1))
-        from src.storage import db
-        from src.storage.models import LeaderLease, utcnow
+        from backend.storage import db
+        from backend.storage.models import LeaderLease, utcnow
 
         with db.session_scope() as session:
             lease = session.get(LeaderLease, "reconciler")
@@ -255,7 +255,7 @@ class MaintenanceTests(StorageTestCase):
         self.assertTrue(self.repo.acquire_lease("reconciler", "pid-2", ttl_seconds=60))
 
     def test_pending_settlement_skips_already_settled_mrs(self):
-        from src.storage.models import DELIVERY_INLINE
+        from backend.storage.models import DELIVERY_INLINE
 
         run_uid = self.repo.start_run(project_id=9, mr_iid=1, trigger="manual", review_mode="file")
         self.repo.record_finding(run_uid, "a.py", 1, "x", DELIVERY_INLINE, discussion_id="d1")

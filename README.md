@@ -54,25 +54,24 @@ opencr/
 │   └── review/             # Skill bundles (name/SKILL.md, references, scripts, assets)
 ├── Dockerfile              # Container image
 ├── docker-compose.yml      # Container orchestration (recommended deployment)
-├── alembic.ini             # Database migration config
-├── migrations/             # Database migration scripts
 ├── CONTEXT.md              # Domain glossary
 ├── docs/adr/               # Architecture decision records
-├── src/                    # Source code
+├── backend/                # Backend source (Python package)
 │   ├── review_server.py    # Flask routing and thread scheduling
 │   ├── wsgi.py             # WSGI production entry
 │   ├── review/             # Review execution, settlement, GitLab client
 │   │   ├── runner.py       # Unified ReviewRun entry point
 │   │   └── settlement.py   # Acceptance verdict logic
 │   ├── storage/            # Persistence (SQLAlchemy)
+│   ├── migrations/         # Alembic migration scripts
+│   ├── alembic.ini         # Migration config
 │   └── admin/              # Admin routes and pages
 └── .gitignore
 
 # Generated after installation
 ~/opencr/
-├── src/                    # Copied source
+├── backend/                # Copied source
 ├── skills/                 # Copied skills for auto skill routing
-├── migrations/             # Copied database migrations
 ├── data/                   # SQLite database (review history and acceptance stats)
 ├── logs/                   # Log directory
 ├── venv/                   # Python virtual environment
@@ -262,40 +261,61 @@ After saving the webhook, click **Test** -> **Merge requests**.
 
 ## Admin Console
 
-The console is **disabled by default**. To enable it, set both values in `config.yaml`:
+The console is a Vue 3 single-page app (Element Plus + ECharts) served by Flask itself at
+`/admin`. It loads no CDN resources, so it renders correctly on an isolated intranet.
+
+### Enabling it
+
+The console is **disabled by default**. To enable it, set the following in `config.yaml`:
 
 ```yaml
 admin:
   enabled: true
-  token: "replace-with-a-long-random-string"
+  username: "admin"
+  # Write the password in PLAIN TEXT. On first start the service replaces it in place
+  # with a scrypt hash and leaves a comment above the line. To change the password,
+  # put a plain-text value back on that line and restart.
+  password: "replace-with-a-strong-password"
   # The webhook port is usually reachable from the intranet.
   # Turn this on if you only access the console from the host itself.
   bind_local_only: false
 ```
 
-> If `admin.enabled` is `true` but `token` is empty, the service **refuses to start**
-> rather than silently allowing access - otherwise you would be exposing an
-> unauthenticated admin panel on an intranet-reachable port.
+> If `admin.enabled` is `true` but `password` is empty, the service **refuses to start** -
+> otherwise you would be exposing an unauthenticated admin panel on an intranet-reachable port.
 
-Access (same token for all three):
+> **Upgrading from 0.4.0**: `admin.token` has been removed in favour of `username` + `password`.
+> If the old field is present, the service refuses to start and tells you exactly what to change.
 
-```bash
-# Browser: pass ?token= once, a cookie is set and /admin works directly afterwards
-open "http://localhost:9034/admin?token=YOUR_TOKEN"
+Once enabled, open `http://localhost:9034/admin`.
 
-# API
-curl -H "X-Admin-Token: YOUR_TOKEN" http://localhost:9034/api/admin/overview
-curl -H "X-Admin-Token: YOUR_TOKEN" http://localhost:9034/api/admin/runs/<run_uid>
-```
+### Guest browsing
 
-### What the console shows
+The console supports **guest browsing**, enabled by default: colleagues can view review status
+without an account.
 
-| Section | Contents |
-|---------|----------|
-| In progress | Running reviews, current phase, per-file progress |
-| Error statistics | Failed / degraded / skipped counts over the last 7 days |
-| Acceptance | Verdict distribution, acceptance rate and coverage over the last 30 days |
-| Recent runs | Last 50 review runs, including skipped ones and why |
+Guests see run status, progress, error statistics and acceptance statistics. They do **not** see
+finding bodies, because a body contains the AI's concrete description of code in a private
+repository (file path, line, problem, suggested fix), and the webhook port is typically reachable
+from the intranet.
+
+The switch lives in the console under System Settings, takes effect immediately, and is the only
+configuration item in this project that is not in `config.yaml` - its use is inherently temporary
+("visitors on site today, turn it off for now"), and requiring a file edit plus a restart would
+mean nobody ever uses it.
+
+The full trade-off is recorded in [ADR-0002](./docs/adr/0002-guest-read-scope.md).
+
+### Modules
+
+| Module | Contents | Guest |
+|--------|----------|:---:|
+| Dashboard | Key metrics, running reviews, run trend chart, acceptance distribution | ✅ |
+| Review runs | Run list (filter by status, search project/MR) and run detail | ✅ (no bodies) |
+| Findings | Cross-run finding list, filter by project / verdict / severity / window | ✅ (no bodies) |
+| Statistics | Acceptance analysis (rate, coverage, by delivery) and error analysis | ✅ |
+| Skills | Loaded skills and their recent hit counts | ✅ |
+| Settings | Effective configuration (secrets shown only as "set") and the writable subset | ❌ |
 
 ### Read these definitions before reading the numbers
 
@@ -332,6 +352,27 @@ downgraded. Both still count toward total output, which is why the console shows
 Review records are kept for 90 days by default (`storage.retention_days`) and purged by a
 background task. **Acceptance data cannot be backfilled** - MRs from before this feature
 shipped will never have verdicts, and purged data is equally unrecoverable.
+
+### Working on the front end
+
+The front end lives in `web/` as a separate build unit:
+
+```bash
+cd web
+pnpm install
+pnpm dev      # dev mode, proxies /api/admin to a local server on 9034
+pnpm build    # builds into backend/admin/static/
+```
+
+**The build output is not committed** - the repository stays clean, and each deployment path
+produces it:
+
+- **Docker**: compiled in a multi-stage build, so Node never reaches the final image
+- **launchd**: compiled by `install.sh` at install time. If Node/pnpm is missing the step is
+  skipped with a warning - the review service still works, `/admin` just returns a short
+  "build output missing" message. Install Node and re-run `./install.sh` to enable it.
+
+So changing the front end means committing **source only**. See [`web/README.md`](./web/README.md).
 
 ---
 
@@ -505,7 +546,7 @@ Then restart the service.
 
 ## Source Code Guide
 
-### `src/review_server.py`
+### `backend/review_server.py`
 
 Main modules:
 
@@ -517,7 +558,7 @@ Main modules:
 | `handle_webhook()` | Handles GitLab Webhook events |
 | `should_review_mr()` | Decides whether an MR should be reviewed |
 
-### `src/wsgi.py`
+### `backend/wsgi.py`
 
 Gunicorn production entry point.
 

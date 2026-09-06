@@ -270,15 +270,19 @@ copy_files() {
     print_step "安装项目文件"
 
     # 创建目录
-    mkdir -p "$INSTALL_DIR"/{src,skills,logs,scripts,data,migrations}
+    mkdir -p "$INSTALL_DIR"/{backend,skills,logs,scripts,data}
     print_success "创建目录: $INSTALL_DIR"
 
     # 复制源码
-    if [[ -d "$SCRIPT_DIR/src" ]]; then
-        cp -r "$SCRIPT_DIR/src/." "$INSTALL_DIR/src/"
-        print_success "复制源码文件"
+    if [[ -d "$SCRIPT_DIR/backend" ]]; then
+        cp -r "$SCRIPT_DIR/backend/." "$INSTALL_DIR/backend/"
+        print_success "复制源码文件（含 migrations 与 alembic.ini）"
+        if [[ ! -f "$INSTALL_DIR/backend/alembic.ini" ]]; then
+            print_error "backend/alembic.ini 缺失，无法初始化数据库"
+            exit 1
+        fi
     else
-        print_error "未找到 src 目录: $SCRIPT_DIR/src"
+        print_error "未找到 backend 目录: $SCRIPT_DIR/backend"
         exit 1
     fi
 
@@ -291,16 +295,6 @@ copy_files() {
         print_warning "自动 skill 选择将无法命中，审查分支会被跳过"
     fi
 
-    # 复制数据库迁移（start.sh 启动前会执行 alembic upgrade head）
-    if [[ -d "$SCRIPT_DIR/migrations" && -f "$SCRIPT_DIR/alembic.ini" ]]; then
-        cp -r "$SCRIPT_DIR/migrations/." "$INSTALL_DIR/migrations/"
-        cp "$SCRIPT_DIR/alembic.ini" "$INSTALL_DIR/alembic.ini"
-        print_success "复制数据库迁移"
-    else
-        print_error "未找到 migrations/ 或 alembic.ini，无法初始化数据库"
-        exit 1
-    fi
-
     # 复制 Python 依赖清单
     if [[ -f "$SCRIPT_DIR/requirements.txt" ]]; then
         cp "$SCRIPT_DIR/requirements.txt" "$INSTALL_DIR/requirements.txt"
@@ -311,7 +305,7 @@ copy_files() {
     fi
 
     # 设置可执行权限
-    chmod +x "$INSTALL_DIR/src/review_server.py"
+    chmod +x "$INSTALL_DIR/backend/review_server.py"
 }
 
 # 创建 Python 虚拟环境
@@ -331,6 +325,45 @@ setup_venv() {
 
     print_success "依赖安装完成"
     deactivate
+}
+
+# 编译后台前端
+#
+# 构建产物不进 Git（仓库保持干净），因此在安装时现编译。
+# 缺 Node/pnpm 时不中断安装：审查服务本身不依赖前端，
+# 只是后台页面会返回一条"产物缺失"的提示，补装后重跑本脚本即可。
+build_web_console() {
+    print_step "编译后台前端"
+
+    if [[ ! -d "$SCRIPT_DIR/web" ]]; then
+        print_warning "未找到 web 目录，跳过后台前端编译"
+        return 0
+    fi
+
+    local pm=""
+    if command -v pnpm >/dev/null 2>&1; then
+        pm="pnpm"
+    elif command -v npm >/dev/null 2>&1; then
+        pm="npm"
+    else
+        print_warning "未检测到 pnpm 或 npm，跳过后台前端编译"
+        print_warning "审查服务可正常使用，但 /admin 后台页面不可用"
+        print_warning "安装 Node.js 后重跑 ./install.sh 即可启用后台"
+        return 0
+    fi
+
+    print_info "使用 $pm 编译（首次会下载依赖，可能需要几分钟）"
+    if (cd "$SCRIPT_DIR/web" && $pm install && $pm run build); then
+        if [[ -f "$SCRIPT_DIR/backend/admin/static/index.html" ]]; then
+            mkdir -p "$INSTALL_DIR/backend/admin/static"
+            cp -r "$SCRIPT_DIR/backend/admin/static/." "$INSTALL_DIR/backend/admin/static/"
+            print_success "后台前端编译完成"
+        else
+            print_warning "编译结束但未找到产物，后台页面将不可用"
+        fi
+    else
+        print_warning "后台前端编译失败，/admin 页面不可用（不影响审查服务）"
+    fi
 }
 
 # 生成启动脚本
@@ -409,14 +442,14 @@ echo "Port: ${SERVER_PORT}"
 workers="${GUNICORN_WORKERS:-2}"
 
 # 迁移在启动前跑一次，而不是在每个 worker 里 —— 多个进程同时执行 DDL 只会互相抢锁
-(cd "$SCRIPT_DIR" && python3 -m src.storage.migrate) || {
+(cd "$SCRIPT_DIR" && python3 -m backend.storage.migrate) || {
     echo "[opencr] 数据库迁移失败，服务未启动" >&2
     exit 1
 }
 
 exec gunicorn \
     --bind "${SERVER_HOST}:${SERVER_PORT}" \
-    --chdir "$SCRIPT_DIR/src" \
+    --chdir "$SCRIPT_DIR/backend" \
     --workers $workers \
     --timeout 300 \
     --access-logfile "$SCRIPT_DIR/logs/access.log" \
@@ -439,11 +472,11 @@ cd "$SCRIPT_DIR"
 
 source "$SCRIPT_DIR/venv/bin/activate"
 
-export FLASK_APP=src/review_server.py
+export FLASK_APP=backend/review_server.py
 export FLASK_ENV=development
 export PYTHONUNBUFFERED=1
 
-cd "$SCRIPT_DIR/src" && python3 review_server.py
+cd "$SCRIPT_DIR/backend" && python3 review_server.py
 DEV_EOF
 
     chmod +x "$INSTALL_DIR/start-dev.sh"
@@ -465,7 +498,8 @@ generate_config_file() {
     REVIEW_SKILL_SCRIPTS_TIMEOUT=${REVIEW_SKILL_SCRIPTS_TIMEOUT:-10}
     OPENAI_REASONING_EFFORT=${OPENAI_REASONING_EFFORT:-medium}
     OPENCR_ADMIN_ENABLED=${OPENCR_ADMIN_ENABLED:-false}
-    OPENCR_ADMIN_TOKEN=${OPENCR_ADMIN_TOKEN:-}
+    OPENCR_ADMIN_USERNAME=${OPENCR_ADMIN_USERNAME:-admin}
+    OPENCR_ADMIN_PASSWORD=${OPENCR_ADMIN_PASSWORD:-}
     OPENCR_ADMIN_BIND_LOCAL_ONLY=${OPENCR_ADMIN_BIND_LOCAL_ONLY:-false}
     OPENCR_DATABASE_URL=${OPENCR_DATABASE_URL:-}
     OPENCR_RETENTION_DAYS=${OPENCR_RETENTION_DAYS:-90}
@@ -501,10 +535,12 @@ review:
   skill_scripts_enabled: ${REVIEW_SKILL_SCRIPTS_ENABLED}
   skill_scripts_timeout: ${REVIEW_SKILL_SCRIPTS_TIMEOUT}
 
-# 后台管理：默认关闭。开启需同时填写 token，否则服务会拒绝启动。
+# 后台管理：默认关闭。开启需同时填写密码，否则服务会拒绝启动。
+# password 可直接写明文，首次启动时会自动替换为哈希。
 admin:
   enabled: ${OPENCR_ADMIN_ENABLED}
-  token: "${OPENCR_ADMIN_TOKEN}"
+  username: "${OPENCR_ADMIN_USERNAME}"
+  password: "${OPENCR_ADMIN_PASSWORD}"
   bind_local_only: ${OPENCR_ADMIN_BIND_LOCAL_ONLY}
 
 storage:
@@ -614,7 +650,7 @@ show_summary() {
     echo ""
     echo "目录结构:"
     echo "  ${INSTALL_DIR}/"
-    echo "    ├── src/"
+    echo "    ├── backend/"
     echo "    │   ├── review_server.py  # 主服务代码"
     echo "    │   └── wsgi.py           # WSGI 入口"
     echo "    ├── skills/"
@@ -660,6 +696,7 @@ main() {
     collect_required_config
     check_code_platform_config
     copy_files
+    build_web_console
     setup_venv
     generate_start_scripts
     generate_config_file
