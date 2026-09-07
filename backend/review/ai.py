@@ -410,12 +410,14 @@ def review_changes_with_inline_notes(
     max_diff_size: int,
     skills_dir: str = "",
     progress_cb=None,
+    skills_cb=None,
 ) -> Tuple[str, List[Dict[str, object]]]:
     """
     按审查模式执行审查，并返回可用于行内评论的结构化问题列表。
 
     `progress_cb(done, total)` 在 file 模式下每处理完一个文件调用一次；
     overall 模式是单次模型调用，没有中间可观测点，因此不会触发。
+    `skills_cb(names)` 在各分支匹配后报告命中的技能名称。
     """
     normalized_mode = normalize_review_mode(review_mode)
     total_changes = len(changes or [])
@@ -432,6 +434,16 @@ def review_changes_with_inline_notes(
     skill_scripts_enabled = bool(review_cfg.get("skill_scripts_enabled", True))
     skill_scripts_timeout = int(review_cfg.get("skill_scripts_timeout", 10))
 
+    def _report_skills(names: List[str]) -> None:
+        """向调用方报告当前分支命中的技能名称。"""
+        if not names or not callable(skills_cb):
+            return
+        try:
+            skills_cb(names)
+        except Exception:
+            # 统计记录失败会使命中次数偏低，但不能阻断审查本身。
+            logger.warning("技能命中上报失败", exc_info=True)
+
     run_overall = normalized_mode in {REVIEW_MODE_OVERALL, REVIEW_MODE_HYBRID}
     run_file = normalized_mode in {REVIEW_MODE_FILE, REVIEW_MODE_HYBRID}
     if run_overall:
@@ -440,6 +452,7 @@ def review_changes_with_inline_notes(
             fallback_skill=review_skill,
             skills_dir=skills_dir,
         )
+        _report_skills(overall_skills)
         logger.info(
             "SkillMatch scope=overall hit=%s selected=%s",
             1 if overall_skills else 0,
@@ -490,6 +503,7 @@ def review_changes_with_inline_notes(
         file_hit = 0
         file_miss = 0
         def _report_progress(done: int) -> None:
+            """向调用方报告已处理文件数。"""
             if not callable(progress_cb):
                 return
             try:
@@ -510,6 +524,7 @@ def review_changes_with_inline_notes(
                 fallback_skill=review_skill,
                 skills_dir=skills_dir,
             )
+            _report_skills(file_skills)
             logger.info(
                 "SkillMatch scope=file file=%s hit=%s selected=%s",
                 file_path,

@@ -450,6 +450,15 @@ def execute_review_run(
             """逐文件进度回调；同时刷新心跳，避免长审查被误判为 Stale。"""
             repo.update_progress(run_uid, files_done=done, files_total=total)
 
+        matched_skills = set()
+
+        def _on_skills(names: List[str]) -> None:
+            """累积本次 ReviewRun 命中的技能并写入统计记录。"""
+            # 同一技能可能命中多个文件或 hybrid 的两个分支，每个 ReviewRun 只计一次。
+            # 匹配后立即记录，后续模型调用失败也不会丢失已经发生的命中。
+            matched_skills.update(names)
+            repo.update_progress(run_uid, review_skills=sorted(matched_skills))
+
         review_result, inline_notes = review_changes_with_inline_notes(
             changes_for_review,
             review_mode=review_mode,
@@ -457,6 +466,7 @@ def execute_review_run(
             max_diff_size=review_cfg["max_diff_size"],
             skills_dir=review_cfg["skills_dir"],
             progress_cb=_on_progress,
+            skills_cb=_on_skills,
         )
 
         repo.update_progress(run_uid, phase=PHASE_PUBLISHING)

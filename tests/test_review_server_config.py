@@ -155,6 +155,44 @@ def _health_payload() -> dict:
 
 
 class ReviewServerConfigTests(unittest.TestCase):
+    def test_matched_skills_reach_hit_counts(self):
+        """真实审查入口应将各分支命中的技能去重落库，并反映到列表统计。"""
+        from backend.review import ai
+        from backend.storage import repo
+
+        changes = [
+            {"new_path": name, "old_path": name, "diff": "@@ -1 +1 @@\n-old\n+new"}
+            for name in ("a.py", "b.py")
+        ]
+        cases = [
+            ("overall", [["python"]], ["python"], False),
+            ("file", [["python"], ["python", "general"]], ["general", "python"], False),
+            ("hybrid", [["general"], ["python"], ["python"]], ["general", "python"], False),
+            ("hybrid", [[], [], []], [], False),
+            ("overall", [["python"]], ["python"], True),
+        ]
+        for mode, selections, expected, fails in cases:
+            with self.subTest(mode=mode, selections=selections, fails=fails):
+                before = repo.skill_hit_counts()
+                uid = repo.start_run(project_id=1022, mr_iid=8, trigger="manual", review_mode=mode)
+                with (
+                    mock.patch.object(review_runner, "load_review_config", return_value={"max_diff_size": 50000, "skills_dir": "skills"}),
+                    mock.patch.object(review_runner, "_resolve_changes", return_value=(changes, {}, "")),
+                    mock.patch.object(review_runner, "enrich_changes_with_file_info", return_value=changes),
+                    mock.patch.object(ai, "auto_select_review_skills", side_effect=selections),
+                    mock.patch.object(ai, "load_review_skill_prompts", return_value="审查 Python"),
+                    mock.patch.object(ai, "call_codex_review", return_value="", side_effect=RuntimeError("测试模型失败") if fails else None),
+                    mock.patch.object(review_runner, "post_mr_comment"),
+                ):
+                    review_runner.execute_review_run(uid, 1022, 8, "测试", mode, "")
+
+                detail = repo.get_run_detail(uid)
+                self.assertEqual(detail["review_skills"], expected)
+                self.assertEqual(detail["status"], "failed" if fails else "succeeded")
+                after = repo.skill_hit_counts()
+                for name in ("python", "general"):
+                    self.assertEqual(after.get(name, 0), before.get(name, 0) + (name in expected))
+
     def test_skill_api_failure_marks_run_failed_and_posts_mr_comment(self):
         """模型鉴权失败必须穿过技能匹配与审查聚合，落库失败并反馈 MR。"""
         from backend.review import skills
