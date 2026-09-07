@@ -9,10 +9,10 @@
 - 新增 Vue 3 后台管理面板 `/admin`（基于 [v3-admin-vite](https://github.com/un-pany/v3-admin-vite) + Element Plus + ECharts 6），包含控制台、审查记录、审查发现、统计分析、Skill 管理与系统设置。通过 `admin.enabled` 开启，使用 `admin.username` 与 `admin.password` 登录。
 - 新增管理员密码哈希存储：首次启动时将配置中的明文密码替换为 scrypt 哈希；配置文件不可写时保留运行并记录警告。
 - 新增游客浏览开关（默认开启）：未登录者可查看运行状态与聚合统计，但看不到审查发现正文；开关可在后台修改并立即生效。判定边界见 `docs/adr/0002-guest-read-scope.md`。
-- 新增 SQLite 持久化层（SQLAlchemy + Alembic），记录每次 ReviewRun、进度与审查发现，支持保留期自动清理。
+- 新增 SQLite 持久化层（SQLAlchemy + Alembic），记录每次 ReviewRun、进度与审查发现，支持保留期自动清理。多 worker 场景下先设置 `busy_timeout` 再切换 WAL，切换失败仅记录警告不阻断启动。
 - 新增审查发现采纳统计：在 MR 合并或关闭时依据 GitLab discussion 的 resolved 状态与 👍/👎 表态结算，同时展示覆盖率。判定口径见 `docs/adr/0001-suggestion-acceptance-via-discussion-state.md`。
 - 新增跨审查运行的审查发现列表，支持按项目、采纳结论、严重度与时间窗筛选；支持按批次查看和筛选同一 MR 的历史发现。
-- 新增 Skill 管理页，展示已加载的技能及近 30 天命中次数。
+- 新增 Skill 管理页，展示已加载的技能及近 30 天命中次数。overall、file、hybrid 三种模式均记录命中，同一技能在一次 ReviewRun 中只计一次；后续模型调用失败仍保留已发生的命中。
 - 新增 Aurora、Graphite 皮肤，图表随当前主题切换；采纳结论使用不同颜色与图标区分。
 - 新增按代码平台展示合并请求名称与跳转链接的能力；链接展示不代表已接入该平台的审查流程。
 - 新增 `/api/admin/*` 接口，提供登录、鉴权、审查记录、审查发现、统计、技能与设置访问。
@@ -31,11 +31,8 @@
 
 ### Fixed
 
-- 修复 Skill 命中仅写日志、未持久化导致列表命中次数始终为 0 的问题。overall、file、hybrid 三种模式均记录命中，同一技能在一次 ReviewRun 中只计一次；后续模型调用失败仍保留已发生的命中。历史缺失记录不会自动补回。
 - 修复技能匹配调用失败被吞掉的问题：审查运行会标记失败，并向 MR 发布失败说明。
 - 修复将未超限的明确通过结论误判为审查发现的问题。
-- 修复多 worker 启动时 `PRAGMA journal_mode=WAL` 可能报 `database is locked` 的问题：先设置 `busy_timeout`，WAL 切换失败时记录警告并继续启动。
-- 修复后台标题配置为空时未显示默认名称的问题，统一回退为 OpenCR。
 
 ## [0.3.0] - 2026-06-02
 

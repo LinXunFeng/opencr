@@ -149,7 +149,7 @@ docker compose up -d --build
 # 前端
 cd web && pnpm install
 pnpm dev      # 开发（自动代理 /api/admin 到本地 9034）
-pnpm build    # 构建到 backend/admin/static/，产物需一并提交
+pnpm build    # 构建到 backend/admin/static/（产物不进 Git）
 ```
 
 ---
@@ -165,6 +165,5 @@ pnpm build    # 构建到 backend/admin/static/，产物需一并提交
 - `/webhook` 与 `/manual-review` 的响应语义变更属于破坏性变更，需同步更新
   `README.md`、`README-zh.md`、`quick-test.sh` 与 `CHANGELOG.md`。
 - 新增配置项要同时更新 `config.example.yaml`（含中英双语注释）与 `install.sh` 的配置生成段。
-- 改动前端后必须 `pnpm build` 并提交 `backend/admin/static/`，否则部署端看到的还是旧界面。
 - 扩大 Guest 可见范围前，先读 `docs/adr/0002-guest-read-scope.md`——那里的默认值是建立在
   "可见范围已排除敏感内容"这个前提上的，扩大范围就必须重新评估默认开启是否还成立。
