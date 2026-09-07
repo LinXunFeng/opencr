@@ -508,7 +508,8 @@ def execute_review_run(
         try:
             post_mr_comment(project_id, mr_iid, f"❌ 代码审查失败\n\n```\n{str(e)}\n```")
         except Exception:
-            pass
+            # GitLab 不可用时 MR 无法收到失败反馈，仍保留已落库的原始审查错误。
+            logger.warning("MR !%s 的审查失败反馈发送失败", mr_iid, exc_info=True)
     except Exception as e:
         logger.exception("%s Unexpected error for MR !%s", log_prefix, mr_iid)
         repo.finish_run(run_uid, RUN_FAILED, ERROR_UNEXPECTED, str(e))

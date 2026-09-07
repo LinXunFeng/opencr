@@ -15,6 +15,7 @@ import openai
 
 from .common import (
     REVIEW_MODE_OVERALL,
+    ReviewError,
     normalize_review_mode,
     normalize_review_skill,
 )
@@ -589,7 +590,7 @@ def auto_select_review_skills(
 ) -> List[str]:
     """
     基于 skill 描述与本次变更自动选择多个审查 skill（按优先级）。
-    若无法判定或调用失败，返回空列表（表示不参与本轮审查）。
+    未匹配时返回空列表；配置缺失或模型调用失败时抛出 ReviewError。
     """
     logger.info(
         "Auto skill selection start: changes=%s, fallback_skill=%s, skills_dir=%s, max_count=%s",
@@ -611,8 +612,7 @@ def auto_select_review_skills(
 
     cfg = load_openai_config()
     if not cfg.get("api_key"):
-        logger.warning("SkillMatch result: hit=0, reason=missing_api_key, scope=auto_select")
-        return []
+        raise ReviewError("技能匹配失败：未配置 API Key")
 
     skill_options = sorted(skill_previews.keys())
     logger.info(
@@ -720,5 +720,6 @@ def auto_select_review_skills(
         )
         return selected_skills
     except Exception as e:
-        logger.warning(f"SkillMatch result: hit=0, reason=exception, error={e}")
-        return []
+        # 空列表只表示正常的未匹配；吞掉调用错误会使整轮零审查仍被标为成功，
+        # 也会绕过 runner 中已有的 MR 失败反馈。
+        raise ReviewError(f"技能匹配模型调用失败：{e}") from e

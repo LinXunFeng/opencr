@@ -155,6 +155,34 @@ def _health_payload() -> dict:
 
 
 class ReviewServerConfigTests(unittest.TestCase):
+    def test_skill_api_failure_marks_run_failed_and_posts_mr_comment(self):
+        """模型鉴权失败必须穿过技能匹配与审查聚合，落库失败并反馈 MR。"""
+        from backend.review import skills
+        from backend.storage import repo
+        from backend.storage.models import RUN_FAILED
+
+        changes = [{"new_path": "a.py", "old_path": "a.py", "diff": "@@ -1 +1 @@\n-old\n+new"}]
+        for mode in ("overall", "file", "hybrid"):
+            with self.subTest(mode=mode):
+                run_uid = repo.start_run(project_id=1022, mr_iid=8, trigger="manual", review_mode=mode)
+                with (
+                    mock.patch.object(review_runner, "load_review_config", return_value={"max_diff_size": 50000, "skills_dir": "skills"}),
+                    mock.patch.object(review_runner, "_resolve_changes", return_value=(changes, {}, "")),
+                    mock.patch.object(review_runner, "enrich_changes_with_file_info", return_value=changes),
+                    mock.patch.object(skills, "load_review_skill_previews", return_value={"python": "Python", "general": "通用"}),
+                    mock.patch.object(skills, "load_openai_config", return_value={"api_key": "test-key", "base_url": "http://test.invalid", "model": "test"}),
+                    mock.patch.object(skills.openai, "OpenAI") as client,
+                    mock.patch.object(review_runner, "post_mr_comment") as post,
+                ):
+                    client.return_value.chat.completions.create.side_effect = RuntimeError("401 Invalid API key")
+                    review_runner.execute_review_run(run_uid, 1022, 8, "测试", mode, "")
+
+                self.assertEqual(repo.get_run_detail(run_uid)["status"], RUN_FAILED)
+                post.assert_called_once()
+                self.assertEqual(post.call_args.args[:2], (1022, 8))
+                self.assertIn("代码审查失败", post.call_args.args[2])
+                self.assertIn("401", post.call_args.args[2])
+
     def setUp(self):
         _ensure_test_database()
         from backend.storage import repo
