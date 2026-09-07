@@ -157,6 +157,8 @@ pnpm build    # 构建到 backend/admin/static/，产物需一并提交
 ## 七、改动约束
 
 - **Git 提交信息统一使用英文**，包括标题、正文和页脚，并遵循 Conventional Commits 格式。
+- **版本号以主分支现有版本为基准更新。** 更新前先核对主分支的版本号，根据该分支最终合入的整体改动确定下一版本；
+  无论分支内改动多少、幅度多大，都不要沿用分支内临时版本号反复递增，也不要在日常修改时随意改版本号。
 - **不要提交 `config.yaml`**（已在 `.gitignore` 中），它含有真实 token。
 - 修改 `backend/storage/models.py` 后**必须**生成对应的 Alembic 迁移，模型与迁移不允许脱节；
   用 `alembic -c backend/alembic.ini check` 可以验证。
