@@ -1075,6 +1075,32 @@ python3 -c 'import json, sys; payload=json.load(sys.stdin); print("script saw " 
 
         self.assertEqual(inline_notes, [])
 
+    def test_file_review_pass_with_negated_limit_does_not_create_finding(self):
+        """未超过限制是通过依据，不能被当成超限问题；真实超限仍须保留。"""
+        screenshot_result = (
+            "### 总体评价\n\n"
+            "新增图片体积为 28.4KB，未超过 300KB 限制。基于现有元信息与二进制差异，未发现可验证的高置信度问题。\n\n"
+            "### 详细审查结果\n\n本次未发现高置信度问题。\n\n"
+            "### 如无问题\n\n✅ 代码审查通过，未发现明显问题。"
+        )
+        for result, expected in (
+            (screenshot_result, 0),
+            (screenshot_result.replace("未超过", "没有超出"), 0),
+            (screenshot_result + "\n但另一张图片超过 300KB 限制。", 1),
+            (screenshot_result + "\n建议修复图片引用路径。", 1),
+        ):
+            with (
+                self.subTest(result=result),
+                mock.patch("backend.review.ai.auto_select_review_skills", return_value=["general"]),
+                mock.patch("backend.review.ai.load_review_skill_prompts", return_value="图片审查规则"),
+                mock.patch("backend.review.ai.call_codex_review", return_value=result),
+            ):
+                _, findings = review_server.review_changes_with_inline_notes(
+                    changes=[{"new_path": "image.png", "old_path": "image.png", "diff": ""}],
+                    review_mode="file", review_skill="", max_diff_size=50000, skills_dir="skills",
+                )
+                self.assertEqual(len(findings), expected)
+
     def test_file_review_long_pass_text_without_issue_marker_does_not_create_note(self):
         non_text_change = {
             "new_path": "assets/images/a.png",

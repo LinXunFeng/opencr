@@ -394,7 +394,10 @@ def _is_explicit_pass_result(result_text: str) -> bool:
         "位置",
         "描述",
     ]
-    if any(marker in normalized for marker in issue_markers):
+    # “未超过限制”是通过依据，不能因子串“超过”落入文件级问题兜底。
+    # 只消去明确否定的超限词组，不删整句；同句或后文的真实问题仍应阻止通过。
+    issue_text = re.sub(r"(?:未|没有)\s*(?:超过|超出)", "", normalized)
+    if any(marker in issue_text for marker in issue_markers):
         return False
 
     return True
