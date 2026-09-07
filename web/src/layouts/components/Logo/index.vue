@@ -9,7 +9,8 @@ const { collapse = true } = defineProps<Props>()
 
 const { isTop } = useLayoutMode()
 
-const title = import.meta.env.VITE_APP_TITLE
+// 部署环境可以不提供标题；与浏览器标签页保持一致，避免展开侧栏只剩图标。
+const title = import.meta.env.VITE_APP_TITLE?.trim() || "OpenCR"
 </script>
 
 <template>

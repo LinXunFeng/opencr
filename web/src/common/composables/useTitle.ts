@@ -1,5 +1,5 @@
 /** 项目标题 */
-const VITE_APP_TITLE = import.meta.env.VITE_APP_TITLE ?? "OpenCR"
+const VITE_APP_TITLE = import.meta.env.VITE_APP_TITLE?.trim() || "OpenCR"
 
 /** 动态标题 */
 const dynamicTitle = ref<string>("")

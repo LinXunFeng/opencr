@@ -1,5 +1,6 @@
 <script lang="ts" setup>
-const VITE_APP_TITLE = import.meta.env.VITE_APP_TITLE
+// 标题是可选的构建配置，缺省时仍需展示版权归属。
+const VITE_APP_TITLE = import.meta.env.VITE_APP_TITLE?.trim() || "OpenCR"
 </script>
 
 <template>
