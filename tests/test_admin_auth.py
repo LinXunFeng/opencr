@@ -129,6 +129,35 @@ class PasswordHashingTests(unittest.TestCase):
 class GuestBoundaryTests(unittest.TestCase):
     """Guest 可见范围：状态与聚合可见，Finding 正文不可见。"""
 
+    def test_guest_change_links_follow_platform_without_exposing_findings(self):
+        """运行接口按平台提供名称与链接，同时保持 Guest 正文边界。"""
+        from flask import Flask
+        from backend.admin import auth, routes
+
+        run_uid = self._seed()
+        app = Flask(__name__)
+        app.register_blueprint(routes.admin_bp)
+        for platform, label, route in (
+            ("gitlab", "MR", "-/merge_requests/2"),
+            ("github", "PR", "pull/2"),
+            ("unknown", "合并请求", ""),
+        ):
+            with (
+                self.subTest(platform=platform),
+                mock.patch.object(auth, "load_admin_config", return_value={"enabled": True, "bind_local_only": False}),
+                mock.patch.object(routes, "load_gitlab_config", return_value={"type": platform, "url": "https://code.example/prefix/?private=value#fragment"}),
+                app.test_client() as client,
+            ):
+                listing = client.get("/api/admin/runs")
+                detail = client.get(f"/api/admin/runs/{run_uid}")
+                self.assertEqual(listing.status_code, 200)
+                self.assertEqual(detail.status_code, 200)
+                expected = f"https://code.example/prefix/g/p/{route}" if route else ""
+                for item in (listing.get_json()["items"][0], detail.get_json()):
+                    self.assertEqual(item["change_url"], expected)
+                    self.assertEqual(item["change_label"], label)
+                self.assertNotIn("body", detail.get_json()["findings"][0])
+
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp(prefix="opencr-db-")
         os.environ["OPENCR_DATABASE_URL"] = f"sqlite:///{Path(self.tmpdir, 'test.db')}"

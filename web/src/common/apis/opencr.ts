@@ -20,6 +20,9 @@ export interface ReviewRun {
   project_path: string
   mr_iid: number
   mr_title: string
+  /** 平台对应的名称（MR / PR）与网页地址；未知平台不生成链接。 */
+  change_label?: string
+  change_url?: string
   trigger: string
   review_mode: string
   review_skills: string[]

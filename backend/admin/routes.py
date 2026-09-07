@@ -9,6 +9,7 @@
 
 import logging
 from pathlib import Path
+from urllib.parse import quote, urlsplit, urlunsplit
 
 from flask import Blueprint, current_app, jsonify, request, send_from_directory, session
 
@@ -67,6 +68,27 @@ def _window_days(default: int) -> int:
 def _stale_after() -> int:
     """心跳超时阈值（秒）。超过它的进行中 ReviewRun 会被标注为 Stale。"""
     return int(load_storage_config()["stale_after_seconds"])
+
+
+def _add_change_links(runs: list[dict]) -> list[dict]:
+    """按配置平台补充合并请求名称与网页地址；未知平台或缺失路径时不生成链接。"""
+    config = load_gitlab_config()
+    platform = config.get("type", "gitlab")
+    label, route = {"gitlab": ("MR", "-/merge_requests"), "github": ("PR", "pull")}.get(
+        platform, ("合并请求", "")
+    )
+    base = urlsplit(str(config.get("url") or "").strip())
+    # 链接只包含网页地址，不把配置中可能存在的凭据、查询参数带给浏览器。
+    valid = base.scheme in {"http", "https"} and bool(base.netloc) and not base.username and not base.password
+    for run in runs:
+        project_path = str(run.get("project_path") or "").strip("/")
+        run["change_label"] = label
+        run["change_url"] = ""
+        # 未知平台不能套用 GitLab 路由；数据库沿用 mr_iid，不为展示功能做迁移。
+        if valid and route and project_path and run.get("mr_iid"):
+            path = f"{base.path.rstrip('/')}/{quote(project_path, safe='/')}/{route}/{int(run['mr_iid'])}"
+            run["change_url"] = urlunsplit((base.scheme, base.netloc, path, "", ""))
+    return runs
 
 
 def _int_arg(name: str, default: int, maximum: int) -> int:
@@ -176,11 +198,11 @@ def api_runs():
     """运行列表。"""
     return jsonify(
         {
-            "items": repo.list_recent_runs(
+            "items": _add_change_links(repo.list_recent_runs(
                 limit=_int_arg("limit", 50, 200),
                 status=(request.args.get("status") or "").strip(),
                 stale_after_seconds=_stale_after(),
-            )
+            ))
         }
     )
 
@@ -203,6 +225,7 @@ def api_run_detail(run_uid: str):
         for finding in detail.get("findings", []):
             finding.pop("body", None)
     detail["body_included"] = body_included
+    _add_change_links([detail])
     return jsonify(detail)
 
 

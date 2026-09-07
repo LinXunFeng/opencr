@@ -274,6 +274,7 @@ def load_gitlab_config() -> dict:
 
     return {
         "url": gitlab_url,
+        "type": (_pick_config_value(config_data, "code_platform.type") or "gitlab").strip().lower(),
         "token": token,
         "webhook_secret": webhook_secret,
     }

@@ -60,7 +60,7 @@ onMounted(load)
           </el-select>
         </el-form-item>
         <el-form-item label="搜索">
-          <el-input v-model="keyword" placeholder="项目 / MR 标题 / 编号" clearable style="width: 260px" />
+          <el-input v-model="keyword" placeholder="项目 / 合并请求标题 / 编号" clearable style="width: 260px" />
         </el-form-item>
         <el-form-item>
           <el-button type="primary" @click="load">
@@ -89,10 +89,10 @@ onMounted(load)
             {{ row.project_path || row.project_id }}
           </template>
         </el-table-column>
-        <el-table-column label="MR" width="80">
+        <el-table-column label="合并请求" width="100">
           <template #default="{ row }">
             <el-link type="primary" @click="router.push(`/runs/detail/${row.run_uid}`)">
-              !{{ row.mr_iid }}
+              {{ row.change_label || "合并请求" }} #{{ row.mr_iid }}
             </el-link>
           </template>
         </el-table-column>
@@ -124,6 +124,14 @@ onMounted(load)
             <span :class="{ danger: row.status === 'failed', warn: row.degradations.length }">
               {{ note(row) }}
             </span>
+          </template>
+        </el-table-column>
+        <el-table-column label="链接" width="130" fixed="right">
+          <template #default="{ row }">
+            <el-link v-if="row.change_url" :href="row.change_url" target="_blank" rel="noopener noreferrer" type="primary">
+              打开 {{ row.change_label || "合并请求" }}
+            </el-link>
+            <span v-else class="muted">-</span>
           </template>
         </el-table-column>
       </el-table>

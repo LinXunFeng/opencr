@@ -44,7 +44,10 @@ onMounted(load)
       <el-card shadow="never" class="mt">
         <template #header>
           <div class="header">
-            <span>MR !{{ detail.mr_iid }} · {{ detail.mr_title }}</span>
+            <span>{{ detail.change_label || "合并请求" }} #{{ detail.mr_iid }} · {{ detail.mr_title }}</span>
+            <el-link v-if="detail.change_url" :href="detail.change_url" target="_blank" rel="noopener noreferrer" type="primary">
+              打开 {{ detail.change_label || "合并请求" }}
+            </el-link>
             <el-tag v-if="detail.is_stale" type="warning" size="small">
               疑似中断
             </el-tag>

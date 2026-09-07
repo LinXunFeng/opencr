@@ -5,6 +5,11 @@
 
 ## Language
 
+### 代码平台
+
+**合并请求**：GitLab 称为 Merge Request（MR），GitHub 称为 Pull Request（PR）。
+后台跳转入口按 `code_platform.type` 显示平台名称与链接；支持链接展示不等于已接入该平台的审查流程。
+
 ### 审查执行
 
 **ReviewRun / 审查运行**：
