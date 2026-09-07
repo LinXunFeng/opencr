@@ -2,39 +2,40 @@
 
 本文件记录项目的重要变更。
 
-## [0.5.0] - 2026-09-06
+## [0.4.0] - 2026-09-07
 
 ### Added
-- 后台管理改为 Vue 3 单页应用（基于 [v3-admin-vite](https://github.com/un-pany/v3-admin-vite) + Element Plus + ECharts 6），包含控制台、审查记录、审查发现、统计分析、Skill 管理与系统设置六个模块。
-- 新增账号密码登录。`admin.password` 直接写明文即可，服务首次启动时会就地把它替换为 scrypt 哈希并加上注释说明；配置文件不可写时服务照常运行，但每次启动会警告明文未清理。
-- 新增**游客浏览**开关（默认开启）：未登录者可查看运行状态与聚合统计，但看不到审查发现的正文。开关存在数据库中、后台可改、立即生效。判定边界见 `docs/adr/0002-guest-read-scope.md`。
-- 新增跨审查运行的「审查发现」列表，支持按项目 / 采纳结论 / 严重度 / 时间窗筛选——用于回答"这个项目所有被忽略的严重问题"这类单看某次运行问不出来的问题。
-- 新增 Skill 管理页，展示已加载的 skill 及其近期命中次数（命中为 0 的 skill 等于没生效）。
-- 新增 `/api/admin/*` 接口族：login、logout、me、dashboard、runs、findings、stats/verdicts、stats/errors、skills、settings。
+
+- 新增 Vue 3 后台管理面板 `/admin`（基于 [v3-admin-vite](https://github.com/un-pany/v3-admin-vite) + Element Plus + ECharts 6），包含控制台、审查记录、审查发现、统计分析、Skill 管理与系统设置。通过 `admin.enabled` 开启，使用 `admin.username` 与 `admin.password` 登录。
+- 新增管理员密码哈希存储：首次启动时将配置中的明文密码替换为 scrypt 哈希；配置文件不可写时保留运行并记录警告。
+- 新增游客浏览开关（默认开启）：未登录者可查看运行状态与聚合统计，但看不到审查发现正文；开关可在后台修改并立即生效。判定边界见 `docs/adr/0002-guest-read-scope.md`。
+- 新增 SQLite 持久化层（SQLAlchemy + Alembic），记录每次 ReviewRun、进度与审查发现，支持保留期自动清理。
+- 新增审查发现采纳统计：在 MR 合并或关闭时依据 GitLab discussion 的 resolved 状态与 👍/👎 表态结算，同时展示覆盖率。判定口径见 `docs/adr/0001-suggestion-acceptance-via-discussion-state.md`。
+- 新增跨审查运行的审查发现列表，支持按项目、采纳结论、严重度与时间窗筛选；支持按批次查看和筛选同一 MR 的历史发现。
+- 新增 Skill 管理页，展示已加载的技能及近 30 天命中次数。
+- 新增 Aurora、Graphite 皮肤，图表随当前主题切换；采纳结论使用不同颜色与图标区分。
+- 新增按代码平台展示合并请求名称与跳转链接的能力；链接展示不代表已接入该平台的审查流程。
+- 新增 `/api/admin/*` 接口，提供登录、鉴权、审查记录、审查发现、统计、技能与设置访问。
+- 新增 Docker 安装方式，保留 macOS launchd 安装方式。
+- 新增领域术语表 `CONTEXT.md` 与架构决策记录 `docs/adr/`。
 
 ### Changed
-- **破坏性变更**：`admin.token` 共享令牌已移除，改为 `admin.username` + `admin.password`。命中旧字段时服务会拒绝启动并给出具体的迁移指引。
-- 移除 Jinja 模板后台，`/admin` 改为托管 Vue 打包产物。`backend/admin/static/` 的构建产物**提交进 Git**，因此部署端不需要 Node。
-- Docker 中 `config.yaml` 不再只读挂载，以便首次启动时写回密码哈希。
-- 测试不再无条件使用 flask/openai/requests 桩：真依赖可用时用真的，桩只在缺库环境兜底。测试也不再读取开发机的 `config.yaml`。
+
+- **破坏性变更**：`/manual-review` 改为异步执行，返回 `202` 与 `run_uid`；审查进度通过后台或 `/api/admin/runs/<run_uid>` 查看。
+- 后端包由 `src/` 调整为 `backend/`；审查执行逻辑集中到 `backend/review/runner.py`，webhook 与手动触发共用同一执行路径。
+- 前端源码位于 `web/`，构建产物 `backend/admin/static/` 不提交进 Git。Docker 使用多阶段构建，Node 不进入运行镜像；launchd 安装时编译前端，缺少构建工具时跳过并提示。
+- Docker 中的 `config.yaml` 使用可写挂载，以便首次启动时写回密码哈希。
+- gunicorn worker 数由 `CPU 核数 × 2 + 1` 调整为 `2`，减少 SQLite 锁竞争。
+- 统一领域用语：AI 产出称为「审查发现 / Finding」，「建议」仅用于最低严重度与修复方案字段。
+- 测试优先使用已安装的真实依赖，仅在缺库时使用桩；测试配置与数据库独立于开发环境。
 
 ### Fixed
-- 修复多 worker 同时启动时 `PRAGMA journal_mode=WAL` 报 `database is locked` 的问题：`busy_timeout` 现在先于 `journal_mode` 设置，且 WAL 切换失败不再导致进程退出。
 
-## [0.4.0] - 2026-09-05
-
-### Added
-- 新增后台管理面板 `/admin`：查看进行中的审查及其阶段/文件进度、最近运行记录、错误统计与建议采纳统计。默认关闭，需在 `config.yaml` 中设置 `admin.enabled` 与 `admin.token`。
-- 新增审查发现（Finding）采纳统计：在 MR 合并/关闭时依据 GitLab discussion 的 resolved 状态与 👍/👎 表态结算，判定口径见 `docs/adr/0001-suggestion-acceptance-via-discussion-state.md`。
-- 新增 SQLite 持久化层（SQLAlchemy + Alembic），记录每次 ReviewRun 与其产出，支持保留期自动清理。
-- 新增 Docker 安装方式：`Dockerfile`、`docker-compose.yml` 与 `docker-entrypoint.sh`，macOS launchd 安装方式继续保留。
-- 新增 `CONTEXT.md` 领域术语表与 `docs/adr/` 架构决策记录。
-
-### Changed
-- **破坏性变更**：`/manual-review` 改为异步执行，返回 `202` 与 `run_uid`，不再同步返回审查结果。审查进度改由 `/admin` 或 `/api/admin/runs/<run_uid>` 查看。
-- 审查执行逻辑从 `review_server.py` 抽出到 `backend/review/runner.py`，webhook 与手动触发合并为同一执行路径。
-- gunicorn worker 数由 `CPU 核数 × 2 + 1` 降为 `2`：本服务 IO bound 且几乎无 QPS，过多 worker 只会放大 SQLite 锁竞争。
-- 术语统一：AI 产出的每一条统称「审查发现 / Finding」，「建议」一词只保留给严重度最低档与修复方案字段。
+- 修复 Skill 命中仅写日志、未持久化导致列表命中次数始终为 0 的问题。overall、file、hybrid 三种模式均记录命中，同一技能在一次 ReviewRun 中只计一次；后续模型调用失败仍保留已发生的命中。历史缺失记录不会自动补回。
+- 修复技能匹配调用失败被吞掉的问题：审查运行会标记失败，并向 MR 发布失败说明。
+- 修复将未超限的明确通过结论误判为审查发现的问题。
+- 修复多 worker 启动时 `PRAGMA journal_mode=WAL` 可能报 `database is locked` 的问题：先设置 `busy_timeout`，WAL 切换失败时记录警告并继续启动。
+- 修复后台标题配置为空时未显示默认名称的问题，统一回退为 OpenCR。
 
 ## [0.3.0] - 2026-06-02
 
