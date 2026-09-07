@@ -1,6 +1,7 @@
 <script lang="ts" setup>
 import type { Finding, ProjectItem } from "@@/apis/opencr"
 import { getDashboardApi, getFindingsApi } from "@@/apis/opencr"
+import VerdictTag from "@@/components/VerdictTag/index.vue"
 import {
   DELIVERY_LABEL,
   formatTime,
@@ -154,11 +155,9 @@ onMounted(async () => {
             {{ DELIVERY_LABEL[row.delivery] || row.delivery }}
           </template>
         </el-table-column>
-        <el-table-column label="采纳结论" width="110">
+        <el-table-column label="采纳结论" width="130">
           <template #default="{ row }">
-            <el-tag size="small" effect="plain">
-              {{ VERDICT_LABEL[row.verdict] || row.verdict }}
-            </el-tag>
+            <VerdictTag :verdict="row.verdict" />
           </template>
         </el-table-column>
         <el-table-column prop="verdict_reason" label="依据" width="150" />

@@ -1,6 +1,7 @@
 <script lang="ts" setup>
 import type { RunDetail } from "@@/apis/opencr"
 import { getChangeHistoryApi, getRunDetailApi } from "@@/apis/opencr"
+import VerdictTag from "@@/components/VerdictTag/index.vue"
 import {
   DEGRADATION_LABEL,
   DELIVERY_LABEL,
@@ -230,11 +231,9 @@ watch(() => route.params.runUid, load, { immediate: true })
               {{ DELIVERY_LABEL[row.delivery] || row.delivery }}
             </template>
           </el-table-column>
-          <el-table-column label="采纳结论" width="110">
+          <el-table-column label="采纳结论" width="130">
             <template #default="{ row }">
-              <el-tag size="small" effect="plain">
-                {{ VERDICT_LABEL[row.verdict] || row.verdict }}
-              </el-tag>
+              <VerdictTag :verdict="row.verdict" />
             </template>
           </el-table-column>
           <el-table-column prop="verdict_reason" label="依据" width="150" />
