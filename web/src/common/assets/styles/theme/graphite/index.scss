@@ -1,0 +1,137 @@
+// 石墨（深色）
+//
+// 和已有的两套深色主题区分开：dark 是接近纯黑的中性灰，dark-blue 是海军蓝，
+// 这套是带一点蓝调的石墨灰 + 青色强调，偏「数据控制台」的观感。
+
+html.graphite {
+  // ---- 主色 ----
+  // 深色底上实色浅调会发白，所以 light-N 一律用 alpha
+  --el-color-primary: #22d3ee;
+  --el-color-primary-light-3: #22d3eeb3;
+  --el-color-primary-light-5: #22d3ee80;
+  --el-color-primary-light-7: #22d3ee4d;
+  --el-color-primary-light-8: #22d3ee33;
+  --el-color-primary-light-9: #22d3ee1a;
+  --el-color-primary-dark-2: #22d3ee;
+
+  // ---- 语义色 ----
+  --el-color-success: #3ecf8e;
+  --el-color-success-light-3: #3ecf8eb3;
+  --el-color-success-light-5: #3ecf8e80;
+  --el-color-success-light-7: #3ecf8e4d;
+  --el-color-success-light-8: #3ecf8e33;
+  --el-color-success-light-9: #3ecf8e1a;
+  --el-color-success-dark-2: #3ecf8e;
+
+  --el-color-warning: #f5a524;
+  --el-color-warning-light-3: #f5a524b3;
+  --el-color-warning-light-5: #f5a52480;
+  --el-color-warning-light-7: #f5a5244d;
+  --el-color-warning-light-8: #f5a52433;
+  --el-color-warning-light-9: #f5a5241a;
+  --el-color-warning-dark-2: #f5a524;
+
+  --el-color-danger: #f4595f;
+  --el-color-danger-light-3: #f4595fb3;
+  --el-color-danger-light-5: #f4595f80;
+  --el-color-danger-light-7: #f4595f4d;
+  --el-color-danger-light-8: #f4595f33;
+  --el-color-danger-light-9: #f4595f1a;
+  --el-color-danger-dark-2: #f4595f;
+
+  --el-color-error: #f4595f;
+  --el-color-error-light-3: #f4595fb3;
+  --el-color-error-light-5: #f4595f80;
+  --el-color-error-light-7: #f4595f4d;
+  --el-color-error-light-8: #f4595f33;
+  --el-color-error-light-9: #f4595f1a;
+  --el-color-error-dark-2: #f4595f;
+
+  --el-color-info: #8b93a3;
+  --el-color-info-light-3: #8b93a3b3;
+  --el-color-info-light-5: #8b93a380;
+  --el-color-info-light-7: #8b93a34d;
+  --el-color-info-light-8: #8b93a333;
+  --el-color-info-light-9: #8b93a31a;
+  --el-color-info-dark-2: #8b93a3;
+
+  // ---- 文字 ----
+  --el-text-color-primary: #e8ebf1;
+  --el-text-color-regular: #c4cad6;
+  --el-text-color-secondary: #8b93a3;
+  --el-text-color-placeholder: #6e7686;
+  --el-text-color-disabled: #545b69;
+
+  // ---- 边框 ----
+  --el-border-color-darker: #303643;
+  --el-border-color-dark: #2b313c;
+  --el-border-color: #272d38;
+  --el-border-color-light: #232833;
+  --el-border-color-lighter: #1f242e;
+  --el-border-color-extra-light: #1b202a;
+
+  // ---- 填充 ----
+  --el-fill-color-darker: #262c36;
+  --el-fill-color-dark: #212630;
+  --el-fill-color: #1d222b;
+  --el-fill-color-light: #1a1f27;
+  --el-fill-color-lighter: #171b23;
+  --el-fill-color-blank: #161a21;
+  --el-fill-color-extra-light: #161a21;
+
+  // ---- 背景 ----
+  --el-bg-color-page: #0e1116;
+  --el-bg-color: #161a21;
+  --el-bg-color-overlay: #1b2029;
+
+  --el-mask-color: rgba(0, 0, 0, 0.7);
+  --el-mask-color-extra-light: rgba(0, 0, 0, 0.4);
+
+  // ---- 阴影 ----
+  --el-box-shadow: 0 12px 32px 4px rgba(0, 0, 0, 0.5), 0 8px 20px rgba(0, 0, 0, 0.4);
+  --el-box-shadow-light: 0 0 12px rgba(0, 0, 0, 0.4);
+  --el-box-shadow-lighter: 0 0 6px rgba(0, 0, 0, 0.35);
+  --el-box-shadow-dark: 0 16px 48px 16px rgba(0, 0, 0, 0.5);
+
+  // ---- 皮肤自有变量（供 polish mixin 使用）----
+  --sk-border: #252b35;
+  --sk-shadow: 0 1px 2px rgba(0, 0, 0, 0.35), 0 8px 24px -12px rgba(0, 0, 0, 0.6);
+  --sk-shadow-hover: 0 2px 6px rgba(0, 0, 0, 0.4), 0 16px 36px -14px rgba(0, 0, 0, 0.7);
+  --sk-login-bg:
+    radial-gradient(1000px 500px at 20% -10%, #17323b 0%, transparent 60%),
+    radial-gradient(800px 460px at 100% 0%, #1c2430 0%, transparent 55%), #0e1116;
+
+  // ---- 布局 ----
+  --v3-header-bg-color: #161a21;
+  --v3-header-box-shadow: none;
+  --v3-header-border-bottom: 1px solid #252b35;
+
+  --v3-sidebar-menu-bg-color: #12161c;
+  --v3-sidebar-border-right: 1px solid #252b35;
+  --v3-sidebar-menu-text-color: #9aa2b1;
+  --v3-sidebar-menu-active-text-color: #22d3ee;
+  --v3-sidebar-menu-hover-bg-color: #22d3ee14;
+  --v3-sidebar-menu-tip-line-bg-color: #22d3ee;
+
+  --v3-tagsview-text-color: #9aa2b1;
+  --v3-tagsview-tag-bg-color: #1b2029;
+  --v3-tagsview-tag-border-color: #252b35;
+  --v3-tagsview-tag-active-bg-color: #22d3ee;
+  --v3-tagsview-tag-active-border-color: #22d3ee;
+  --v3-tagsview-tag-active-text-color: #06212a;
+  --v3-tagsview-tag-icon-hover-bg-color: #00000040;
+
+  --v3-rightpanel-button-bg-color: #22d3ee;
+}
+
+html.graphite {
+  @include v3-skin-polish;
+
+  // 青色底配白字对比度不够，主色按钮改成深色文字，顺带更贴近控制台的观感
+  .el-button--primary {
+    --el-button-text-color: #06212a;
+    --el-button-hover-text-color: #06212a;
+    --el-button-active-text-color: #06212a;
+    --el-button-disabled-text-color: rgba(6, 33, 42, 0.55);
+  }
+}

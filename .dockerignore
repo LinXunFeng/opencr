@@ -1,0 +1,32 @@
+.git
+.gitignore
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+logs/
+data/
+*.log
+config.yaml
+.idea/
+.vscode/
+.DS_Store
+tests/
+docs/
+README.md
+README-zh.md
+CHANGELOG.md
+CONTEXT.md
+AGENTS.md
+install.sh
+uninstall.sh
+quick-test.sh
+
+# web/ 本身**需要**进构建阶段（前端在镜像里现编译），
+# 但它的依赖与产物不能带进去：前者体积巨大，后者会被构建阶段重新生成。
+web/node_modules/
+web/dist/
+backend/admin/static/

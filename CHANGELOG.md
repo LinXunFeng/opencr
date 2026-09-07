@@ -2,6 +2,38 @@
 
 本文件记录项目的重要变更。
 
+## [0.4.0] - 2026-09-07
+
+### Added
+
+- 新增 Vue 3 后台管理面板 `/admin`（基于 [v3-admin-vite](https://github.com/un-pany/v3-admin-vite) + Element Plus + ECharts 6），包含控制台、审查记录、审查发现、统计分析、Skill 管理与系统设置。通过 `admin.enabled` 开启，使用 `admin.username` 与 `admin.password` 登录。
+- 新增管理员密码哈希存储：首次启动时将配置中的明文密码替换为 scrypt 哈希；配置文件不可写时保留运行并记录警告。
+- 新增游客浏览开关（默认开启）：未登录者可查看运行状态与聚合统计，但看不到审查发现正文；开关可在后台修改并立即生效。判定边界见 `docs/adr/0002-guest-read-scope.md`。
+- 新增 SQLite 持久化层（SQLAlchemy + Alembic），记录每次 ReviewRun、进度与审查发现，支持保留期自动清理。多 worker 场景下先设置 `busy_timeout` 再切换 WAL，切换失败仅记录警告不阻断启动。
+- 新增审查发现采纳统计：在 MR 合并或关闭时依据 GitLab discussion 的 resolved 状态与 👍/👎 表态结算，同时展示覆盖率。判定口径见 `docs/adr/0001-suggestion-acceptance-via-discussion-state.md`。
+- 新增跨审查运行的审查发现列表，支持按项目、采纳结论、严重度与时间窗筛选；支持按批次查看和筛选同一 MR 的历史发现。
+- 新增 Skill 管理页，展示已加载的技能及近 30 天命中次数。overall、file、hybrid 三种模式均记录命中，同一技能在一次 ReviewRun 中只计一次；后续模型调用失败仍保留已发生的命中。
+- 新增 Aurora、Graphite 皮肤，图表随当前主题切换；采纳结论使用不同颜色与图标区分。
+- 新增按代码平台展示合并请求名称与跳转链接的能力；链接展示不代表已接入该平台的审查流程。
+- 新增 `/api/admin/*` 接口，提供登录、鉴权、审查记录、审查发现、统计、技能与设置访问。
+- 新增 Docker 安装方式，保留 macOS launchd 安装方式。
+- 新增领域术语表 `CONTEXT.md` 与架构决策记录 `docs/adr/`。
+
+### Changed
+
+- **破坏性变更**：`/manual-review` 改为异步执行，返回 `202` 与 `run_uid`；审查进度通过后台或 `/api/admin/runs/<run_uid>` 查看。
+- 后端包由 `src/` 调整为 `backend/`；审查执行逻辑集中到 `backend/review/runner.py`，webhook 与手动触发共用同一执行路径。
+- 前端源码位于 `web/`，构建产物 `backend/admin/static/` 不提交进 Git。Docker 使用多阶段构建，Node 不进入运行镜像；launchd 安装时编译前端，缺少构建工具时跳过并提示。
+- Docker 中的 `config.yaml` 使用可写挂载，以便首次启动时写回密码哈希。
+- gunicorn worker 数由 `CPU 核数 × 2 + 1` 调整为 `2`，减少 SQLite 锁竞争。
+- 统一领域用语：AI 产出称为「审查发现 / Finding」，「建议」仅用于最低严重度与修复方案字段。
+- 测试优先使用已安装的真实依赖，仅在缺库时使用桩；测试配置与数据库独立于开发环境。
+
+### Fixed
+
+- 修复技能匹配调用失败被吞掉的问题：审查运行会标记失败，并向 MR 发布失败说明。
+- 修复将未超限的明确通过结论误判为审查发现的问题。
+
 ## [0.3.0] - 2026-06-02
 
 ### Added

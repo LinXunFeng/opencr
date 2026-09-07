@@ -27,3 +27,10 @@ config.yaml
 
 # macOS
 .DS_Store
+
+# 前端工程：源码进库，依赖与构建产物都不进库。
+# 产物由 Docker 多阶段构建 / install.sh 在安装时现编译生成。
+web/node_modules/
+web/dist/
+web/.eslintcache
+backend/admin/static/

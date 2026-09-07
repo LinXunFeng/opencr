@@ -1,0 +1,8 @@
+// 注册多主题
+@import "./dark/index.scss";
+@import "./dark-blue/index.scss";
+
+// 下面两套皮肤共用的形状与组件细节（只定义 mixin，不产出样式）
+@import "./shared/polish.scss";
+@import "./aurora/index.scss";
+@import "./graphite/index.scss";

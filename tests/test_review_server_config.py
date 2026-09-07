@@ -11,10 +11,31 @@ from unittest import mock
 TEST_HOME = tempfile.mkdtemp(prefix="opencr-test-home-")
 Path(TEST_HOME, "opencr", "logs").mkdir(parents=True, exist_ok=True)
 os.environ["HOME"] = TEST_HOME
+# 这组测试只覆盖配置解析，不需要后台 reconciler 线程；数据库也隔离到临时目录
+os.environ["OPENCR_DISABLE_RECONCILER"] = "1"
+# 显式指向一个空配置：否则会读到开发机仓库根目录下的 config.yaml，
+# 测试结果就取决于开发者本地怎么配，而不是代码本身。
+_EMPTY_CONFIG = Path(TEST_HOME, "empty-config.yaml")
+_EMPTY_CONFIG.write_text("openai:\n  model: \"test\"\n", encoding="utf-8")
+os.environ["OPENCR_CONFIG_PATH"] = str(_EMPTY_CONFIG)
+
+
+def _module_available(name: str) -> bool:
+    """真依赖装上了就用真的，桩只在缺库的环境里兜底。
+
+    原先无条件塞桩，导致每次给路由层加一个 flask 符号（Blueprint、session、
+    current_app……）都要回来补桩，而桩越补越不像真库。
+    """
+    import importlib.util
+
+    try:
+        return importlib.util.find_spec(name) is not None
+    except (ImportError, ValueError):
+        return False
 
 
 def _install_stub_modules():
-    if "flask" not in sys.modules:
+    if "flask" not in sys.modules and not _module_available("flask"):
         flask_stub = types.ModuleType("flask")
 
         class DummyFlask:
@@ -27,19 +48,45 @@ def _install_stub_modules():
 
                 return decorator
 
+            def register_blueprint(self, *args, **kwargs):
+                return None
+
+            def before_request(self, func):
+                return func
+
+        class DummyBlueprint(DummyFlask):
+            pass
+
         class DummyRequest:
             headers = {}
+            args = {}
+            cookies = {}
+            remote_addr = "127.0.0.1"
             json = None
+
+        class DummyResponse:
+            def __init__(self, *args, **kwargs):
+                pass
 
         def jsonify(payload):
             return payload
 
+        def render_template(*args, **kwargs):
+            return ""
+
+        def make_response(payload):
+            return payload
+
         flask_stub.Flask = DummyFlask
+        flask_stub.Blueprint = DummyBlueprint
+        flask_stub.Response = DummyResponse
         flask_stub.request = DummyRequest()
         flask_stub.jsonify = jsonify
+        flask_stub.render_template = render_template
+        flask_stub.make_response = make_response
         sys.modules["flask"] = flask_stub
 
-    if "openai" not in sys.modules:
+    if "openai" not in sys.modules and not _module_available("openai"):
         openai_stub = types.ModuleType("openai")
 
         class DummyOpenAI:
@@ -49,7 +96,7 @@ def _install_stub_modules():
         openai_stub.OpenAI = DummyOpenAI
         sys.modules["openai"] = openai_stub
 
-    if "requests" not in sys.modules:
+    if "requests" not in sys.modules and not _module_available("requests"):
         requests_stub = types.ModuleType("requests")
 
         def _placeholder(*args, **kwargs):
@@ -59,7 +106,7 @@ def _install_stub_modules():
         requests_stub.post = _placeholder
         sys.modules["requests"] = requests_stub
 
-    if "urllib3" not in sys.modules:
+    if "urllib3" not in sys.modules and not _module_available("urllib3"):
         urllib3_stub = types.ModuleType("urllib3")
 
         class _Exceptions:
@@ -74,11 +121,114 @@ def _install_stub_modules():
 
 
 _install_stub_modules()
-opencr_package = importlib.import_module("src")
-review_server = importlib.import_module("src.review_server")
+opencr_package = importlib.import_module("backend")
+review_server = importlib.import_module("backend.review_server")
+review_runner = importlib.import_module("backend.review.runner")
+
+_TEST_DB_URL = f"sqlite:///{Path(TEST_HOME, 'opencr-test.db')}"
+
+
+def _ensure_test_database():
+    """
+    把持久化层指向本模块专用的库并建表。
+
+    engine 是进程内单例，其他测试模块的 tearDown 会重置它、并清掉
+    OPENCR_DATABASE_URL，所以不能只在 import 期建一次 —— 每个用例都要自己保证。
+    """
+    os.environ["OPENCR_DATABASE_URL"] = _TEST_DB_URL
+    storage_db = importlib.import_module("backend.storage.db")
+    storage_db.reset_engine_for_tests(_TEST_DB_URL)
+    importlib.import_module("backend.storage.models").Base.metadata.create_all(storage_db.get_engine())
+
+
+_ensure_test_database()
+
+
+def _health_payload() -> dict:
+    """
+    调用 /health 并取回 JSON。
+
+    jsonify 需要应用上下文，因此不能直接调视图函数；走 test_client 也更贴近真实行为。
+    """
+    with review_server.app.test_client() as client:
+        return client.get("/health").get_json()
 
 
 class ReviewServerConfigTests(unittest.TestCase):
+    def test_matched_skills_reach_hit_counts(self):
+        """真实审查入口应将各分支命中的技能去重落库，并反映到列表统计。"""
+        from backend.review import ai
+        from backend.storage import repo
+
+        changes = [
+            {"new_path": name, "old_path": name, "diff": "@@ -1 +1 @@\n-old\n+new"}
+            for name in ("a.py", "b.py")
+        ]
+        cases = [
+            ("overall", [["python"]], ["python"], False),
+            ("file", [["python"], ["python", "general"]], ["general", "python"], False),
+            ("hybrid", [["general"], ["python"], ["python"]], ["general", "python"], False),
+            ("hybrid", [[], [], []], [], False),
+            ("overall", [["python"]], ["python"], True),
+        ]
+        for mode, selections, expected, fails in cases:
+            with self.subTest(mode=mode, selections=selections, fails=fails):
+                before = repo.skill_hit_counts()
+                uid = repo.start_run(project_id=1022, mr_iid=8, trigger="manual", review_mode=mode)
+                with (
+                    mock.patch.object(review_runner, "load_review_config", return_value={"max_diff_size": 50000, "skills_dir": "skills"}),
+                    mock.patch.object(review_runner, "_resolve_changes", return_value=(changes, {}, "")),
+                    mock.patch.object(review_runner, "enrich_changes_with_file_info", return_value=changes),
+                    mock.patch.object(ai, "auto_select_review_skills", side_effect=selections),
+                    mock.patch.object(ai, "load_review_skill_prompts", return_value="审查 Python"),
+                    mock.patch.object(ai, "call_codex_review", return_value="", side_effect=RuntimeError("测试模型失败") if fails else None),
+                    mock.patch.object(review_runner, "post_mr_comment"),
+                ):
+                    review_runner.execute_review_run(uid, 1022, 8, "测试", mode, "")
+
+                detail = repo.get_run_detail(uid)
+                self.assertEqual(detail["review_skills"], expected)
+                self.assertEqual(detail["status"], "failed" if fails else "succeeded")
+                after = repo.skill_hit_counts()
+                for name in ("python", "general"):
+                    self.assertEqual(after.get(name, 0), before.get(name, 0) + (name in expected))
+
+    def test_skill_api_failure_marks_run_failed_and_posts_mr_comment(self):
+        """模型鉴权失败必须穿过技能匹配与审查聚合，落库失败并反馈 MR。"""
+        from backend.review import skills
+        from backend.storage import repo
+        from backend.storage.models import RUN_FAILED
+
+        changes = [{"new_path": "a.py", "old_path": "a.py", "diff": "@@ -1 +1 @@\n-old\n+new"}]
+        for mode in ("overall", "file", "hybrid"):
+            with self.subTest(mode=mode):
+                run_uid = repo.start_run(project_id=1022, mr_iid=8, trigger="manual", review_mode=mode)
+                with (
+                    mock.patch.object(review_runner, "load_review_config", return_value={"max_diff_size": 50000, "skills_dir": "skills"}),
+                    mock.patch.object(review_runner, "_resolve_changes", return_value=(changes, {}, "")),
+                    mock.patch.object(review_runner, "enrich_changes_with_file_info", return_value=changes),
+                    mock.patch.object(skills, "load_review_skill_previews", return_value={"python": "Python", "general": "通用"}),
+                    mock.patch.object(skills, "load_openai_config", return_value={"api_key": "test-key", "base_url": "http://test.invalid", "model": "test"}),
+                    mock.patch.object(skills.openai, "OpenAI") as client,
+                    mock.patch.object(review_runner, "post_mr_comment") as post,
+                ):
+                    client.return_value.chat.completions.create.side_effect = RuntimeError("401 Invalid API key")
+                    review_runner.execute_review_run(run_uid, 1022, 8, "测试", mode, "")
+
+                self.assertEqual(repo.get_run_detail(run_uid)["status"], RUN_FAILED)
+                post.assert_called_once()
+                self.assertEqual(post.call_args.args[:2], (1022, 8))
+                self.assertIn("代码审查失败", post.call_args.args[2])
+                self.assertIn("401", post.call_args.args[2])
+
+    def setUp(self):
+        _ensure_test_database()
+        from backend.storage import repo
+
+        self.run_uid = repo.start_run(
+            project_id=1022, mr_iid=8, trigger="manual", review_mode="file"
+        )
+
     def _env(self, **kwargs):
         base = {"HOME": TEST_HOME, "OPENAI_API_KEY": "test-key"}
         base.update(kwargs)
@@ -236,7 +386,7 @@ code_platform:
 
     def test_load_review_config_defaults_to_skills_root(self):
         with mock.patch.dict(os.environ, self._env(OPENAI_API_KEY=""), clear=True):
-            with mock.patch("src.review.config.load_file_config", return_value={}):
+            with mock.patch("backend.review.config.load_file_config", return_value={}):
                 cfg = review_server.load_review_config()
 
         self.assertEqual(cfg["skills_dir"], "skills")
@@ -312,7 +462,7 @@ code_platform:
             self._env(OPENAI_MODEL="gpt-4.1"),
             clear=True,
         ):
-            payload = review_server.health_check()
+            payload = _health_payload()
 
         self.assertIn("version", payload)
         self.assertEqual(payload["version"], opencr_package.__version__)
@@ -323,7 +473,7 @@ code_platform:
             self._env(OPENAI_MODEL="gpt-4.1", OPENCR_VERSION="9.9.9"),
             clear=True,
         ):
-            payload = review_server.health_check()
+            payload = _health_payload()
 
         self.assertEqual(payload["version"], opencr_package.__version__)
 
@@ -616,24 +766,25 @@ python3 -c 'import json, sys; payload=json.load(sys.stdin); print("script saw " 
         ]
 
         with mock.patch.object(
-            review_server,
+            review_runner,
             "load_review_config",
             return_value={"max_diff_size": 50000, "skills_dir": "skills"},
         ):
             with mock.patch.object(
-                review_server,
+                review_runner,
                 "get_mr_changes_with_refs",
                 return_value=(changes, {"head_sha": "c" * 40}),
             ):
-                with mock.patch.object(review_server, "get_compare_changes", return_value=changes):
+                with mock.patch.object(review_runner, "get_compare_changes", return_value=changes):
                     with mock.patch.object(
-                        review_server,
+                        review_runner,
                         "enrich_changes_with_file_info",
                         return_value=enriched_changes,
                     ) as mock_enrich:
-                        with mock.patch.object(review_server, "review_changes_with_inline_notes", return_value=("", [])) as mock_review:
-                            with mock.patch.object(review_server, "post_mr_comment") as mock_post:
+                        with mock.patch.object(review_runner, "review_changes_with_inline_notes", return_value=("", [])) as mock_review:
+                            with mock.patch.object(review_runner, "post_mr_comment") as mock_post:
                                 review_server.process_review_async(
+                                    run_uid=self.run_uid,
                                     project_id=1022,
                                     mr_iid=8,
                                     mr_title="test",
@@ -667,29 +818,30 @@ python3 -c 'import json, sys; payload=json.load(sys.stdin); print("script saw " 
         ]
 
         with mock.patch.object(
-            review_server,
+            review_runner,
             "load_review_config",
             return_value={"max_diff_size": 50000, "skills_dir": "skills"},
         ):
             with mock.patch.object(
-                review_server,
+                review_runner,
                 "get_mr_changes_with_refs",
                 return_value=(changes, {"head_sha": "c" * 40}),
             ):
-                with mock.patch.object(review_server, "get_compare_changes", return_value=changes):
-                    with mock.patch.object(review_server, "enrich_changes_with_file_info", return_value=changes):
+                with mock.patch.object(review_runner, "get_compare_changes", return_value=changes):
+                    with mock.patch.object(review_runner, "enrich_changes_with_file_info", return_value=changes):
                         with mock.patch.object(
-                            review_server,
+                            review_runner,
                             "review_changes_with_inline_notes",
                             return_value=("", inline_notes),
                         ):
                             with mock.patch.object(
-                                review_server,
-                                "_post_inline_comment_with_offset",
+                                review_runner,
+                                "post_inline_comment_with_offset",
                                 side_effect=review_server.ReviewError("发布行内评论失败"),
                             ):
-                                with mock.patch.object(review_server, "post_mr_comment") as mock_post:
+                                with mock.patch.object(review_runner, "post_mr_comment") as mock_post:
                                     review_server.process_review_async(
+                                        run_uid=self.run_uid,
                                         project_id=1022,
                                         mr_iid=11,
                                         mr_title="test",
@@ -713,7 +865,7 @@ python3 -c 'import json, sys; payload=json.load(sys.stdin); print("script saw " 
             {"file_path": "assets/images/b.png", "line": 1, "body": "third issue"},
         ]
 
-        comments = review_server._build_inline_fallback_comments_by_file(failed_notes)
+        comments = review_runner.build_inline_fallback_comments_by_file(failed_notes)
 
         self.assertEqual(len(comments), 2)
         self.assertIn("文件级降级评论｜`assets/images/a.png`", comments[0])
@@ -723,14 +875,14 @@ python3 -c 'import json, sys; payload=json.load(sys.stdin); print("script saw " 
         self.assertIn("assets/images/b.png:1", comments[1])
 
     def test_is_binary_or_non_text_change(self):
-        self.assertTrue(review_server._is_binary_or_non_text_change({"diff": ""}))
+        self.assertTrue(review_runner.is_binary_or_non_text_change({"diff": ""}))
         self.assertTrue(
-            review_server._is_binary_or_non_text_change(
+            review_runner.is_binary_or_non_text_change(
                 {"diff": "Binary files a/assets/a.png and b/assets/a.png differ"}
             )
         )
         self.assertFalse(
-            review_server._is_binary_or_non_text_change(
+            review_runner.is_binary_or_non_text_change(
                 {"diff": "@@ -1,1 +1,1 @@\n-foo\n+bar\n"}
             )
         )
@@ -764,29 +916,30 @@ python3 -c 'import json, sys; payload=json.load(sys.stdin); print("script saw " 
         ]
 
         with mock.patch.object(
-            review_server,
+            review_runner,
             "load_review_config",
             return_value={"max_diff_size": 50000, "skills_dir": "skills"},
         ):
             with mock.patch.object(
-                review_server,
+                review_runner,
                 "get_mr_changes_with_refs",
                 return_value=(changes, {"head_sha": "c" * 40}),
             ):
-                with mock.patch.object(review_server, "get_compare_changes", return_value=changes):
-                    with mock.patch.object(review_server, "enrich_changes_with_file_info", return_value=changes):
+                with mock.patch.object(review_runner, "get_compare_changes", return_value=changes):
+                    with mock.patch.object(review_runner, "enrich_changes_with_file_info", return_value=changes):
                         with mock.patch.object(
-                            review_server,
+                            review_runner,
                             "review_changes_with_inline_notes",
                             return_value=("", inline_notes),
                         ):
                             with mock.patch.object(
-                                review_server,
-                                "_post_inline_comment_with_offset",
+                                review_runner,
+                                "post_inline_comment_with_offset",
                                 side_effect=review_server.ReviewError("发布行内评论失败"),
                             ):
-                                with mock.patch.object(review_server, "post_mr_comment") as mock_post:
+                                with mock.patch.object(review_runner, "post_mr_comment") as mock_post:
                                     review_server.process_review_async(
+                                        run_uid=self.run_uid,
                                         project_id=1022,
                                         mr_iid=11,
                                         mr_title="test",
@@ -824,28 +977,29 @@ python3 -c 'import json, sys; payload=json.load(sys.stdin); print("script saw " 
         ]
 
         with mock.patch.object(
-            review_server,
+            review_runner,
             "load_review_config",
             return_value={"max_diff_size": 50000, "skills_dir": "skills"},
         ):
             with mock.patch.object(
-                review_server,
+                review_runner,
                 "get_mr_changes_with_refs",
                 return_value=(changes, {"head_sha": "c" * 40}),
             ):
-                with mock.patch.object(review_server, "get_compare_changes", return_value=changes):
-                    with mock.patch.object(review_server, "enrich_changes_with_file_info", return_value=changes):
+                with mock.patch.object(review_runner, "get_compare_changes", return_value=changes):
+                    with mock.patch.object(review_runner, "enrich_changes_with_file_info", return_value=changes):
                         with mock.patch.object(
-                            review_server,
+                            review_runner,
                             "review_changes_with_inline_notes",
                             return_value=("", inline_notes),
                         ):
                             with mock.patch.object(
-                                review_server,
-                                "_post_inline_comment_with_offset",
+                                review_runner,
+                                "post_inline_comment_with_offset",
                             ) as mock_inline_post:
-                                with mock.patch.object(review_server, "post_mr_comment") as mock_post:
+                                with mock.patch.object(review_runner, "post_mr_comment") as mock_post:
                                     review_server.process_review_async(
+                                        run_uid=self.run_uid,
                                         project_id=1022,
                                         mr_iid=11,
                                         mr_title="test",
@@ -873,10 +1027,10 @@ python3 -c 'import json, sys; payload=json.load(sys.stdin); print("script saw " 
             "file_size_kb": 620.0,
         }
 
-        with mock.patch("src.review.ai.auto_select_review_skills", return_value=["general"]):
-            with mock.patch("src.review.ai.load_review_skill_prompts", return_value="general rules"):
+        with mock.patch("backend.review.ai.auto_select_review_skills", return_value=["general"]):
+            with mock.patch("backend.review.ai.load_review_skill_prompts", return_value="general rules"):
                 with mock.patch(
-                    "src.review.ai.call_codex_review",
+                    "backend.review.ai.call_codex_review",
                     return_value=(
                         "#### 问题 : 图片体积过大\n"
                         "- **位置**: `assets/images/a.png:1`\n"
@@ -910,10 +1064,10 @@ python3 -c 'import json, sys; payload=json.load(sys.stdin); print("script saw " 
             "file_size_kb": 620.0,
         }
 
-        with mock.patch("src.review.ai.auto_select_review_skills", return_value=["general"]):
-            with mock.patch("src.review.ai.load_review_skill_prompts", return_value="general rules"):
+        with mock.patch("backend.review.ai.auto_select_review_skills", return_value=["general"]):
+            with mock.patch("backend.review.ai.load_review_skill_prompts", return_value="general rules"):
                 with mock.patch(
-                    "src.review.ai.call_codex_review",
+                    "backend.review.ai.call_codex_review",
                     return_value=(
                         "### 详细审查结果\n"
                         "- 该图片文件体积超过 300KB，建议压缩后提交。\n"
@@ -943,10 +1097,10 @@ python3 -c 'import json, sys; payload=json.load(sys.stdin); print("script saw " 
             "file_size_kb": 120.0,
         }
 
-        with mock.patch("src.review.ai.auto_select_review_skills", return_value=["general"]):
-            with mock.patch("src.review.ai.load_review_skill_prompts", return_value="general rules"):
+        with mock.patch("backend.review.ai.auto_select_review_skills", return_value=["general"]):
+            with mock.patch("backend.review.ai.load_review_skill_prompts", return_value="general rules"):
                 with mock.patch(
-                    "src.review.ai.call_codex_review",
+                    "backend.review.ai.call_codex_review",
                     return_value="✅ 代码审查通过，未发现明显问题。",
                 ):
                     _summary, inline_notes = review_server.review_changes_with_inline_notes(
@@ -959,6 +1113,32 @@ python3 -c 'import json, sys; payload=json.load(sys.stdin); print("script saw " 
 
         self.assertEqual(inline_notes, [])
 
+    def test_file_review_pass_with_negated_limit_does_not_create_finding(self):
+        """未超过限制是通过依据，不能被当成超限问题；真实超限仍须保留。"""
+        screenshot_result = (
+            "### 总体评价\n\n"
+            "新增图片体积为 28.4KB，未超过 300KB 限制。基于现有元信息与二进制差异，未发现可验证的高置信度问题。\n\n"
+            "### 详细审查结果\n\n本次未发现高置信度问题。\n\n"
+            "### 如无问题\n\n✅ 代码审查通过，未发现明显问题。"
+        )
+        for result, expected in (
+            (screenshot_result, 0),
+            (screenshot_result.replace("未超过", "没有超出"), 0),
+            (screenshot_result + "\n但另一张图片超过 300KB 限制。", 1),
+            (screenshot_result + "\n建议修复图片引用路径。", 1),
+        ):
+            with (
+                self.subTest(result=result),
+                mock.patch("backend.review.ai.auto_select_review_skills", return_value=["general"]),
+                mock.patch("backend.review.ai.load_review_skill_prompts", return_value="图片审查规则"),
+                mock.patch("backend.review.ai.call_codex_review", return_value=result),
+            ):
+                _, findings = review_server.review_changes_with_inline_notes(
+                    changes=[{"new_path": "image.png", "old_path": "image.png", "diff": ""}],
+                    review_mode="file", review_skill="", max_diff_size=50000, skills_dir="skills",
+                )
+                self.assertEqual(len(findings), expected)
+
     def test_file_review_long_pass_text_without_issue_marker_does_not_create_note(self):
         non_text_change = {
             "new_path": "assets/images/a.png",
@@ -970,10 +1150,10 @@ python3 -c 'import json, sys; payload=json.load(sys.stdin); print("script saw " 
             "file_size_kb": 120.0,
         }
 
-        with mock.patch("src.review.ai.auto_select_review_skills", return_value=["general"]):
-            with mock.patch("src.review.ai.load_review_skill_prompts", return_value="general rules"):
+        with mock.patch("backend.review.ai.auto_select_review_skills", return_value=["general"]):
+            with mock.patch("backend.review.ai.load_review_skill_prompts", return_value="general rules"):
                 with mock.patch(
-                    "src.review.ai.call_codex_review",
+                    "backend.review.ai.call_codex_review",
                     return_value=(
                         "### 总体评价\n"
                         "本次未发现高置信度问题，代码逻辑清晰，结构完整，未发现明显风险，保持当前实现即可。"
@@ -1000,10 +1180,10 @@ python3 -c 'import json, sys; payload=json.load(sys.stdin); print("script saw " 
             "file_size_kb": 620.0,
         }
 
-        with mock.patch("src.review.ai.auto_select_review_skills", return_value=["general"]):
-            with mock.patch("src.review.ai.load_review_skill_prompts", return_value="general rules"):
+        with mock.patch("backend.review.ai.auto_select_review_skills", return_value=["general"]):
+            with mock.patch("backend.review.ai.load_review_skill_prompts", return_value="general rules"):
                 with mock.patch(
-                    "src.review.ai.call_codex_review",
+                    "backend.review.ai.call_codex_review",
                     return_value=(
                         "本次未发现高置信度问题，但该图片体积偏大，建议压缩后提交。"
                     ),
@@ -1040,28 +1220,29 @@ python3 -c 'import json, sys; payload=json.load(sys.stdin); print("script saw " 
         ]
 
         with mock.patch.object(
-            review_server,
+            review_runner,
             "load_review_config",
             return_value={"max_diff_size": 50000, "skills_dir": "skills"},
         ):
             with mock.patch.object(
-                review_server,
+                review_runner,
                 "get_mr_changes_with_refs",
                 return_value=(changes, {"head_sha": "c" * 40}),
             ):
-                with mock.patch.object(review_server, "get_compare_changes", return_value=changes):
-                    with mock.patch.object(review_server, "enrich_changes_with_file_info", return_value=changes):
+                with mock.patch.object(review_runner, "get_compare_changes", return_value=changes):
+                    with mock.patch.object(review_runner, "enrich_changes_with_file_info", return_value=changes):
                         with mock.patch.object(
-                            review_server,
+                            review_runner,
                             "review_changes_with_inline_notes",
                             return_value=("", inline_notes),
                         ):
                             with mock.patch.object(
-                                review_server,
-                                "_post_inline_comment_with_offset",
+                                review_runner,
+                                "post_inline_comment_with_offset",
                             ) as mock_inline_post:
-                                with mock.patch.object(review_server, "post_mr_comment") as mock_post:
+                                with mock.patch.object(review_runner, "post_mr_comment") as mock_post:
                                     review_server.process_review_async(
+                                        run_uid=self.run_uid,
                                         project_id=1022,
                                         mr_iid=11,
                                         mr_title="test",

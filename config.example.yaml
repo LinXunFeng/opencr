@@ -61,3 +61,45 @@ review:
   # Timeout for each skill script, in seconds.
   # 单个 skill script 的超时时间（秒）。
   skill_scripts_timeout: 10
+
+# Admin console settings. Disabled by default.
+# 后台管理配置。默认关闭 —— 从旧版本升级上来的实例不会平白多出一个管理面板。
+admin:
+  # Enable the /admin console and /api/admin/* endpoints.
+  # 是否启用 /admin 后台与 /api/admin/* 接口。
+  enabled: false
+  # Administrator account name. There is exactly one admin account.
+  # 管理员用户名。系统只有这一个管理账号，没有用户表也没有角色。
+  username: "admin"
+  # Password. Write it in PLAIN TEXT here; on first start the service replaces
+  # it in place with a scrypt hash and leaves a comment above the line.
+  # 密码。**直接写明文**即可：服务首次启动时会就地把它替换成 scrypt 哈希，
+  # 并在上方加一行注释。想改密码就把这一行换回明文再重启。
+  # 若配置文件不可写（例如只读挂载），服务照常运行，但每次启动都会警告明文未清理。
+  password: ""
+  # Reject admin requests that do not come from loopback.
+  # 是否只允许本机访问后台。Webhook 端口通常内网可达，开启这项可缩小暴露面。
+  bind_local_only: false
+
+# 注意：是否允许游客（未登录）浏览由后台界面控制，**不在这个文件里**。
+# 它默认开启，存在数据库中、改动立即生效 —— 因为它的使用场景天然是临时性的
+# （"今天有外部人员来，先关一下"），要求改文件加重启就等于没人会用。
+# 游客能看到运行状态与聚合统计，但看不到审查发现的正文；
+# 完整取舍见 docs/adr/0002-guest-read-scope.md。
+
+# Persistence settings for review history and acceptance statistics.
+# 审查历史与采纳统计的持久化配置。
+storage:
+  # SQLAlchemy database URL. Leave empty to use ~/opencr/data/opencr.db.
+  # 数据库连接串；留空则使用 ~/opencr/data/opencr.db。容器内固定为 /app/data/opencr.db。
+  database_url: ""
+  # Days to keep review runs before the reconciler purges them.
+  # 审查记录保留天数，超期由后台任务清理。注意：采纳数据无法回填，清理后不可恢复。
+  retention_days: 90
+  # A running review with no heartbeat for this long is shown as "stale".
+  # 心跳超过该秒数未更新的审查会在后台显示为「疑似中断」。
+  # 只标注不改写状态 —— 多进程下无法断言其他进程的审查已死。
+  stale_after_seconds: 600
+  # Interval of the background reconciler (settles missed merges, purges old data).
+  # 后台兜底任务的执行间隔（秒）：结算错过 webhook 的 MR，并清理过期数据。
+  reconcile_interval_seconds: 300
