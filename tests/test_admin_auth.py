@@ -129,6 +129,38 @@ class PasswordHashingTests(unittest.TestCase):
 class GuestBoundaryTests(unittest.TestCase):
     """Guest 可见范围：状态与聚合可见，Finding 正文不可见。"""
 
+    def test_change_history_groups_filters_pages_and_protects_bodies(self):
+        """历史接口限定同项目同合并请求，保留空批次，并按身份隐藏正文。"""
+        from flask import Flask
+        from backend.admin import auth, routes
+        from backend.storage.models import DELIVERY_INLINE
+
+        first = self._seed()
+        second = self.repo.start_run(project_id=1, mr_iid=2, trigger="manual", review_mode="file")
+        self.repo.record_finding(second, "b.py", 2, "第二轮正文", DELIVERY_INLINE, severity="warning", discussion_id="d2")
+        empty = self.repo.start_run(project_id=1, mr_iid=2, trigger="manual", review_mode="file")
+        self.repo.start_run(project_id=2, mr_iid=2, trigger="manual", review_mode="file")
+        self.repo.start_run(project_id=1, mr_iid=3, trigger="manual", review_mode="file")
+        app = Flask(__name__)
+        app.register_blueprint(routes.admin_bp)
+        with mock.patch.object(auth, "load_admin_config", return_value={"enabled": True, "bind_local_only": False}), app.test_client() as client:
+            result = client.get(f"/api/admin/runs/{first}/history").get_json()
+            self.assertEqual(result["total"], 3)
+            self.assertEqual([r["run_uid"] for r in result["items"]], [empty, second, first])
+            self.assertEqual(result["items"][0]["findings"], [])
+            self.assertNotIn("body", result["items"][1]["findings"][0])
+            page = client.get(f"/api/admin/runs/{first}/history?limit=1&offset=1").get_json()
+            self.assertEqual(page["total"], 3)
+            self.assertEqual([r["run_uid"] for r in page["items"]], [second])
+            filtered = client.get(f"/api/admin/runs/{first}/history?severity=critical&verdict=undecided").get_json()
+            self.assertEqual([len(r["findings"]) for r in filtered["items"]], [0, 0, 1])
+            with mock.patch.object(routes, "is_admin", return_value=True):
+                admin = client.get(f"/api/admin/runs/{second}/history").get_json()
+            self.assertEqual(admin["items"][1]["findings"][0]["body"], "第二轮正文")
+            self.assertEqual(client.get("/api/admin/runs/missing/history").status_code, 404)
+            current = client.get(f"/api/admin/runs/{first}").get_json()
+            self.assertEqual(len(current["findings"]), 1)
+
     def test_guest_change_links_follow_platform_without_exposing_findings(self):
         """运行接口按平台提供名称与链接，同时保持 Guest 正文边界。"""
         from flask import Flask

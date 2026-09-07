@@ -1,11 +1,12 @@
 <script lang="ts" setup>
 import type { RunDetail } from "@@/apis/opencr"
-import { getRunDetailApi } from "@@/apis/opencr"
+import { getChangeHistoryApi, getRunDetailApi } from "@@/apis/opencr"
 import {
   DEGRADATION_LABEL,
   DELIVERY_LABEL,
   ERROR_KIND_LABEL,
   formatTime,
+  HISTORY_NOTE,
   PHASE_LABEL,
   RUN_STATUS_LABEL,
   RUN_STATUS_TAG,
@@ -21,8 +22,53 @@ const router = useRouter()
 const loading = ref(true)
 const detail = ref<RunDetail | null>(null)
 
+const scope = ref("current")
+const severity = ref("")
+const verdict = ref("")
+const page = ref(1)
+const history = ref<RunDetail[]>([])
+const historyTotal = ref(0)
+const historyLoading = ref(false)
+const historyError = ref("")
+let historyRequest = 0
+
+/** 展示本次发现或服务端已筛选的历史批次。 */
+const groups = computed(() => scope.value === "all" ? history.value : detail.value ? [detail.value] : [])
+
+/** 本次审查已加载全部发现，可直接在页面筛选。 */
+function filteredFindings(run: RunDetail) {
+  return run.findings.filter(f => (!severity.value || f.severity === severity.value)
+    && (!verdict.value || f.verdict === verdict.value))
+}
+
+/** 拉取历史分页；过期响应不能覆盖用户刚切换的筛选或运行。 */
+async function loadHistory() {
+  const requestId = ++historyRequest
+  if (scope.value !== "all") return
+  historyLoading.value = true
+  historyError.value = ""
+  history.value = []
+  try {
+    const result = await getChangeHistoryApi(route.params.runUid as string, {
+      limit: 20, offset: (page.value - 1) * 20, severity: severity.value, verdict: verdict.value
+    })
+    if (requestId !== historyRequest) return
+    history.value = result.items
+    historyTotal.value = result.total
+  } catch (error) {
+    if (requestId === historyRequest) historyError.value = (error as Error).message
+  } finally {
+    if (requestId === historyRequest) historyLoading.value = false
+  }
+}
+
+/** 切换运行时重置历史视图，加载当前运行详情。 */
 async function load() {
   loading.value = true
+  scope.value = "current"
+  page.value = 1
+  history.value = []
+  ++historyRequest
   try {
     detail.value = await getRunDetailApi(route.params.runUid as string)
   } catch (error) {
@@ -33,7 +79,12 @@ async function load() {
   }
 }
 
-onMounted(load)
+watch([scope, severity, verdict], () => {
+  if (page.value !== 1) page.value = 1
+  else void loadHistory()
+})
+watch(page, loadHistory)
+watch(() => route.params.runUid, load, { immediate: true })
 </script>
 
 <template>
@@ -113,8 +164,26 @@ onMounted(load)
 
       <el-card shadow="never" class="mt">
         <template #header>
-          审查发现（{{ detail.findings.length }}）
+          {{ scope === "current" ? "本次审查发现" : "全部审查发现" }}
+          <span v-if="scope === 'current'">（{{ filteredFindings(detail).length }}）</span>
         </template>
+
+        <div class="filters mb">
+          <el-radio-group v-model="scope" aria-label="审查范围">
+            <el-radio-button value="current">本次审查</el-radio-button>
+            <el-radio-button value="all">全部审查</el-radio-button>
+          </el-radio-group>
+          <el-select v-model="severity" aria-label="严重度筛选" placeholder="全部严重度" clearable style="width: 150px">
+            <el-option v-for="(label, value) in SEVERITY_LABEL" :key="value" :label="label" :value="value" />
+          </el-select>
+          <el-select v-model="verdict" aria-label="采纳结论筛选" placeholder="全部采纳结论" clearable style="width: 160px">
+            <el-option v-for="(label, value) in VERDICT_LABEL" :key="value" :label="label" :value="value" />
+          </el-select>
+        </div>
+        <el-alert v-if="scope === 'all'" class="mb" type="info" :closable="false" :title="HISTORY_NOTE" />
+        <el-alert v-if="scope === 'all' && historyError" class="mb" type="error" :closable="false" :title="historyError">
+          <el-button link type="primary" @click="loadHistory">重试</el-button>
+        </el-alert>
 
         <!-- Guest 拿不到正文：字段在服务端就被剔除了，不是前端隐藏 -->
         <el-alert
@@ -126,8 +195,20 @@ onMounted(load)
           title="以游客身份浏览：审查发现的正文需登录后可见。"
         />
 
-        <el-table :data="detail.findings" size="small" empty-text="本次运行没有产出审查发现">
-          <el-table-column type="expand" v-if="detail.body_included">
+        <div v-loading="scope === 'all' && historyLoading">
+          <section v-for="group in groups" :key="group.run_uid" class="batch">
+            <div v-if="scope === 'all'" class="header mb">
+              <span>{{ formatTime(group.started_at) }}</span>
+              <span>{{ TRIGGER_LABEL[group.trigger] || group.trigger }}</span>
+              <el-tag :type="group.is_stale ? 'warning' : RUN_STATUS_TAG[group.status]" size="small">
+                {{ group.is_stale ? "疑似中断" : RUN_STATUS_LABEL[group.status] || group.status }}
+              </el-tag>
+              <span>{{ filteredFindings(group).length }} 条发现</span>
+              <el-tag v-if="group.run_uid === detail.run_uid" size="small" effect="plain">本次审查</el-tag>
+              <el-link v-else type="primary" @click="router.push(`/runs/detail/${group.run_uid}`)">运行详情</el-link>
+            </div>
+        <el-table :data="filteredFindings(group)" size="small" :empty-text="severity || verdict ? '本批次没有符合筛选条件的审查发现' : '本次运行没有产出审查发现'">
+          <el-table-column type="expand" v-if="group.body_included">
             <template #default="{ row }">
               <pre class="body">{{ row.body }}</pre>
             </template>
@@ -158,6 +239,11 @@ onMounted(load)
           </el-table-column>
           <el-table-column prop="verdict_reason" label="依据" width="150" />
         </el-table>
+          </section>
+          <el-empty v-if="scope === 'all' && !historyLoading && !historyError && !groups.length" description="暂无历史审查记录" />
+        </div>
+        <el-pagination v-if="scope === 'all' && historyTotal > 20" class="mt" v-model:current-page="page" :page-size="20" :total="historyTotal" layout="prev, pager, next" />
+        <p v-if="scope === 'all'" class="note">共 {{ historyTotal }} 个审查批次，每页最多 20 个批次。</p>
 
         <p class="note">
           投递方式为「仅整体评论」或「降级为普通评论」的发现，走的是 GitLab 不可 resolve 的普通评论，
@@ -178,7 +264,18 @@ onMounted(load)
   margin-bottom: 16px;
 }
 
+.filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.batch + .batch {
+  margin-top: 24px;
+}
+
 .header {
+  flex-wrap: wrap;
   display: flex;
   gap: 12px;
   align-items: center;

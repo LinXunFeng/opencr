@@ -416,22 +416,48 @@ def get_run_detail(run_uid: str, stale_after_seconds: int = 600) -> Optional[dic
             select(Finding).where(Finding.run_id == run.id).order_by(Finding.id.asc())
         ).all()
         detail = _run_to_dict(run, stale_after_seconds)
-        detail["findings"] = [
-            {
-                "id": f.id,
-                "file_path": f.file_path or "",
-                "line": f.line,
-                "severity": f.severity,
-                "delivery": f.delivery,
-                "discussion_id": f.discussion_id or "",
-                "verdict": f.verdict,
-                "verdict_reason": f.verdict_reason or "",
-                "body": f.body or "",
-            }
-            for f in findings
-        ]
+        detail["findings"] = [_finding_to_dict(f) for f in findings]
         return detail
 
+
+
+def _finding_to_dict(finding: Finding) -> dict:
+    """将审查发现转换为接口数据，正文的访问控制由后台 API 负责。"""
+    return {
+        "id": finding.id, "file_path": finding.file_path or "", "line": finding.line,
+        "severity": finding.severity, "delivery": finding.delivery,
+        "discussion_id": finding.discussion_id or "", "verdict": finding.verdict,
+        "verdict_reason": finding.verdict_reason or "", "body": finding.body or "",
+    }
+
+
+def get_change_history(
+    run_uid: str, limit: int = 20, offset: int = 0,
+    severity: str = "", verdict: str = "", stale_after_seconds: int = 600,
+) -> Optional[dict]:
+    """查询指定运行所属合并请求的历史批次及发现；分页以批次为单位，找不到运行返回 None。"""
+    with session_scope() as session:
+        anchor = session.scalar(select(ReviewRun).where(ReviewRun.run_uid == run_uid))
+        if anchor is None:
+            return None
+        same_change = (ReviewRun.project_id == anchor.project_id, ReviewRun.mr_iid == anchor.mr_iid)
+        total = session.scalar(select(func.count()).select_from(ReviewRun).where(*same_change))
+        runs = session.scalars(
+            select(ReviewRun).where(*same_change)
+            .order_by(ReviewRun.started_at.desc(), ReviewRun.id.desc())
+            .offset(max(offset, 0)).limit(max(1, min(limit, 100)))
+        ).all()
+        groups = {run.id: {**_run_to_dict(run, stale_after_seconds), "findings": []} for run in runs}
+        if groups:
+            stmt = select(Finding).where(Finding.run_id.in_(groups)).order_by(Finding.id.asc())
+            if severity:
+                stmt = stmt.where(Finding.severity == severity)
+            if verdict:
+                stmt = stmt.where(Finding.verdict == verdict)
+            # 保留零发现批次：失败、跳过和筛选后无匹配都不能被误读为从未运行。
+            for finding in session.scalars(stmt):
+                groups[finding.run_id]["findings"].append(_finding_to_dict(finding))
+        return {"items": list(groups.values()), "total": total}
 
 def _window_start(days: int) -> datetime:
     """统计时间窗的起点。"""

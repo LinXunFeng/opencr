@@ -120,3 +120,6 @@ export function formatPercent(value: number | null | undefined): string {
   if (value === null || value === undefined) return "—"
   return `${(value * 100).toFixed(1)}%`
 }
+
+/** 历史审查发现的展示范围与去重口径。 */
+export const HISTORY_NOTE = "展示当前合并请求在保留期内的全部审查批次，按时间倒序排列。历史发现可能针对不同提交并存在重复，不代表当前问题清单；筛选仅影响批次内的发现。"

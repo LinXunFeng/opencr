@@ -229,6 +229,27 @@ def api_run_detail(run_uid: str):
     return jsonify(detail)
 
 
+@admin_bp.route("/api/admin/runs/<run_uid>/history", methods=["GET"])
+@require_viewer
+def api_change_history(run_uid: str):
+    """同一合并请求的历史审查批次；Guest 可看批次与发现元数据，但拿不到正文。"""
+    result = repo.get_change_history(
+        run_uid, limit=_int_arg("limit", 20, 100), offset=_int_arg("offset", 0, 100000),
+        severity=(request.args.get("severity") or "").strip(),
+        verdict=(request.args.get("verdict") or "").strip(), stale_after_seconds=_stale_after(),
+    )
+    if result is None:
+        return jsonify({"error": "未找到审查运行"}), 404
+    body_included = is_admin()
+    for run in result["items"]:
+        if not body_included:
+            for finding in run["findings"]:
+                finding.pop("body", None)
+        run["body_included"] = body_included
+    result["body_included"] = body_included
+    return jsonify(result)
+
+
 @admin_bp.route("/api/admin/findings", methods=["GET"])
 @require_viewer
 def api_findings():

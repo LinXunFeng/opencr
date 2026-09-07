@@ -142,6 +142,13 @@ export function getRunDetailApi(runUid: string) {
   return request<RunDetail>({ url: `runs/${runUid}`, method: "get" })
 }
 
+/** 按审查批次分页查询同一合并请求的历史发现。 */
+export function getChangeHistoryApi(runUid: string, params: { limit: number, offset: number, severity: string, verdict: string }) {
+  return request<{ items: RunDetail[], total: number, body_included: boolean }>({
+    url: `runs/${runUid}/history`, method: "get", params
+  })
+}
+
 export function getFindingsApi(params: {
   limit?: number
   offset?: number
