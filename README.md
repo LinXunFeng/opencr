@@ -114,7 +114,7 @@ Two options are supported: **Docker** (recommended, cross-platform) and the
 # 1. Prepare the config (required first - step 2 exits immediately without it)
 cp config.example.yaml config.yaml
 # Edit config.yaml, especially the openai and code_platform sections.
-# For the admin console, also set admin.enabled to true and fill in admin.token.
+# For the admin console, also set admin.enabled to true and fill in admin.username / admin.password.
 
 # 2. Build and start
 docker compose up -d
@@ -283,9 +283,6 @@ admin:
 
 > If `admin.enabled` is `true` but `password` is empty, the service **refuses to start** -
 > otherwise you would be exposing an unauthenticated admin panel on an intranet-reachable port.
-
-> **Upgrading from 0.4.0**: `admin.token` has been removed in favour of `username` + `password`.
-> If the old field is present, the service refuses to start and tells you exactly what to change.
 
 Once enabled, open `http://localhost:9034/admin`.
 

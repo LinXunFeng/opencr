@@ -113,7 +113,7 @@ opencr/
 # 1. 准备配置（必须先做，否则第 2 步会直接报错退出）
 cp config.example.yaml config.yaml
 # 按需修改 config.yaml，尤其是 openai 与 code_platform 两段；
-# 想用后台面板还需把 admin.enabled 改为 true 并填上 admin.token
+# 想用后台面板还需把 admin.enabled 改为 true 并填上 admin.username 与 admin.password
 
 # 2. 构建并启动
 docker compose up -d
@@ -278,9 +278,6 @@ admin:
 
 > `admin.enabled` 为 `true` 但 `password` 为空时，服务会**拒绝启动** ——
 > 否则等于把一个无鉴权的管理面板挂在内网可达的端口上。
-
-> **从 0.4.0 升级**：`admin.token` 已被移除，改为 `username` + `password`。
-> 命中旧字段时服务会拒绝启动并直接告诉你怎么改。
 
 启用后访问 `http://localhost:9034/admin` 即可。
 

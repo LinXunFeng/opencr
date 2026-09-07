@@ -190,16 +190,6 @@ def _init_admin_console() -> None:
         return
 
     if not cfg["password"]:
-        # 0.4.0 用的是共享 token，0.5.0 改成了账号密码。命中旧字段时明确指出改名，
-        # 否则用户只会看到"password 为空"，却不知道自己明明配过东西。
-        legacy_token = _pick_config_value(load_file_config(), "admin.token")
-        if legacy_token:
-            raise RuntimeError(
-                "检测到旧版配置 admin.token —— 0.5.0 起后台改用账号密码登录。"
-                "请把 config.yaml 的 admin 段中的 token 一行替换为：\n"
-                '  username: "admin"\n'
-                '  password: "你的密码"   # 直接写明文，首次启动会自动替换为哈希'
-            )
         raise RuntimeError(
             "admin.enabled=true 但 admin.password 为空。"
             "请在 config.yaml 的 admin 段填写密码（直接写明文，首次启动后会自动替换为哈希），"
