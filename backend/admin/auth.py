@@ -189,6 +189,21 @@ def guest_retry_enabled() -> bool:
     return repo.get_setting("guest_retry") == "1"
 
 
+def survey_guest_read_enabled() -> bool:
+    """
+    是否允许 Guest 浏览巡检结果。
+
+    嵌套在 guest_read 之下：guest_read 关着的时候这个开关没有意义。
+    默认开启，与 MR 审查一致 —— 依据同样是 ADR-0002 的那条边界（正文已剔除），
+    而不是"巡检不敏感"。开关控制的是"看不看得到这个模块"，
+    打开后 Finding 正文与整合叙述**依然剔除**。
+    """
+    value = repo.get_setting("survey_guest_read")
+    if value is None:
+        return True  # 默认开启
+    return value == "1"
+
+
 def current_identity() -> str:
     """
     当前请求的身份：admin 或 guest。
@@ -258,6 +273,28 @@ def require_admin(f):
         if not is_admin():
             return _reject("Authentication required", 401)
         return f(*args, **kwargs)
+
+    return decorated
+
+
+def require_survey_viewer(f):
+    """
+    巡检接口的访问档位：Admin 恒可访问；Guest 需要 guest_read 与 survey_guest_read 同时打开。
+
+    与 require_viewer 分开而不是加参数，是为了让"这个接口属于哪一档"
+    在路由定义处一眼可见 —— 漏加一个参数不会报错，但会静默放开访问。
+    """
+
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        available, rejection = admin_console_available()
+        if not available:
+            return rejection
+        if is_admin():
+            return f(*args, **kwargs)
+        if guest_read_enabled() and survey_guest_read_enabled():
+            return f(*args, **kwargs)
+        return _reject("Authentication required", 401)
 
     return decorated
 

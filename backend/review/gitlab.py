@@ -377,6 +377,28 @@ def _gitlab_get(path: str, params: dict = None, timeout: int = 30):
     return response
 
 
+def list_group_projects(group_path: str, page: int = 1, per_page: int = 100) -> List[dict]:
+    """
+    列出某个组织（含子组）下的项目，一页一页取。
+
+    归档项目由 API 侧过滤掉：它们按定义已经不再维护，对它们提问题没有收件人。
+    调用方负责翻页与去重——这里只做一次 HTTP，不替它决定翻几页。
+    """
+    encoded = quote(str(group_path or "").strip().strip("/"), safe="")
+    response = _gitlab_get(
+        f"/groups/{encoded}/projects",
+        params={
+            "per_page": per_page,
+            "page": page,
+            "include_subgroups": "true",
+            "archived": "false",
+            "simple": "true",
+        },
+    )
+    data = response.json() or []
+    return data if isinstance(data, list) else []
+
+
 def get_mr_state(project_id: int, mr_iid: int) -> dict:
     """读取 MR 当前状态，用于判断是否到了结算时机。"""
     response = _gitlab_get(f"/projects/{project_id}/merge_requests/{mr_iid}")

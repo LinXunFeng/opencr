@@ -46,6 +46,12 @@ export function registerNavigationGuard(router: Router) {
       return `${LOGIN_PATH}?redirect=${encodeURIComponent(to.fullPath)}`
     }
 
+    // 巡检模块：游客需要 guest_read 与 survey_guest_read 同时打开。
+    // 这里挡住只是为了不让人点进一个必然 401 的页面，真正的边界在服务端。
+    if (to.meta.surveyGated && !userStore.surveyVisible) {
+      return `${LOGIN_PATH}?redirect=${encodeURIComponent(to.fullPath)}`
+    }
+
     return true
   })
 

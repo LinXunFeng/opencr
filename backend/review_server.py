@@ -653,10 +653,26 @@ def start_reconciler() -> None:
     logger.info("Reconciler thread started (pid=%s)", os.getpid())
 
 
+def start_survey_scheduler() -> None:
+    """
+    启动巡检调度线程。
+
+    与 reconciler 同样延迟到请求期启动，理由完全一致（见 start_reconciler 的注释）；
+    但用的是**另一条租约**：reconciler 一轮要做结算加清理，跑得慢会把巡检的
+    触发点往后拖，共用一条租约还意味着其中一个卡死另一个也停摆。
+    """
+    if os.getenv("OPENCR_DISABLE_SURVEY_SCHEDULER", "").strip().lower() in {"1", "true", "yes", "on"}:
+        return
+    from backend.survey.scheduler import start_scheduler
+
+    start_scheduler()
+
+
 @app.before_request
-def _ensure_reconciler_running():
-    """每个请求前确认本进程的 reconciler 已启动（内部有幂等保护）。"""
+def _ensure_background_workers_running():
+    """每个请求前确认本进程的后台线程已启动（两者内部都有幂等保护）。"""
     start_reconciler()
+    start_survey_scheduler()
 
 
 if __name__ == "__main__":

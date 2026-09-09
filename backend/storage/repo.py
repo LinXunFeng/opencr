@@ -884,3 +884,760 @@ def skill_hit_counts(days: int = 30) -> Dict[str, int]:
             if key:
                 counts[key] = counts.get(key, 0) + 1
     return counts
+
+
+# ==========================================================================
+# 定期巡检（Survey / SurveyRun）
+#
+# 与上面的 ReviewRun 完全分开：两者唯一的共性是都产出"问题"，
+# 但巡检的产出不依附 MR discussion，不参与 Verdict 与 Coverage 的任何统计。
+# ==========================================================================
+
+def _unique_survey_slug(session, base_slug: str) -> str:
+    """
+    生成不冲突的工作区 slug。
+
+    冲突是真实存在的：`我的巡检 A` 和 `另一个巡检 A` 去掉中文后 slug 一样。
+    直接让唯一索引报错等于把一个可自动处理的情况丢给用户。
+    """
+    from .models import Survey as _Survey
+
+    candidate = base_slug or "survey"
+    suffix = 2
+    while session.scalar(select(_Survey.id).where(_Survey.slug == candidate)) is not None:
+        candidate = f"{base_slug}-{suffix}"
+        suffix += 1
+    return candidate
+
+
+def _survey_to_dict(survey: "Survey") -> dict:
+    """把 Survey 转成接口数据。"""
+    return {
+        "survey_uid": survey.survey_uid,
+        "name": survey.name,
+        "slug": survey.slug,
+        "enabled": bool(survey.enabled),
+        "schedule_kind": survey.schedule_kind,
+        "schedule_expr": survey.schedule_expr,
+        "timezone": survey.timezone,
+        "excluded_skills": json.loads(survey.excluded_skills) if survey.excluded_skills else [],
+        "delete_workspace_after": bool(survey.delete_workspace_after),
+        "budget_wall_clock_minutes": survey.budget_wall_clock_minutes,
+        "budget_l1_max_chars": survey.budget_l1_max_chars,
+        "budget_l2_max_focus": survey.budget_l2_max_focus,
+        "budget_index_timeout_seconds": survey.budget_index_timeout_seconds,
+        "retention_runs": survey.retention_runs,
+        "last_run_at": survey.last_run_at.isoformat() if survey.last_run_at else "",
+        "next_run_at": survey.next_run_at.isoformat() if survey.next_run_at else "",
+        "created_at": survey.created_at.isoformat() if survey.created_at else "",
+        "sources": [
+            {
+                "id": s.id,
+                "kind": s.kind,
+                "url": s.url,
+                "branch": s.branch or "",
+                "exclude_patterns": json.loads(s.exclude_patterns) if s.exclude_patterns else [],
+            }
+            for s in sorted(survey.sources, key=lambda x: x.id)
+        ],
+    }
+
+
+def create_survey(
+    name: str,
+    slug: str,
+    schedule_kind: str,
+    schedule_expr: str,
+    timezone_name: str,
+    sources: List[dict],
+    next_run_at: Optional[datetime] = None,
+    **options,
+) -> dict:
+    """新建一个巡检配置，返回它的完整数据。"""
+    from .models import Survey, SurveySource
+
+    survey_uid = str(uuid.uuid4())
+    with session_scope() as session:
+        survey = Survey(
+            survey_uid=survey_uid,
+            name=name,
+            slug=_unique_survey_slug(session, slug),
+            schedule_kind=schedule_kind,
+            schedule_expr=schedule_expr,
+            timezone=timezone_name,
+            next_run_at=next_run_at,
+            enabled=1 if options.get("enabled", True) else 0,
+            excluded_skills=json.dumps(options.get("excluded_skills") or [], ensure_ascii=False),
+            delete_workspace_after=1 if options.get("delete_workspace_after") else 0,
+            budget_wall_clock_minutes=options.get("budget_wall_clock_minutes"),
+            budget_l1_max_chars=options.get("budget_l1_max_chars"),
+            budget_l2_max_focus=options.get("budget_l2_max_focus"),
+            budget_index_timeout_seconds=options.get("budget_index_timeout_seconds"),
+            retention_runs=int(options.get("retention_runs") or 20),
+        )
+        session.add(survey)
+        session.flush()
+        for item in sources or []:
+            session.add(
+                SurveySource(
+                    survey_id=survey.id,
+                    kind=item.get("kind") or "repo",
+                    url=item.get("url") or "",
+                    branch=(item.get("branch") or "").strip() or None,
+                    exclude_patterns=json.dumps(item.get("exclude_patterns") or [], ensure_ascii=False),
+                )
+            )
+        session.flush()
+        session.refresh(survey)
+        return _survey_to_dict(survey)
+
+
+def update_survey(survey_uid: str, fields: dict, sources: Optional[List[dict]] = None) -> Optional[dict]:
+    """
+    更新巡检配置。sources 传 None 表示不动来源清单，传列表表示整体替换。
+
+    **slug 永不随改名变化** —— 改个名字就要搬几十 GB 代码，不划算，
+    而且搬运过程中断会留下一个谁也说不清状态的工作区。
+    """
+    from .models import Survey, SurveySource
+
+    with session_scope() as session:
+        survey = session.scalar(select(Survey).where(Survey.survey_uid == survey_uid))
+        if survey is None:
+            return None
+
+        for key, value in (fields or {}).items():
+            if key in {"slug", "survey_uid", "id"}:
+                continue
+            if key == "excluded_skills":
+                survey.excluded_skills = json.dumps(value or [], ensure_ascii=False)
+            elif key in {"enabled", "delete_workspace_after"}:
+                setattr(survey, key, 1 if value else 0)
+            elif hasattr(survey, key):
+                setattr(survey, key, value)
+        survey.updated_at = utcnow()
+
+        if sources is not None:
+            session.execute(delete(SurveySource).where(SurveySource.survey_id == survey.id))
+            for item in sources:
+                session.add(
+                    SurveySource(
+                        survey_id=survey.id,
+                        kind=item.get("kind") or "repo",
+                        url=item.get("url") or "",
+                        branch=(item.get("branch") or "").strip() or None,
+                        exclude_patterns=json.dumps(item.get("exclude_patterns") or [], ensure_ascii=False),
+                    )
+                )
+        session.flush()
+        session.refresh(survey)
+        return _survey_to_dict(survey)
+
+
+def delete_survey(survey_uid: str) -> Optional[str]:
+    """
+    删除巡检配置及其全部运行记录，返回它的 slug（供调用方决定是否清理工作区）。
+
+    **不连带删工作区** —— 误删一个巡检顺手把几十 GB 代码删掉是不可逆的，
+    工作区清理是界面上单独的动作。
+    """
+    from .models import Survey
+
+    with session_scope() as session:
+        survey = session.scalar(select(Survey).where(Survey.survey_uid == survey_uid))
+        if survey is None:
+            return None
+        slug = survey.slug
+        session.delete(survey)
+        return slug
+
+
+def get_survey(survey_uid: str) -> Optional[dict]:
+    """按 uid 读取巡检配置。"""
+    from .models import Survey
+
+    with session_scope() as session:
+        survey = session.scalar(select(Survey).where(Survey.survey_uid == survey_uid))
+        return None if survey is None else _survey_to_dict(survey)
+
+
+def list_surveys() -> List[dict]:
+    """全部巡检配置，按创建时间倒序。"""
+    from .models import Survey
+
+    with session_scope() as session:
+        rows = session.scalars(select(Survey).order_by(Survey.created_at.desc())).all()
+        return [_survey_to_dict(s) for s in rows]
+
+
+def list_due_surveys(now: Optional[datetime] = None) -> List[dict]:
+    """到期待执行的巡检。调度线程每轮调用一次，走 ix_survey_next_run 索引。"""
+    from .models import Survey
+
+    moment = now or utcnow()
+    with session_scope() as session:
+        rows = session.scalars(
+            select(Survey).where(
+                Survey.enabled == 1,
+                Survey.next_run_at.isnot(None),
+                Survey.next_run_at <= moment,
+            )
+        ).all()
+        return [_survey_to_dict(s) for s in rows]
+
+
+def set_survey_next_run(survey_uid: str, next_run_at: Optional[datetime], mark_ran: bool = False) -> None:
+    """更新下次触发时间；mark_ran=True 时同时记录本次执行时刻。"""
+    from .models import Survey
+
+    values: Dict[str, object] = {"next_run_at": next_run_at}
+    if mark_ran:
+        values["last_run_at"] = utcnow()
+    with session_scope() as session:
+        session.execute(update(Survey).where(Survey.survey_uid == survey_uid).values(**values))
+
+
+def has_running_survey_run(survey_uid: str) -> bool:
+    """
+    该巡检是否已有运行中的实例。
+
+    上一次还没跑完、下一次时间点又到了时跳过而不是排队 ——
+    一个每周任务积压两轮全量分析，除了烧钱没有意义。
+    """
+    from .models import Survey, SurveyRun
+
+    with session_scope() as session:
+        survey_id = session.scalar(select(Survey.id).where(Survey.survey_uid == survey_uid))
+        if survey_id is None:
+            return False
+        found = session.scalar(
+            select(SurveyRun.id).where(
+                SurveyRun.survey_id == survey_id, SurveyRun.status == RUN_RUNNING
+            ).limit(1)
+        )
+        return found is not None
+
+
+def start_survey_run(survey_uid: str, trigger: str) -> Optional[str]:
+    """登记一次 SurveyRun，返回 run_uid；巡检不存在返回 None。"""
+    from .models import Survey, SurveyRun, SURVEY_PHASE_FETCHING
+
+    run_uid = str(uuid.uuid4())
+    now = utcnow()
+    with session_scope() as session:
+        survey_id = session.scalar(select(Survey.id).where(Survey.survey_uid == survey_uid))
+        if survey_id is None:
+            return None
+        session.add(
+            SurveyRun(
+                run_uid=run_uid,
+                survey_id=survey_id,
+                trigger=trigger,
+                status=RUN_RUNNING,
+                phase=SURVEY_PHASE_FETCHING,
+                started_at=now,
+                heartbeat_at=now,
+            )
+        )
+    return run_uid
+
+
+def update_survey_progress(
+    run_uid: str,
+    phase: str = "",
+    repos_total: Optional[int] = None,
+    repos_done: Optional[int] = None,
+    matched_skills: Optional[List[str]] = None,
+) -> None:
+    """推进阶段与仓库计数，并顺带刷新心跳。"""
+    from .models import SurveyRun
+
+    values: Dict[str, object] = {"heartbeat_at": utcnow()}
+    if phase:
+        values["phase"] = phase
+    if repos_total is not None:
+        values["repos_total"] = int(repos_total)
+    if repos_done is not None:
+        values["repos_done"] = int(repos_done)
+    if matched_skills is not None:
+        values["matched_skills"] = json.dumps(sorted(set(matched_skills)), ensure_ascii=False)
+
+    with session_scope() as session:
+        session.execute(update(SurveyRun).where(SurveyRun.run_uid == run_uid).values(**values))
+
+
+def survey_heartbeat(run_uid: str) -> None:
+    """仅刷新心跳。L1/L2 的单次模型调用可能很久，靠它保活。"""
+    from .models import SurveyRun
+
+    with session_scope() as session:
+        session.execute(
+            update(SurveyRun).where(SurveyRun.run_uid == run_uid).values(heartbeat_at=utcnow())
+        )
+
+
+def add_survey_degradation(run_uid: str, kind: str, count: int = 1) -> None:
+    """累加一条巡检降级记录。与 status 正交：成功的运行也可以带多条降级。"""
+    from .models import SurveyRun
+
+    with session_scope() as session:
+        run = session.scalar(select(SurveyRun).where(SurveyRun.run_uid == run_uid))
+        if run is None:
+            return
+        try:
+            items = json.loads(run.degradations) if run.degradations else []
+        except (ValueError, TypeError):
+            items = []
+        if not isinstance(items, list):
+            items = []
+        for item in items:
+            if isinstance(item, dict) and item.get("kind") == kind:
+                item["count"] = int(item.get("count", 0)) + int(count)
+                break
+        else:
+            items.append({"kind": kind, "count": int(count)})
+        run.degradations = json.dumps(items, ensure_ascii=False)
+        run.heartbeat_at = utcnow()
+
+
+def record_survey_repo(
+    run_uid: str,
+    repo_slug: str,
+    url: str,
+    branch: str = "",
+    commit_sha: str = "",
+    status: str = "ok",
+    profile_kind: str = "",
+    file_count: int = 0,
+    error_message: str = "",
+) -> None:
+    """记录一次运行里单个仓库的处理结果。"""
+    from .models import SurveyRun, SurveyRunRepo
+
+    with session_scope() as session:
+        run = session.scalar(select(SurveyRun).where(SurveyRun.run_uid == run_uid))
+        if run is None:
+            return
+        session.add(
+            SurveyRunRepo(
+                run_id=run.id,
+                repo_slug=repo_slug,
+                url=url,
+                branch=branch or None,
+                commit_sha=commit_sha or None,
+                status=status,
+                profile_kind=profile_kind or None,
+                file_count=int(file_count or 0),
+                error_message=(error_message or "")[:2000] or None,
+            )
+        )
+
+
+def previous_survey_fingerprints(survey_id: int, before_run_id: int) -> set:
+    """
+    上一次 SurveyRun 产出的指纹集合，用于判定本轮哪些是新增。
+
+    只看**紧邻的上一次**而不是历史全集：一条问题被修好、几周后又被引入，
+    它对读报告的人来说就是新问题，不该因为半年前出现过就被标成"仍存在"。
+    """
+    from .models import SurveyFinding, SurveyRun
+
+    with session_scope() as session:
+        prev_run_id = session.scalar(
+            select(SurveyRun.id)
+            .where(SurveyRun.survey_id == survey_id, SurveyRun.id < before_run_id,
+                   SurveyRun.status == RUN_SUCCEEDED)
+            .order_by(SurveyRun.id.desc())
+            .limit(1)
+        )
+        if prev_run_id is None:
+            return set()
+        rows = session.scalars(
+            select(SurveyFinding.fingerprint).where(SurveyFinding.run_id == prev_run_id)
+        ).all()
+        return set(rows)
+
+
+def record_survey_findings(run_uid: str, findings: List[dict]) -> Dict[str, int]:
+    """
+    批量落库巡检产出，并标注每条是新增还是仍存在。
+
+    命中忽略清单的直接丢弃、不入库 —— 入库再在查询时过滤的话，
+    "本次发现 80 条"这个数字会一直包含用户明确说过不想再看的条目。
+    返回 {"new": n, "persisted": m, "ignored": k}。
+    """
+    from .models import (
+        FINDING_STATE_NEW,
+        FINDING_STATE_PERSISTED,
+        SurveyFinding,
+        SurveyIgnore,
+        SurveyRun,
+    )
+
+    counters = {"new": 0, "persisted": 0, "ignored": 0}
+    if not findings:
+        return counters
+
+    with session_scope() as session:
+        run = session.scalar(select(SurveyRun).where(SurveyRun.run_uid == run_uid))
+        if run is None:
+            return counters
+        survey_id = run.survey_id
+        ignored = set(
+            session.scalars(
+                select(SurveyIgnore.fingerprint).where(SurveyIgnore.survey_id == survey_id)
+            ).all()
+        )
+        run_id = run.id
+
+    previous = previous_survey_fingerprints(survey_id, run_id)
+
+    with session_scope() as session:
+        for item in findings:
+            fingerprint = item["fingerprint"]
+            if fingerprint in ignored:
+                counters["ignored"] += 1
+                continue
+            state = FINDING_STATE_PERSISTED if fingerprint in previous else FINDING_STATE_NEW
+            counters["new" if state == FINDING_STATE_NEW else "persisted"] += 1
+            session.add(
+                SurveyFinding(
+                    run_id=run_id,
+                    survey_id=survey_id,
+                    repo_slug=item.get("repo_slug", "")[:128],
+                    file_path=(item.get("file_path") or "")[:1024] or None,
+                    line=max(int(item.get("line") or 0), 0),
+                    category=item["category"],
+                    severity=item.get("severity") or SEVERITY_UNKNOWN,
+                    title=(item.get("title") or "")[:512] or None,
+                    body=(item.get("body") or "")[:8000] or None,
+                    fingerprint=fingerprint,
+                    state=state,
+                )
+            )
+    return counters
+
+
+def finish_survey_run(
+    run_uid: str,
+    status: str,
+    summary: str = "",
+    error_kind: str = "",
+    error_message: str = "",
+) -> None:
+    """收尾一次 SurveyRun。"""
+    from .models import SURVEY_PHASE_DONE, SurveyRun
+
+    now = utcnow()
+    values: Dict[str, object] = {
+        "status": status,
+        "phase": SURVEY_PHASE_DONE,
+        "heartbeat_at": now,
+        "finished_at": now,
+    }
+    if summary:
+        values["summary"] = summary
+    if error_kind:
+        values["error_kind"] = error_kind
+    if error_message:
+        values["error_message"] = str(error_message)[:4000]
+
+    with session_scope() as session:
+        session.execute(update(SurveyRun).where(SurveyRun.run_uid == run_uid).values(**values))
+
+
+def _survey_run_to_dict(run: "SurveyRun", stale_after_seconds: int = 600) -> dict:
+    """把 SurveyRun 转成接口数据。JSON 字段解析失败退化为空列表，不让面板打不开。"""
+    try:
+        degradations = json.loads(run.degradations) if run.degradations else []
+    except (ValueError, TypeError):
+        degradations = []
+    try:
+        skills = json.loads(run.matched_skills) if run.matched_skills else []
+    except (ValueError, TypeError):
+        skills = []
+
+    is_stale = (
+        run.status == RUN_RUNNING
+        and run.heartbeat_at is not None
+        and (utcnow() - run.heartbeat_at) > timedelta(seconds=stale_after_seconds)
+    )
+    return {
+        "run_uid": run.run_uid,
+        "trigger": run.trigger,
+        "status": run.status,
+        "phase": run.phase or "",
+        "repos_total": run.repos_total,
+        "repos_done": run.repos_done,
+        "matched_skills": skills,
+        "degradations": degradations,
+        "error_kind": run.error_kind or "",
+        "error_message": run.error_message or "",
+        "started_at": run.started_at.isoformat() if run.started_at else "",
+        "heartbeat_at": run.heartbeat_at.isoformat() if run.heartbeat_at else "",
+        "finished_at": run.finished_at.isoformat() if run.finished_at else "",
+        "is_stale": is_stale,
+    }
+
+
+def _survey_finding_to_dict(finding: "SurveyFinding", include_body: bool) -> dict:
+    """
+    巡检发现的接口数据。
+
+    include_body=False 时不返回正文与标题：巡检 Finding 描述的是整个代码库的
+    架构与弱点，正文密度比 MR 审查更高，Guest 边界只会更严格，不会更松。
+    """
+    item = {
+        "id": finding.id,
+        "repo_slug": finding.repo_slug,
+        "file_path": finding.file_path or "",
+        "line": finding.line,
+        "category": finding.category,
+        "severity": finding.severity,
+        "state": finding.state,
+        "fingerprint": finding.fingerprint,
+        "created_at": finding.created_at.isoformat() if finding.created_at else "",
+    }
+    if include_body:
+        item["title"] = finding.title or ""
+        item["body"] = finding.body or ""
+    return item
+
+
+def list_survey_runs(survey_uid: str = "", limit: int = 50, stale_after_seconds: int = 600) -> List[dict]:
+    """巡检运行列表，按开始时间倒序。survey_uid 为空表示不限巡检。"""
+    from .models import Survey, SurveyRun
+
+    with session_scope() as session:
+        stmt = select(SurveyRun).order_by(SurveyRun.started_at.desc()).limit(max(int(limit), 1))
+        if survey_uid:
+            survey_id = session.scalar(select(Survey.id).where(Survey.survey_uid == survey_uid))
+            if survey_id is None:
+                return []
+            stmt = stmt.where(SurveyRun.survey_id == survey_id)
+        runs = session.scalars(stmt).all()
+        survey_names = dict(session.execute(select(Survey.id, Survey.name)).all())
+        return [
+            {**_survey_run_to_dict(r, stale_after_seconds), "survey_name": survey_names.get(r.survey_id, "")}
+            for r in runs
+        ]
+
+
+def get_survey_run_detail(
+    run_uid: str, include_body: bool = True, stale_after_seconds: int = 600
+) -> Optional[dict]:
+    """
+    单次 SurveyRun 的完整报告：仓库清单、逐条发现、以及与上一次相比的差异。
+
+    "已消失"不从库里读 —— 它没有对应的行（见 models 里 FINDING_STATE 的注释），
+    是拿上一次的指纹集减去本次算出来的。
+    """
+    from .models import Survey, SurveyFinding, SurveyRun, SurveyRunRepo
+
+    with session_scope() as session:
+        run = session.scalar(select(SurveyRun).where(SurveyRun.run_uid == run_uid))
+        if run is None:
+            return None
+        survey = session.get(Survey, run.survey_id)
+        findings = session.scalars(
+            select(SurveyFinding).where(SurveyFinding.run_id == run.id).order_by(SurveyFinding.id.asc())
+        ).all()
+        repos = session.scalars(
+            select(SurveyRunRepo).where(SurveyRunRepo.run_id == run.id).order_by(SurveyRunRepo.id.asc())
+        ).all()
+
+        detail = _survey_run_to_dict(run, stale_after_seconds)
+        detail["survey_uid"] = survey.survey_uid if survey else ""
+        detail["survey_name"] = survey.name if survey else ""
+        # 整合叙述也是模型对私有代码的描述，与正文同一档待遇
+        detail["summary"] = (run.summary or "") if include_body else ""
+        detail["body_included"] = include_body
+        detail["repos"] = [
+            {
+                "repo_slug": r.repo_slug,
+                "url": r.url,
+                "branch": r.branch or "",
+                "commit_sha": (r.commit_sha or "")[:12],
+                "status": r.status,
+                "profile_kind": r.profile_kind or "",
+                "file_count": r.file_count,
+                "error_message": r.error_message or "",
+            }
+            for r in repos
+        ]
+        detail["findings"] = [_survey_finding_to_dict(f, include_body) for f in findings]
+
+        current_fps = {f.fingerprint for f in findings}
+        prev_run_id = session.scalar(
+            select(SurveyRun.id)
+            .where(SurveyRun.survey_id == run.survey_id, SurveyRun.id < run.id,
+                   SurveyRun.status == RUN_SUCCEEDED)
+            .order_by(SurveyRun.id.desc())
+            .limit(1)
+        )
+        resolved = []
+        if prev_run_id is not None:
+            prev_findings = session.scalars(
+                select(SurveyFinding).where(SurveyFinding.run_id == prev_run_id)
+            ).all()
+            for f in prev_findings:
+                if f.fingerprint not in current_fps:
+                    resolved.append(_survey_finding_to_dict(f, include_body))
+        detail["resolved_findings"] = resolved
+        detail["counts"] = {
+            "new": sum(1 for f in findings if f.state == "new"),
+            "persisted": sum(1 for f in findings if f.state == "persisted"),
+            "resolved": len(resolved),
+            "total": len(findings),
+        }
+        return detail
+
+
+def add_survey_ignore(survey_uid: str, fingerprint: str, note: str = "") -> bool:
+    """把一条发现标记为"已知问题、不再提醒"。已存在时视为成功。"""
+    from .models import Survey, SurveyIgnore
+
+    with session_scope() as session:
+        survey_id = session.scalar(select(Survey.id).where(Survey.survey_uid == survey_uid))
+        if survey_id is None:
+            return False
+        existing = session.scalar(
+            select(SurveyIgnore).where(
+                SurveyIgnore.survey_id == survey_id, SurveyIgnore.fingerprint == fingerprint
+            )
+        )
+        if existing is None:
+            session.add(
+                SurveyIgnore(survey_id=survey_id, fingerprint=fingerprint, note=(note or "")[:2000] or None)
+            )
+        return True
+
+
+def remove_survey_ignore(survey_uid: str, fingerprint: str) -> bool:
+    """取消忽略。"""
+    from .models import Survey, SurveyIgnore
+
+    with session_scope() as session:
+        survey_id = session.scalar(select(Survey.id).where(Survey.survey_uid == survey_uid))
+        if survey_id is None:
+            return False
+        result = session.execute(
+            delete(SurveyIgnore).where(
+                SurveyIgnore.survey_id == survey_id, SurveyIgnore.fingerprint == fingerprint
+            )
+        )
+        return (result.rowcount or 0) > 0
+
+
+def list_survey_ignores(survey_uid: str) -> List[dict]:
+    """某个巡检的忽略清单。"""
+    from .models import Survey, SurveyIgnore
+
+    with session_scope() as session:
+        survey_id = session.scalar(select(Survey.id).where(Survey.survey_uid == survey_uid))
+        if survey_id is None:
+            return []
+        rows = session.scalars(
+            select(SurveyIgnore).where(SurveyIgnore.survey_id == survey_id).order_by(SurveyIgnore.id.desc())
+        ).all()
+        return [
+            {
+                "fingerprint": r.fingerprint,
+                "note": r.note or "",
+                "created_at": r.created_at.isoformat() if r.created_at else "",
+            }
+            for r in rows
+        ]
+
+
+def purge_survey_runs(survey_id: int, retention_runs: int) -> int:
+    """
+    按次数清理巡检运行记录，返回删除条数。
+
+    **永远保留最近一次**，哪怕 retention_runs 被设成 0 或 1 ——
+    "新增/仍存在"的比对依赖上一次的记录还在，删掉它之后下一轮报告会把
+    所有问题都标成新增。这类故障发生在某个凌晨，且看起来完全正常。
+    """
+    from .models import SurveyFinding, SurveyRun
+
+    keep = max(int(retention_runs or 1), 1)
+    with session_scope() as session:
+        run_ids = session.scalars(
+            select(SurveyRun.id)
+            .where(SurveyRun.survey_id == int(survey_id))
+            .order_by(SurveyRun.started_at.desc())
+        ).all()
+        stale_ids = list(run_ids[keep:])
+        if not stale_ids:
+            return 0
+        session.execute(delete(SurveyFinding).where(SurveyFinding.run_id.in_(stale_ids)))
+        session.execute(delete(SurveyRun).where(SurveyRun.id.in_(stale_ids)))
+        return len(stale_ids)
+
+
+def purge_all_survey_runs() -> int:
+    """对所有巡检按各自的 retention_runs 做一次清理，返回总删除条数。"""
+    from .models import Survey
+
+    with session_scope() as session:
+        pairs = session.execute(select(Survey.id, Survey.retention_runs)).all()
+    return sum(purge_survey_runs(sid, keep) for sid, keep in pairs)
+
+
+def survey_dashboard_stats(days: int = 90) -> dict:
+    """巡检的聚合统计。不含任何正文，Guest 开关打开时可直接返回。"""
+    from .models import SurveyFinding, SurveyRun
+
+    since = _window_start(days)
+    with session_scope() as session:
+        by_status = dict(
+            session.execute(
+                select(SurveyRun.status, func.count())
+                .where(SurveyRun.started_at >= since)
+                .group_by(SurveyRun.status)
+            ).all()
+        )
+        by_category = dict(
+            session.execute(
+                select(SurveyFinding.category, func.count())
+                .where(SurveyFinding.created_at >= since)
+                .group_by(SurveyFinding.category)
+            ).all()
+        )
+        by_severity = dict(
+            session.execute(
+                select(SurveyFinding.severity, func.count())
+                .where(SurveyFinding.created_at >= since)
+                .group_by(SurveyFinding.severity)
+            ).all()
+        )
+        by_state = dict(
+            session.execute(
+                select(SurveyFinding.state, func.count())
+                .where(SurveyFinding.created_at >= since)
+                .group_by(SurveyFinding.state)
+            ).all()
+        )
+    return {
+        "window_days": days,
+        "total_runs": sum(by_status.values()),
+        "succeeded": by_status.get(RUN_SUCCEEDED, 0),
+        "failed": by_status.get(RUN_FAILED, 0),
+        "running": by_status.get(RUN_RUNNING, 0),
+        "by_category": by_category,
+        "by_severity": by_severity,
+        "by_state": by_state,
+    }
+
+
+def purge_survey_runs_by_uid(survey_uid: str) -> int:
+    """按 uid 对单个巡检做保留清理，供执行收尾调用。"""
+    from .models import Survey
+
+    with session_scope() as session:
+        row = session.execute(
+            select(Survey.id, Survey.retention_runs).where(Survey.survey_uid == survey_uid)
+        ).first()
+    if row is None:
+        return 0
+    return purge_survey_runs(row[0], row[1])

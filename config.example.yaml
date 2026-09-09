@@ -62,6 +62,58 @@ review:
   # 单个 skill script 的超时时间（秒）。
   skill_scripts_timeout: 10
 
+# Scheduled survey settings: periodically pull whole repositories and analyse them.
+# 定期巡检配置：按周期拉取整组仓库的全量代码并做跨仓库整合分析。
+survey:
+  # Enable the survey scheduler thread.
+  # 是否启用巡检调度线程。关闭后已有配置保留，只是不会自动触发。
+  enabled: true
+  # Root directory holding each survey's local repository copies.
+  # Leave empty to use ~/opencr/workspaces.
+  # 工作区根目录，存放各巡检的仓库副本；留空则使用 ~/opencr/workspaces。
+  # 全量克隆多个仓库可能占用几十 GB，需要放到其它磁盘时改这里。
+  workspace_dir: ""
+  # How often the scheduler checks for due surveys, in seconds.
+  # 调度线程检查到期巡检的间隔（秒）。它只做一次带索引的查询，很轻。
+  scheduler_interval_seconds: 60
+  # Use codegraph to build structural profiles. Installed by default by both
+  # deployment paths; turning this off (or a missing binary) degrades surveys to
+  # manifest-level profiles instead of failing them.
+  # 是否使用 codegraph 生成仓库画像。两条部署路径都会**默认安装**它。
+  # 关掉这个开关（或可执行文件缺失）不会让巡检失败，只会让画像退化为
+  # 依赖清单级并记录一条降级 —— 代价是分析时只知道有哪些文件，
+  # 不知道有哪些接口与类型。
+  codegraph_enabled: true
+  # Path or name of the codegraph executable. install.sh writes an absolute path
+  # here, because launchd's PATH does not include ~/.local/bin.
+  # codegraph 可执行文件路径或名称。install.sh 会在这里写**绝对路径**：
+  # launchd 的 PATH 里没有 ~/.local/bin，写裸名会让服务运行时找不到它，
+  # 表现为每次巡检都静默降级。
+  codegraph_bin: "codegraph"
+  # Hard budget for a single survey run. Overridable per survey in the console.
+  # 单次巡检的硬预算，可在后台按巡检单独覆盖。
+  # 没有预算的话，一个每周自动跑的任务成本可以从几美元浮动到几百美元。
+  budget:
+    # Wall-clock limit for one run, in minutes. Exceeding it degrades, not fails.
+    # 单次运行的墙钟上限（分钟）。超出属于降级而非失败，已产出的结果照常保留。
+    wall_clock_minutes: 60
+    # Max characters fed into the integration step (all repo profiles combined).
+    # 整合分析步骤的输入上限（字符）。默认值据实测标定：
+    # 三个中等仓库的组合画像约 43 万字符。
+    l1_max_chars: 400000
+    # Max number of focus points the integration step may hand to the inspection step.
+    # 整合分析最多产出多少个关注点交给取证步骤。
+    l2_max_focus: 20
+    # Max characters of source read per focus point.
+    # 每个关注点最多读取多少字符的源码。
+    l2_max_chars_per_focus: 20000
+    # Timeout for building one repository's code index, in seconds.
+    # 单个仓库建索引的超时时间（秒）。
+    index_timeout_seconds: 600
+    # Timeout for cloning or fetching one repository, in seconds.
+    # 单个仓库克隆/拉取的超时时间（秒）。
+    fetch_timeout_seconds: 600
+
 # Admin console settings. Disabled by default.
 # 后台管理配置。默认关闭 —— 从旧版本升级上来的实例不会平白多出一个管理面板。
 admin:
@@ -81,11 +133,21 @@ admin:
   # 是否只允许本机访问后台。Webhook 端口通常内网可达，开启这项可缩小暴露面。
   bind_local_only: false
 
-# Guest browsing (default on) and retry (default off) are runtime settings in the console/database.
-# Both switches must be on for guests to retry failed runs; they are not YAML settings.
-# 游客浏览（默认开启）与重新触发（默认关闭）由后台界面控制，存在数据库中。
-# 游客重新触发需同时开启两个开关；这两个设置不在 YAML 中。
-# 开关改动立即生效 —— 因为它们的使用场景天然是临时性的
+# Three runtime switches live in the console/database, not in this file:
+#   guest_read        browse the console without logging in  (default on)
+#   guest_retry       retry a failed run as a guest          (default off)
+#   survey_guest_read see the scheduled-survey module        (default on)
+# guest_retry and survey_guest_read are both nested under guest_read: with
+# browsing off, neither has any effect. survey_guest_read only controls whether
+# the module is visible - finding bodies and summaries stay stripped either way.
+# 三个运行期开关由后台界面控制，**不在这个文件里**：
+#   guest_read        未登录浏览后台        （默认开启）
+#   guest_retry       游客重新触发失败运行  （默认关闭）
+#   survey_guest_read 游客可见定期巡检模块  （默认开启）
+# 后两者都嵌套在 guest_read 之下：浏览关掉时它们都不起作用。
+# survey_guest_read 只控制"看不看得到巡检模块"——打开后，发现正文与整合叙述
+# 依然会被服务端剔除。
+# 三者都存在数据库中、改动立即生效 —— 因为它们的使用场景天然是临时性的
 # （"今天有外部人员来，先关一下"），要求改文件加重启就等于没人会用。
 # 游客能看到运行状态与聚合统计，但看不到审查发现的正文；
 # 完整取舍见 docs/adr/0002-guest-read-scope.md。

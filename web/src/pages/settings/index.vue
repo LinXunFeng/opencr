@@ -9,6 +9,7 @@ const saving = ref(false)
 const data = ref<SettingsData | null>(null)
 const guestRead = ref(true)
 const guestRetry = ref(false)
+const surveyGuestRead = ref(true)
 
 /** 读取当前设置。 */
 async function load() {
@@ -17,6 +18,7 @@ async function load() {
     data.value = await getSettingsApi()
     guestRead.value = data.value.writable.guest_read
     guestRetry.value = data.value.writable.guest_retry
+    surveyGuestRead.value = data.value.writable.survey_guest_read
   } catch (error) {
     ElMessage.error((error as Error).message)
   } finally {
@@ -75,6 +77,28 @@ async function toggleGuestRetry(value: string | number | boolean) {
   }
 }
 
+/**
+ * 巡检结果对游客的可见性。
+ *
+ * 它嵌套在游客浏览之下，且**只控制看不看得到这个模块**——
+ * 打开之后，发现正文与整体结论依然会被服务端剔除。
+ */
+async function toggleSurveyGuest(value: string | number | boolean) {
+  const next = Boolean(value)
+  saving.value = true
+  try {
+    const res = await updateSettingsApi({ survey_guest_read: next })
+    surveyGuestRead.value = res.writable.survey_guest_read
+    await userStore.fetchMe()
+    ElMessage.success(next ? "巡检结果已对游客开放" : "巡检结果已对游客隐藏")
+  } catch (error) {
+    surveyGuestRead.value = !next
+    ElMessage.error((error as Error).message)
+  } finally {
+    saving.value = false
+  }
+}
+
 onMounted(load)
 </script>
 
@@ -96,7 +120,21 @@ onMounted(load)
         </el-form-item>
         <el-form-item label="游客重新触发">
           <el-switch v-model="guestRetry" :loading="saving" :disabled="saving || !guestRead" @change="toggleGuestRetry" />
-          <div class="hint">默认关闭。开启后，游客可重新触发失败的审查，消耗模型额度并向 MR 发布评论；仅在游客浏览也开启时生效。</div>
+          <div class="hint">
+            默认关闭。开启后，游客可重新触发失败的审查，消耗模型额度并向 MR 发布评论；仅在游客浏览也开启时生效。
+          </div>
+        </el-form-item>
+
+        <el-form-item label="游客可见巡检">
+          <el-switch
+            v-model="surveyGuestRead" :loading="saving" :disabled="!guestRead"
+            @change="toggleSurveyGuest"
+          />
+          <div class="hint">
+            控制未登录访问者能否看到<b>定期巡检</b>模块。开启后他们能看到巡检的运行状态与聚合统计，
+            但同样<b>看不到发现正文与整体结论</b>——巡检正文描述的是整个代码库的架构与弱点。
+            该开关嵌套在「游客浏览」之下：上面关掉时它不起作用。
+          </div>
         </el-form-item>
       </el-form>
 

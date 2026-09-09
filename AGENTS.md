@@ -71,10 +71,13 @@ except Exception:
 
 以 [`CONTEXT.md`](./CONTEXT.md) 为唯一真相。几个最容易用错的：
 
-- **ReviewRun**：一次审查执行。一个 MR 对应**多个** ReviewRun（创建一次 + 每次推送一次）。
+- **ReviewRun**：一次 MR 审查执行。一个 MR 对应**多个** ReviewRun（创建一次 + 每次推送一次）。
+- **SurveyRun**：一次定期巡检执行。它与 ReviewRun **并列而非从属**：前者由时间驱动、审查全量代码，
+  后者由事件驱动、审查一次变更。两者产出的都叫 Finding，但**分表存放** ——
+  SurveyRun 的 Finding 永远不 Trackable，混进 `finding` 表会污染 Coverage 与采纳率的分母。
 - **Finding / 审查发现**：AI 产出的每一条。`建议` 一词**只**指严重度最低档与"修复方案"字段，
   不要用它指代产出本身。
-- **Degradation / 降级**：与失败**正交**——一次 ReviewRun 可以既成功又带多条降级。
+- **Degradation / 降级**：与失败**正交**——一次运行可以既成功又带多条降级。
 - **Trackable**：Finding 是否有 GitLab discussion 身份。普通 note 不可 resolve，因此不可追踪。
 
 ---
@@ -91,13 +94,23 @@ except Exception:
 ```
 backend/                # 后端 Python 包
 ├── review_server.py    # 只做 HTTP 路由、线程调度、后台任务，不含审查逻辑
-├── review/
+├── review/             # MR 审查链路：事件驱动，审查一次变更
 │   ├── runner.py       # ReviewRun 的唯一执行入口（webhook 与手动触发都走这里）
 │   ├── settlement.py   # Verdict 判定；核心分类逻辑是纯函数，不碰网络与数据库
 │   ├── ai.py           # 模型调用与产出解析
 │   ├── gitlab.py       # GitLab API 交互
 │   ├── skills.py       # skill 匹配与加载
 │   └── config.py       # 配置加载（config.yaml → 环境变量 → ~/.codex 回退）
+├── survey/             # 定期巡检链路：时间驱动，审查全量代码
+│   ├── runner.py       # SurveyRun 的唯一执行入口（定时与手动触发都走这里）
+│   ├── scheduler.py    # 调度线程；独立租约，不与 reconciler 共用
+│   ├── schedule.py     # cron 求值与下次触发时刻；纯函数，不碰数据库
+│   ├── workspace.py    # 仓库拉取与工作区管理（唯一调 git 的地方）
+│   ├── sources.py      # 来源展开（组织在每次执行时实时展开）
+│   ├── profile.py      # L0 仓库画像；codegraph 集成
+│   ├── crossrepo.py    # 跨仓库接口连接；确定性匹配，不含模型判断
+│   ├── analysis.py     # L1 整合 / L2 取证 / L3 汇总的模型调用
+│   └── report.py       # Markdown 报告渲染（渲染产物，不是存储真相）
 ├── storage/            # 持久化；上层只通过 repo.py 访问，不直接持有 Session
 ├── admin/              # 后台 API、鉴权，以及前端构建产物 static/（不进 Git）
 ├── migrations/         # Alembic 迁移脚本
@@ -131,7 +144,7 @@ web/                    # 后台前端源码，独立构建单元，详见 web/R
 ## 六、常用命令
 
 ```bash
-# 测试（79 个用例，无需外部依赖）
+# 测试（144 个用例，无需外部依赖）
 python3 -m unittest discover -s tests -t .
 
 # 数据库迁移（部署脚本走的就是这条）
@@ -167,3 +180,10 @@ pnpm build    # 构建到 backend/admin/static/（产物不进 Git）
 - 新增配置项要同时更新 `config.example.yaml`（含中英双语注释）与 `install.sh` 的配置生成段。
 - 扩大 Guest 可见范围前，先读 `docs/adr/0002-guest-read-scope.md`——那里的默认值是建立在
   "可见范围已排除敏感内容"这个前提上的，扩大范围就必须重新评估默认开启是否还成立。
+- **不要把多个仓库放进同一个 codegraph 索引。** 看起来只是少跑几条命令，实际会产生大量
+  跨仓库假边，而且假边的形状恰好就是巡检想产出的结论。动这块之前读
+  `docs/adr/0003-per-repo-codegraph-index.md`，那里有实测数据与复现方式。
+- **巡检的清理逻辑永远不能删掉每个 Survey 的最近一次运行。** 跨轮次比对依赖它，
+  删掉之后下一轮报告会把所有问题标成"新增"——这个故障发生在某个凌晨，且看起来完全正常。
+- 新增巡检链路的代码放 `backend/survey/`，**不要**写进 `backend/review/`。两条链路唯一的
+  共用物是 skill 加载与模型配置，其余一律分开。
