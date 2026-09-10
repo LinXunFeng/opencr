@@ -11,7 +11,7 @@ import uuid
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import delete, func, select, text, update
 
 from .db import session_scope
 from .models import (
@@ -72,6 +72,80 @@ def start_run(
             )
         )
     return run_uid
+
+
+def save_review_input(run_uid: str, review_input: dict) -> None:
+    """保存本次运行的原始选择参数与已确定的提交范围。"""
+    with session_scope() as session:
+        session.execute(update(ReviewRun).where(ReviewRun.run_uid == run_uid).values(
+            review_input=json.dumps(review_input, ensure_ascii=False)))
+
+
+def _original_input(run: ReviewRun) -> Optional[dict]:
+    """返回可恢复的原范围参数；旧记录或不完整记录返回 None。"""
+    try:
+        value = json.loads(run.review_input or "null")
+    except (ValueError, TypeError):
+        # 参数损坏只禁用原范围，仍允许按当前配置审查最新全量。
+        return None
+    if not isinstance(value, dict) or run.review_mode not in {"overall", "file", "hybrid"}:
+        return None
+    if not all(isinstance(value.get(k), str) and value[k] for k in ("from_sha", "to_sha")):
+        return None
+    if not isinstance(value.get("review_skill"), str):
+        return None
+    refs = value.get("diff_refs")
+    if not isinstance(refs, dict) or not all(isinstance(refs.get(k), str) and refs[k] for k in ("base_sha", "start_sha", "head_sha")):
+        return None
+    return value
+
+
+class RetryRejected(ValueError):
+    """重新触发被拒绝，携带响应状态与阻塞运行标识。"""
+
+    def __init__(self, message: str, status: int = 409, active_run_uid: str = ""):
+        """构造可向调用方展示的拒绝原因。"""
+        super().__init__(message)
+        self.status = status
+        self.active_run_uid = active_run_uid
+
+
+def start_retry_run(source_uid: str, scope: str, review_mode: str, review_skill: str) -> dict:
+    """原子检查失败来源与同 MR 运行，登记重试并返回执行参数。"""
+    if scope not in {"latest", "original"}:
+        raise RetryRejected("重试范围必须为 latest 或 original", 400)
+    with session_scope() as session:
+        # SQLite 先获得写锁再读取，避免不同 gunicorn worker 同时检查为空后各自插入。
+        # 事务内不访问 GitLab；旧入口仍可在提交后接收新推送，不建立全入口互斥。
+        session.execute(text("BEGIN IMMEDIATE"))
+        source = session.scalar(select(ReviewRun).where(ReviewRun.run_uid == source_uid))
+        if source is None:
+            raise RetryRejected("原审查运行不存在或已清理", 404)
+        if source.status != RUN_FAILED:
+            raise RetryRejected("仅明确失败的审查运行可以重新触发")
+        review_input = _original_input(source) if scope == "original" else None
+        if scope == "original" and review_input is None:
+            raise RetryRejected("原运行缺少完整范围或选择参数，请选择最新全量")
+        active = session.scalar(select(ReviewRun.run_uid).where(
+            ReviewRun.project_id == source.project_id, ReviewRun.mr_iid == source.mr_iid,
+            ReviewRun.status == RUN_RUNNING).order_by(ReviewRun.started_at.desc()).limit(1))
+        # Stale 没有终止保证，必须与正常 running 一样阻止重试。
+        if active:
+            raise RetryRejected("该 MR 已有审查正在运行（含疑似中断），请查看运行记录", active_run_uid=active)
+        if review_input is not None:
+            review_mode = source.review_mode
+            review_skill = review_input["review_skill"]
+        run_uid = str(uuid.uuid4())
+        session.add(ReviewRun(
+            run_uid=run_uid, project_id=source.project_id, mr_iid=source.mr_iid,
+            project_path=source.project_path, mr_title=source.mr_title,
+            trigger="manual", review_mode=review_mode, status=RUN_RUNNING,
+            retry_of_uid=source_uid, retry_scope=scope,
+            review_input=json.dumps(review_input, ensure_ascii=False) if review_input else None,
+        ))
+        return {"run_uid": run_uid, "project_id": source.project_id, "mr_iid": source.mr_iid,
+                "mr_title": source.mr_title or "", "review_mode": review_mode,
+                "review_skill": review_skill, "original_input": review_input}
 
 
 def record_skipped_run(
@@ -365,6 +439,9 @@ def _run_to_dict(run: ReviewRun, stale_after_seconds: int = 600) -> dict:
         "trigger": run.trigger,
         "review_mode": run.review_mode,
         "review_skills": skills,
+        "retry_of_uid": run.retry_of_uid or "",
+        "retry_scope": run.retry_scope or "",
+        "original_retry_available": _original_input(run) is not None,
         "status": run.status,
         "skip_reason": run.skip_reason or "",
         "phase": run.phase or "",

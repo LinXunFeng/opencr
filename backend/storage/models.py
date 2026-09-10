@@ -103,6 +103,12 @@ class ReviewRun(Base):
     # 实际命中的 skill，JSON 数组字符串
     review_skills: Mapped[Optional[str]] = mapped_column(Text)
 
+    # 只保存重试所需的范围与选择参数，不保存凭据或技能正文。
+    review_input: Mapped[Optional[str]] = mapped_column(Text)
+    # 不建外键：保留期清理原运行后，新运行仍保留来源标识。
+    retry_of_uid: Mapped[Optional[str]] = mapped_column(String(36))
+    retry_scope: Mapped[Optional[str]] = mapped_column(String(16))
+
     status: Mapped[str] = mapped_column(String(16), nullable=False, default=RUN_RUNNING)
     # should_review_mr 的跳过理由，只在 status=skipped 时有值
     skip_reason: Mapped[Optional[str]] = mapped_column(Text)
@@ -207,7 +213,7 @@ class AppSetting(Base):
     运行期设置的键值存储。
 
     只放两类东西：一是必须跨重启与跨 worker 保持一致的运行期密钥（session secret_key），
-    二是被刻意放在配置文件之外的开关（guest_read，理由见 ADR-0002）。
+    二是被刻意放在配置文件之外的开关（guest_read / guest_retry，理由见 ADR-0002）。
     **不放任何凭据** —— 密码的唯一真相是 config.yaml。
     """
 

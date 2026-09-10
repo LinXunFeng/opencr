@@ -333,6 +333,7 @@ def process_review_async(
     update_from_sha="",
     update_to_sha="",
     log_prefix="[Async]",
+    original_input=None,
 ):
     """后台线程入口：直接委托给统一的 ReviewRun 执行器。"""
     execute_review_run(
@@ -346,6 +347,7 @@ def process_review_async(
         update_from_sha=update_from_sha,
         update_to_sha=update_to_sha,
         log_prefix=log_prefix,
+        original_input=original_input,
     )
 
 
@@ -354,6 +356,10 @@ def _start_review_thread(**kwargs) -> None:
     thread = threading.Thread(target=process_review_async, kwargs=kwargs)
     thread.daemon = True
     thread.start()
+
+
+# 通过回调复用线程调度，后台蓝图不反向导入 HTTP 服务模块。
+app.config["START_REVIEW_THREAD"] = _start_review_thread
 
 
 def _settle_async(project_id: int, mr_iid: int, mr_state: str) -> None:

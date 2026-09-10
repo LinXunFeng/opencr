@@ -184,6 +184,11 @@ def guest_read_enabled() -> bool:
     return value == "1"
 
 
+def guest_retry_enabled() -> bool:
+    """游客重新触发开关，未设置时默认关闭，独立于游客浏览开关保存。"""
+    return repo.get_setting("guest_retry") == "1"
+
+
 def current_identity() -> str:
     """
     当前请求的身份：admin 或 guest。

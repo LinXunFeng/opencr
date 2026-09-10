@@ -176,12 +176,30 @@ def _resolve_changes(
     action: str,
     update_from_sha: str,
     update_to_sha: str,
+    original_input: Optional[dict] = None,
+    review_skill: str = "",
 ) -> tuple:
     """拉取本次要审查的变更集。增量场景只取本次新提交区间。"""
     repo.update_progress(run_uid, phase=PHASE_FETCHING)
+    if original_input is not None:
+        # 原范围不读取当前 MR diff，避免后续推送把 A→B 偷换为 A→C。
+        changes = get_compare_changes(project_id, original_input["from_sha"], original_input["to_sha"])
+        return changes, original_input["diff_refs"], original_input["to_sha"]
     all_changes, diff_refs = get_mr_changes_with_refs(project_id, mr_iid)
     changes_for_review = all_changes
     file_info_ref = str(diff_refs.get("head_sha", "") or "").strip()
+
+    incremental = action == "update" and normalized_mode == REVIEW_MODE_FILE and bool(update_from_sha)
+    target_sha = (update_to_sha or file_info_ref) if incremental else file_info_ref
+    # 快照中的投递位置也必须指向被审查的提交，不能携带后续推送的 head。
+    snapshot_refs = dict(diff_refs)
+    if incremental and target_sha != file_info_ref:
+        snapshot_refs = {"base_sha": update_from_sha, "start_sha": update_from_sha, "head_sha": target_sha}
+    repo.save_review_input(run_uid, {
+        "review_skill": review_skill,
+        "from_sha": update_from_sha if incremental else diff_refs.get("base_sha", ""),
+        "to_sha": target_sha, "diff_refs": snapshot_refs,
+    })
 
     if action == "update" and normalized_mode == REVIEW_MODE_FILE and update_from_sha:
         target_to_sha = (update_to_sha or diff_refs.get("head_sha", "")).strip()
@@ -393,6 +411,7 @@ def execute_review_run(
     update_from_sha: str = "",
     update_to_sha: str = "",
     log_prefix: str = "[Run]",
+    original_input: Optional[dict] = None,
 ) -> None:
     """
     执行一次 ReviewRun 的完整流程，并全程更新 ReviewRun 状态。
@@ -400,12 +419,15 @@ def execute_review_run(
     webhook 与手动触发都走这里，状态机只有这一份。
     """
     try:
+        # 模型或 GitLab 调用失败之前保留原始参数；尚未取到范围时原范围选项保持禁用。
+        repo.save_review_input(run_uid, original_input or {"review_skill": review_skill})
         review_cfg = load_review_config()
         normalized_mode = normalize_review_mode(review_mode)
 
         logger.info("%s Fetching changes for MR !%s", log_prefix, mr_iid)
         changes_for_review, diff_refs, file_info_ref = _resolve_changes(
-            project_id, mr_iid, run_uid, normalized_mode, action, update_from_sha, update_to_sha
+            project_id, mr_iid, run_uid, normalized_mode, action, update_from_sha, update_to_sha,
+            original_input, review_skill
         )
 
         if not changes_for_review:

@@ -81,8 +81,11 @@ admin:
   # 是否只允许本机访问后台。Webhook 端口通常内网可达，开启这项可缩小暴露面。
   bind_local_only: false
 
-# 注意：是否允许游客（未登录）浏览由后台界面控制，**不在这个文件里**。
-# 它默认开启，存在数据库中、改动立即生效 —— 因为它的使用场景天然是临时性的
+# Guest browsing (default on) and retry (default off) are runtime settings in the console/database.
+# Both switches must be on for guests to retry failed runs; they are not YAML settings.
+# 游客浏览（默认开启）与重新触发（默认关闭）由后台界面控制，存在数据库中。
+# 游客重新触发需同时开启两个开关；这两个设置不在 YAML 中。
+# 开关改动立即生效 —— 因为它们的使用场景天然是临时性的
 # （"今天有外部人员来，先关一下"），要求改文件加重启就等于没人会用。
 # 游客能看到运行状态与聚合统计，但看不到审查发现的正文；
 # 完整取舍见 docs/adr/0002-guest-read-scope.md。
