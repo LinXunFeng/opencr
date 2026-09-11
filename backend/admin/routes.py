@@ -28,6 +28,7 @@ from .auth import (
     admin_console_available,
     current_identity,
     guest_read_enabled,
+    guest_retry_enabled,
     is_admin,
     require_admin,
     require_viewer,
@@ -47,6 +48,7 @@ ALLOWED_WINDOWS = (1, 7, 30, 90)
 # 而后台本身就在这个服务里 —— 你会失去补救的入口。
 WRITABLE_SETTINGS = {
     "guest_read": {"type": "bool"},
+    "guest_retry": {"type": "bool"},
 }
 
 
@@ -224,9 +226,51 @@ def api_run_detail(run_uid: str):
     if not body_included:
         for finding in detail.get("findings", []):
             finding.pop("body", None)
+    detail["can_retry"] = is_admin() or (guest_read_enabled() and guest_retry_enabled())
     detail["body_included"] = body_included
     _add_change_links([detail])
     return jsonify(detail)
+
+
+@admin_bp.route("/api/admin/runs/<run_uid>/retry", methods=["POST"])
+@require_viewer
+def api_retry_run(run_uid: str):
+    """按指定范围重新触发失败运行，返回新运行或拒绝原因。"""
+    from ..review.gitlab import get_mr_state
+    from ..review.skills import resolve_review_options
+    from ..storage.models import ERROR_UNEXPECTED, RUN_FAILED
+
+    if not is_admin() and not guest_retry_enabled():
+        return jsonify({"error": "游客重新触发未开启"}), 403
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict) or set(payload) != {"scope"} or payload["scope"] not in ("latest", "original"):
+        return jsonify({"error": "请仅提供 scope，取值为 latest 或 original"}), 400
+    source = repo.get_run_detail(run_uid)
+    if source is None:
+        return jsonify({"error": "原审查运行不存在或已清理"}), 404
+    if source["status"] != RUN_FAILED:
+        return jsonify({"error": "仅明确失败的审查运行可以重新触发"}), 409
+    try:
+        mr = get_mr_state(source["project_id"], source["mr_iid"])
+    except Exception:
+        # 无法确认 MR 状态时不启动，原运行不受影响，也不向游客暴露上游错误中的凭据。
+        logger.exception("重新触发前读取 MR 状态失败")
+        return jsonify({"error": "无法读取 MR 当前状态，请稍后重试"}), 502
+    if mr["state"] != "opened":
+        return jsonify({"error": "仅允许对仍处于 opened 状态的 MR 重新触发"}), 409
+    try:
+        mode, skill = resolve_review_options({}, default_skill="")
+        params = repo.start_retry_run(run_uid, payload["scope"], mode, skill)
+    except repo.RetryRejected as exc:
+        return jsonify({"error": str(exc), "active_run_uid": exc.active_run_uid}), exc.status
+    try:
+        current_app.config["START_REVIEW_THREAD"](**params, log_prefix="[Retry]")
+    except Exception:
+        # 线程未启动也必须收尾，否则新记录会永久挡住后续重试。
+        logger.exception("重试审查线程启动失败")
+        repo.finish_run(params["run_uid"], RUN_FAILED, ERROR_UNEXPECTED, "审查线程启动失败")
+        return jsonify({"error": "审查线程启动失败", "run_uid": params["run_uid"]}), 500
+    return jsonify({"run_uid": params["run_uid"], "status": "processing"}), 202
 
 
 @admin_bp.route("/api/admin/runs/<run_uid>/history", methods=["GET"])
@@ -371,7 +415,7 @@ def api_settings():
                     "bind_local_only": admin_cfg["bind_local_only"],
                 },
             },
-            "writable": {"guest_read": guest_read_enabled()},
+            "writable": {"guest_read": guest_read_enabled(), "guest_retry": guest_retry_enabled()},
         }
     )
 
@@ -386,6 +430,8 @@ def api_update_settings():
     静默忽略会让调用方以为改成功了。
     """
     payload = request.get_json(silent=True) or {}
+    if not isinstance(payload, dict) or any(type(v) is not bool for v in payload.values()):
+        return jsonify({"error": "设置必须为布尔值对象"}), 400
     unknown = [k for k in payload if k not in WRITABLE_SETTINGS]
     if unknown:
         return jsonify({"error": f"不可写的配置项: {', '.join(sorted(unknown))}"}), 400
@@ -395,7 +441,7 @@ def api_update_settings():
             repo.set_setting(key, "1" if value else "0")
             logger.info("Admin changed setting %s -> %s", key, bool(value))
 
-    return jsonify({"writable": {"guest_read": guest_read_enabled()}})
+    return jsonify({"writable": {"guest_read": guest_read_enabled(), "guest_retry": guest_retry_enabled()}})
 
 
 # ---------------------------------------------------------------------------

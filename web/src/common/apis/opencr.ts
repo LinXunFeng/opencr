@@ -38,6 +38,9 @@ export interface ReviewRun {
   heartbeat_at: string
   finished_at: string
   is_stale: boolean
+  retry_of_uid: string
+  retry_scope: string
+  original_retry_available: boolean
 }
 
 export interface Finding {
@@ -60,6 +63,7 @@ export interface Finding {
 export interface RunDetail extends ReviewRun {
   findings: Finding[]
   body_included: boolean
+  can_retry?: boolean
 }
 
 export interface ErrorStats {
@@ -115,7 +119,7 @@ export interface DashboardData {
 
 export interface SettingsData {
   readonly: Record<string, any>
-  writable: { guest_read: boolean }
+  writable: { guest_read: boolean, guest_retry: boolean }
 }
 
 export function loginApi(data: { username: string, password: string }) {
@@ -185,6 +189,13 @@ export function getSettingsApi() {
   return request<SettingsData>({ url: "settings", method: "get" })
 }
 
-export function updateSettingsApi(data: Partial<{ guest_read: boolean }>) {
-  return request<{ writable: { guest_read: boolean } }>({ url: "settings", method: "patch", data })
+export function updateSettingsApi(data: Partial<{ guest_read: boolean, guest_retry: boolean }>) {
+  return request<{ writable: { guest_read: boolean, guest_retry: boolean } }>({ url: "settings", method: "patch", data })
+}
+
+/** 重新触发指定失败运行，成功后返回新的运行标识。 */
+export function retryRunApi(runUid: string, scope: "latest" | "original") {
+  return request<{ run_uid: string, status: string }>({
+    url: `runs/${runUid}/retry`, method: "post", data: { scope }
+  })
 }

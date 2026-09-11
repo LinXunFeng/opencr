@@ -296,8 +296,8 @@ finding bodies, because a body contains the AI's concrete description of code in
 repository (file path, line, problem, suggested fix), and the webhook port is typically reachable
 from the intranet.
 
-The switch lives in the console under System Settings, takes effect immediately, and is the only
-configuration item in this project that is not in `config.yaml` - its use is inherently temporary
+The switch lives in the console under System Settings, takes effect immediately, and is stored
+in the database alongside the guest retry switch - its use is inherently temporary
 ("visitors on site today, turn it off for now"), and requiring a file edit plus a restart would
 mean nobody ever uses it.
 
@@ -631,3 +631,11 @@ See [LICENSE](./LICENSE) for details.
 ---
 
 If anything fails, check logs first or run `./quick-test.sh` for diagnostics.
+
+### Retry failed reviews
+
+Use **Retry** on a failed run's detail page and choose the original range or the latest full MR. The original range preserves the commit interval, mode and selection parameters, but uses current model/skill content and matches skills again. Latest full uses the current defaults (the same as the manual endpoint, overall by default). Older runs without complete inputs support latest full only. Unavailable original commits fail explicitly without switching ranges.
+
+A retry creates a new ReviewRun linked to the failed run and retains old records and comments; duplicate comments are possible. The source link may expire under retention cleanup. Only failed runs on opened MRs are eligible. An existing running run, including Stale, blocks retry and provides its run link. Concurrent retry requests are guarded across processes; later webhooks and existing manual requests remain unaffected.
+
+Admins can enable **Guest retry** in Settings. It defaults to off and requires guest browsing to be enabled too; Finding bodies remain hidden. `POST /api/admin/runs/<run_uid>/retry` accepts `{"scope":"original"}` or `{"scope":"latest"}` and returns HTTP 202 with the new `run_uid`.

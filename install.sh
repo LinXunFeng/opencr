@@ -542,6 +542,10 @@ admin:
   username: "${OPENCR_ADMIN_USERNAME}"
   password: "${OPENCR_ADMIN_PASSWORD}"
   bind_local_only: ${OPENCR_ADMIN_BIND_LOCAL_ONLY}
+# Guest browsing (default on) and retry (default off) are managed in the console/database.
+# Guests can retry only when both switches are on; neither is a YAML setting.
+# 游客浏览默认开启，游客重新触发默认关闭，由后台即时设置并存入数据库。
+# 游客重新触发需同时开启两个开关；不在 YAML 中配置。
 
 storage:
   database_url: "${OPENCR_DATABASE_URL}"

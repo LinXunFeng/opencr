@@ -1,6 +1,6 @@
 <script lang="ts" setup>
 import type { RunDetail } from "@@/apis/opencr"
-import { getChangeHistoryApi, getRunDetailApi } from "@@/apis/opencr"
+import { getChangeHistoryApi, getRunDetailApi, retryRunApi } from "@@/apis/opencr"
 import VerdictTag from "@@/components/VerdictTag/index.vue"
 import {
   DEGRADATION_LABEL,
@@ -22,6 +22,39 @@ const router = useRouter()
 
 const loading = ref(true)
 const detail = ref<RunDetail | null>(null)
+
+const retryDialog = ref(false)
+const retryScope = ref<"latest" | "original">("latest")
+const retrying = ref(false)
+const retryError = ref("")
+const activeRunUid = ref("")
+
+/** 打开范围选择，历史信息不足时默认使用最新全量。 */
+function openRetry() {
+  retryScope.value = detail.value?.original_retry_available ? "original" : "latest"
+  retryError.value = ""
+  activeRunUid.value = ""
+  retryDialog.value = true
+}
+
+/** 提交重试；冲突时保留服务端给出的运行入口。 */
+async function submitRetry() {
+  if (!detail.value || retrying.value) return
+  retrying.value = true
+  retryError.value = ""
+  activeRunUid.value = ""
+  try {
+    const result = await retryRunApi(detail.value.run_uid, retryScope.value)
+    retryDialog.value = false
+    await router.push(`/runs/detail/${result.run_uid}`)
+  } catch (error) {
+    // 请求失败仍保留弹窗，用户可以查看冲突运行或修改范围后再试。
+    retryError.value = (error as Error).message
+    activeRunUid.value = (error as { response?: { data?: { active_run_uid?: string } } }).response?.data?.active_run_uid || ""
+  } finally {
+    retrying.value = false
+  }
+}
 
 const scope = ref("current")
 const severity = ref("")
@@ -66,6 +99,7 @@ async function loadHistory() {
 /** 切换运行时重置历史视图，加载当前运行详情。 */
 async function load() {
   loading.value = true
+  retryDialog.value = false
   scope.value = "current"
   page.value = 1
   history.value = []
@@ -97,6 +131,9 @@ watch(() => route.params.runUid, load, { immediate: true })
         <template #header>
           <div class="header">
             <span>{{ detail.change_label || "合并请求" }} #{{ detail.mr_iid }} · {{ detail.mr_title }}</span>
+            <el-button v-if="detail.status === 'failed' && detail.can_retry" type="primary" size="small" @click="openRetry">
+              重新触发
+            </el-button>
             <el-link v-if="detail.change_url" :href="detail.change_url" target="_blank" rel="noopener noreferrer" type="primary">
               打开 {{ detail.change_label || "合并请求" }}
             </el-link>
@@ -110,6 +147,10 @@ watch(() => route.params.runUid, load, { immediate: true })
         </template>
 
         <el-descriptions :column="3" border size="small">
+          <el-descriptions-item v-if="detail.retry_of_uid" label="重试来源">
+            <el-link type="primary" @click="router.push(`/runs/detail/${detail.retry_of_uid}`)">原失败运行</el-link>
+            · {{ detail.retry_scope === "original" ? "原失败范围" : "最新全量" }}
+          </el-descriptions-item>
           <el-descriptions-item label="项目">
             {{ detail.project_path || detail.project_id }}
           </el-descriptions-item>
@@ -252,6 +293,21 @@ watch(() => route.params.runUid, load, { immediate: true })
     </template>
 
     <el-empty v-else-if="!loading" description="未找到该审查运行，或已超出保留期被清理" />
+    <el-dialog v-model="retryDialog" title="重新触发失败审查" width="min(520px, 90vw)" :close-on-click-modal="!retrying" :close-on-press-escape="!retrying" :show-close="!retrying">
+      <el-radio-group v-model="retryScope" aria-label="重试范围" :disabled="retrying">
+        <el-radio value="original" :disabled="!detail?.original_retry_available">原失败范围</el-radio>
+        <el-radio value="latest">最新全量</el-radio>
+      </el-radio-group>
+      <p v-if="!detail?.original_retry_available" class="note">原运行缺少完整范围或选择参数，仅支持最新全量。</p>
+      <p class="note">{{ retryScope === "original" ? "重新审查原运行的完整提交区间，技能按当前内容重新匹配。" : "审查当前 MR 的全部变更，使用当前默认审查设置。" }}</p>
+      <el-alert class="mt" type="warning" :closable="false" title="将创建新的审查运行，保留旧评论，可能产生重复评论。" />
+      <el-alert v-if="retryError" class="mt" type="error" :closable="false" :title="retryError" />
+      <el-link v-if="activeRunUid" class="mt" type="primary" @click="router.push(`/runs/detail/${activeRunUid}`)">查看正在运行的审查</el-link>
+      <template #footer>
+        <el-button :disabled="retrying" @click="retryDialog = false">取消</el-button>
+        <el-button type="primary" :loading="retrying" @click="submitRetry">重新触发</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 

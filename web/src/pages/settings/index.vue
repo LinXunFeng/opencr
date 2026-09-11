@@ -8,12 +8,15 @@ const loading = ref(true)
 const saving = ref(false)
 const data = ref<SettingsData | null>(null)
 const guestRead = ref(true)
+const guestRetry = ref(false)
 
+/** 读取当前设置。 */
 async function load() {
   loading.value = true
   try {
     data.value = await getSettingsApi()
     guestRead.value = data.value.writable.guest_read
+    guestRetry.value = data.value.writable.guest_retry
   } catch (error) {
     ElMessage.error((error as Error).message)
   } finally {
@@ -55,6 +58,23 @@ async function toggleGuest(value: string | number | boolean) {
   }
 }
 
+/** 即时保存游客重新触发权限，失败时恢复开关。 */
+async function toggleGuestRetry(value: string | number | boolean) {
+  const next = Boolean(value)
+  saving.value = true
+  try {
+    const result = await updateSettingsApi({ guest_retry: next })
+    guestRetry.value = result.writable.guest_retry
+    ElMessage.success(next ? "已允许游客重新触发" : "已关闭游客重新触发")
+  } catch (error) {
+    // 保存失败时恢复原值，避免界面显示尚未生效的权限。
+    guestRetry.value = !next
+    ElMessage.error((error as Error).message)
+  } finally {
+    saving.value = false
+  }
+}
+
 onMounted(load)
 </script>
 
@@ -67,12 +87,16 @@ onMounted(load)
 
       <el-form label-width="140px">
         <el-form-item label="游客浏览">
-          <el-switch v-model="guestRead" :loading="saving" @change="toggleGuest" />
+          <el-switch v-model="guestRead" :loading="saving" :disabled="saving" @change="toggleGuest" />
           <div class="hint">
             开启后，未登录的访问者可以查看运行状态与聚合统计，但<b>看不到审查发现的正文</b>——
             正文包含 AI 对私有仓库代码的具体描述，因此被划在游客可见范围之外。
-            该开关存在数据库中、立即生效，是本项目唯一不在 <code>config.yaml</code> 里的配置项。
+            游客权限开关立即生效。
           </div>
+        </el-form-item>
+        <el-form-item label="游客重新触发">
+          <el-switch v-model="guestRetry" :loading="saving" :disabled="saving || !guestRead" @change="toggleGuestRetry" />
+          <div class="hint">默认关闭。开启后，游客可重新触发失败的审查，消耗模型额度并向 MR 发布评论；仅在游客浏览也开启时生效。</div>
         </el-form-item>
       </el-form>
 
