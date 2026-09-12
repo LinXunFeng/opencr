@@ -30,6 +30,8 @@ declare module "vue-router" {
      * @description 它只控制菜单与页面的可见性；数据边界由服务端保证，见 docs/adr/0002
      */
     adminOnly?: boolean
+    /** 巡检模块：游客可见性由后台开关决定，只控制显隐不是安全边界 */
+    surveyGated?: boolean
     /**
      * @description 默认 true，如果设置为 false，则不会在面包屑中显示
      */

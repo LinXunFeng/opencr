@@ -103,6 +103,33 @@ export const constantRoutes: RouteRecordRaw[] = [
     ]
   },
   {
+    path: "/surveys",
+    component: Layouts,
+    redirect: "/surveys/list",
+    name: "Surveys",
+    meta: { title: "定期巡检", elIcon: "Compass", alwaysShow: true, surveyGated: true },
+    children: [
+      {
+        path: "list",
+        component: () => import("@/pages/surveys/index.vue"),
+        name: "SurveyList",
+        meta: { title: "巡检配置", elIcon: "Compass", surveyGated: true }
+      },
+      {
+        path: "runs",
+        component: () => import("@/pages/surveys/runs.vue"),
+        name: "SurveyRunList",
+        meta: { title: "巡检记录", elIcon: "Tickets", surveyGated: true, keepAlive: true }
+      },
+      {
+        path: "runs/:runUid",
+        component: () => import("@/pages/surveys/detail.vue"),
+        name: "SurveyRunDetail",
+        meta: { title: "巡检报告", hidden: true, activeMenu: "/surveys/runs", surveyGated: true }
+      }
+    ]
+  },
+  {
     path: "/skills",
     component: Layouts,
     redirect: "/skills/list",

@@ -30,11 +30,17 @@ services:
       # 数据库：审查历史与采纳统计，删掉等于统计归零
       - opencr-data:/app/data
       - opencr-logs:/app/logs
+      # 巡检工作区：各巡检的仓库副本。删掉不丢任何数据（Finding 都在库里），
+      # 只是下次巡检要重新全量克隆。全量克隆多个仓库可能占几十 GB，
+      # 磁盘紧张时把它换成指向大盘的 bind mount。
+      - opencr-workspaces:/app/workspaces
     environment:
       # 容器内固定路径，覆盖 config.yaml 里的默认推导
       OPENCR_DATABASE_URL: sqlite:////app/data/opencr.db
       OPENCR_LOG_FILE: /app/logs/server.log
+      OPENCR_SURVEY_WORKSPACE_DIR: /app/workspaces
 
 volumes:
   opencr-data:
   opencr-logs:
+  opencr-workspaces:

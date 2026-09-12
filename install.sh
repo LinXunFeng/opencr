@@ -366,6 +366,96 @@ build_web_console() {
     fi
 }
 
+# codegraph 版本。钉死而不是取 latest：
+# 取 latest 会让两次安装装出不同版本，而巡检的画像质量直接取决于它的抽取行为。
+CODEGRAPH_VERSION="${CODEGRAPH_VERSION:-v1.6.0}"
+
+# 安装 codegraph（定期巡检的画像来源，默认安装）
+#
+# 官方一键脚本不续传不重试，实测在网络不佳时会拉了二十多分钟后以协议错误整体失败，
+# 因此这里自己下载：HTTP/1.1 + 断点续传 + 重试，并校验压缩包完整性。
+# 安装失败**不中断整个安装流程** —— 与 build_web_console 同一原则：
+# 巡检在缺少它时会退化为依赖清单级画像，功能仍然可用。
+setup_codegraph() {
+    print_step "安装 codegraph（定期巡检的代码画像工具）"
+
+    local install_root="$HOME/.codegraph"
+    local bin_dir="$HOME/.local/bin"
+    local existing=""
+
+    if command -v codegraph >/dev/null 2>&1; then
+        existing="$(command -v codegraph)"
+    elif [[ -x "$bin_dir/codegraph" ]]; then
+        existing="$bin_dir/codegraph"
+    fi
+
+    if [[ -n "$existing" ]]; then
+        print_success "已安装 codegraph（$("$existing" --version 2>/dev/null || echo '版本未知')）"
+        "$existing" telemetry off >/dev/null 2>&1 || true
+        # 写绝对路径而不是裸名：launchd 的 PATH 里没有 ~/.local/bin，
+        # 写裸名会让服务运行时找不到它，表现为每次巡检都静默降级。
+        OPENCR_SURVEY_CODEGRAPH_BIN="$existing"
+        return 0
+    fi
+
+    local os arch target
+    case "$(uname -s)" in
+        Darwin) os="darwin" ;;
+        Linux)  os="linux" ;;
+        *) print_warning "不支持的系统，跳过 codegraph 安装"; return 0 ;;
+    esac
+    case "$(uname -m)" in
+        arm64|aarch64) arch="arm64" ;;
+        x86_64|amd64)  arch="x64" ;;
+        *) print_warning "不支持的架构，跳过 codegraph 安装"; return 0 ;;
+    esac
+    target="${os}-${arch}"
+
+    local url="https://github.com/colbymchenry/codegraph/releases/download/${CODEGRAPH_VERSION}/codegraph-${target}.tar.gz"
+    local tmp_file
+    tmp_file="$(mktemp -t codegraph)" || { print_warning "无法创建临时文件，跳过 codegraph 安装"; return 0; }
+
+    print_info "下载 codegraph ${CODEGRAPH_VERSION}（约 57MB，网络较慢时可能需要几分钟）"
+    if ! curl -fL --http1.1 --retry 8 --retry-all-errors --retry-delay 3 -C - \
+            --connect-timeout 20 -o "$tmp_file" "$url"; then
+        rm -f "$tmp_file"
+        print_warning "codegraph 下载失败，已跳过（不影响审查服务）"
+        print_warning "巡检仍可运行，但仓库画像会退化为依赖清单级"
+        print_info "稍后可重跑 ./install.sh，或手动安装后在 config.yaml 里设置 survey.codegraph_bin"
+        return 0
+    fi
+
+    # 断点续传拿到的可能是被截断的文件，解包前先验一次完整性
+    if ! gzip -t "$tmp_file" 2>/dev/null; then
+        rm -f "$tmp_file"
+        print_warning "codegraph 下载内容不完整，已跳过（不影响审查服务）"
+        return 0
+    fi
+
+    local dest="$install_root/versions/$CODEGRAPH_VERSION"
+    rm -rf "$dest"
+    mkdir -p "$dest" "$bin_dir"
+    if ! tar -xzf "$tmp_file" -C "$dest" --strip-components=1; then
+        rm -f "$tmp_file"; rm -rf "$dest"
+        print_warning "codegraph 解包失败，已跳过（不影响审查服务）"
+        return 0
+    fi
+    rm -f "$tmp_file"
+
+    ln -sfn "$dest" "$install_root/current"
+    ln -sf "$dest/bin/codegraph" "$bin_dir/codegraph"
+    OPENCR_SURVEY_CODEGRAPH_BIN="$bin_dir/codegraph"
+
+    # 遥测默认开启。这个服务的典型部署环境是内网自签证书的 GitLab 旁边，
+    # 留一个说不清的外连不合适，而关掉的成本是一行命令。
+    "$bin_dir/codegraph" telemetry off >/dev/null 2>&1 || true
+
+    print_success "codegraph 已安装到 $dest"
+    if [[ ":$PATH:" != *":$bin_dir:"* ]]; then
+        print_info "提示：$bin_dir 不在你的 PATH 中（服务本身不受影响，配置里写的是绝对路径）"
+    fi
+}
+
 # 生成启动脚本
 generate_start_scripts() {
     print_step "生成启动脚本"
@@ -505,6 +595,17 @@ generate_config_file() {
     OPENCR_RETENTION_DAYS=${OPENCR_RETENTION_DAYS:-90}
     OPENCR_STALE_AFTER_SECONDS=${OPENCR_STALE_AFTER_SECONDS:-600}
     OPENCR_RECONCILE_INTERVAL_SECONDS=${OPENCR_RECONCILE_INTERVAL_SECONDS:-300}
+    OPENCR_SURVEY_ENABLED=${OPENCR_SURVEY_ENABLED:-true}
+    OPENCR_SURVEY_WORKSPACE_DIR=${OPENCR_SURVEY_WORKSPACE_DIR:-}
+    OPENCR_SURVEY_SCHEDULER_INTERVAL_SECONDS=${OPENCR_SURVEY_SCHEDULER_INTERVAL_SECONDS:-60}
+    OPENCR_SURVEY_CODEGRAPH_ENABLED=${OPENCR_SURVEY_CODEGRAPH_ENABLED:-true}
+    OPENCR_SURVEY_CODEGRAPH_BIN=${OPENCR_SURVEY_CODEGRAPH_BIN:-codegraph}
+    OPENCR_SURVEY_WALL_CLOCK_MINUTES=${OPENCR_SURVEY_WALL_CLOCK_MINUTES:-60}
+    OPENCR_SURVEY_L1_MAX_CHARS=${OPENCR_SURVEY_L1_MAX_CHARS:-400000}
+    OPENCR_SURVEY_L2_MAX_FOCUS=${OPENCR_SURVEY_L2_MAX_FOCUS:-20}
+    OPENCR_SURVEY_L2_MAX_CHARS_PER_FOCUS=${OPENCR_SURVEY_L2_MAX_CHARS_PER_FOCUS:-20000}
+    OPENCR_SURVEY_INDEX_TIMEOUT_SECONDS=${OPENCR_SURVEY_INDEX_TIMEOUT_SECONDS:-600}
+    OPENCR_SURVEY_FETCH_TIMEOUT_SECONDS=${OPENCR_SURVEY_FETCH_TIMEOUT_SECONDS:-600}
 
     cat > "$INSTALL_DIR/config.yaml" << CONFIG_EOF
 # OpenCR - 自动代码审查服务配置
@@ -534,6 +635,22 @@ review:
   skills_dir: "${REVIEW_SKILLS_DIR}"
   skill_scripts_enabled: ${REVIEW_SKILL_SCRIPTS_ENABLED}
   skill_scripts_timeout: ${REVIEW_SKILL_SCRIPTS_TIMEOUT}
+
+# 定期巡检：按周期拉取整组仓库的全量代码做跨仓库整合分析。
+# codegraph 是可选依赖，缺失时画像退化为依赖清单级，巡检照常执行。
+survey:
+  enabled: ${OPENCR_SURVEY_ENABLED}
+  workspace_dir: "${OPENCR_SURVEY_WORKSPACE_DIR}"
+  scheduler_interval_seconds: ${OPENCR_SURVEY_SCHEDULER_INTERVAL_SECONDS}
+  codegraph_enabled: ${OPENCR_SURVEY_CODEGRAPH_ENABLED}
+  codegraph_bin: "${OPENCR_SURVEY_CODEGRAPH_BIN}"
+  budget:
+    wall_clock_minutes: ${OPENCR_SURVEY_WALL_CLOCK_MINUTES}
+    l1_max_chars: ${OPENCR_SURVEY_L1_MAX_CHARS}
+    l2_max_focus: ${OPENCR_SURVEY_L2_MAX_FOCUS}
+    l2_max_chars_per_focus: ${OPENCR_SURVEY_L2_MAX_CHARS_PER_FOCUS}
+    index_timeout_seconds: ${OPENCR_SURVEY_INDEX_TIMEOUT_SECONDS}
+    fetch_timeout_seconds: ${OPENCR_SURVEY_FETCH_TIMEOUT_SECONDS}
 
 # 后台管理：默认关闭。开启需同时填写密码，否则服务会拒绝启动。
 # password 可直接写明文，首次启动时会自动替换为哈希。
@@ -583,7 +700,7 @@ generate_launchd_plist() {
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin</string>
+        <string>${HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin</string>
         <key>HOME</key>
         <string>${HOME}</string>
     </dict>
@@ -701,6 +818,7 @@ main() {
     check_code_platform_config
     copy_files
     build_web_console
+    setup_codegraph
     setup_venv
     generate_start_scripts
     generate_config_file

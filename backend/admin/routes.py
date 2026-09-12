@@ -22,6 +22,13 @@ from ..review.config import (
     load_storage_config,
 )
 from ..storage import repo
+from ..survey.common import SurveyError, slugify
+from ..survey.config import load_survey_config
+from ..survey.profile import codegraph_available
+from ..survey.report import render_run_markdown
+from ..survey.schedule import describe_schedule, next_fire_time
+from ..survey.scheduler import trigger_survey_now
+from ..survey.workspace import delete_workspace, workspace_size_bytes
 from .auth import (
     IDENTITY_ADMIN,
     SESSION_IDENTITY_KEY,
@@ -31,7 +38,9 @@ from .auth import (
     guest_retry_enabled,
     is_admin,
     require_admin,
+    require_survey_viewer,
     require_viewer,
+    survey_guest_read_enabled,
     verify_password,
 )
 
@@ -49,6 +58,9 @@ ALLOWED_WINDOWS = (1, 7, 30, 90)
 WRITABLE_SETTINGS = {
     "guest_read": {"type": "bool"},
     "guest_retry": {"type": "bool"},
+    # 嵌套在 guest_read 之下：guest_read 关着时它没有意义。
+    # 默认开启，与 MR 审查一致；打开后巡检发现的正文与整合叙述**依然剔除**。
+    "survey_guest_read": {"type": "bool"},
 }
 
 
@@ -158,6 +170,8 @@ def api_me():
             "identity": current_identity(),
             "username": cfg["username"] if is_admin() else "",
             "guest_read": guest_enabled,
+            "survey_guest_read": survey_guest_read_enabled(),
+            "survey_enabled": load_survey_config()["enabled"],
             # Guest 开关关闭且未登录时，前端应直接跳登录页
             "requires_login": not is_admin() and not guest_enabled,
             "version": get_app_version(),
@@ -410,12 +424,21 @@ def api_settings():
                 },
                 "review": review_cfg,
                 "storage": storage_cfg,
+                "survey": {
+                    **load_survey_config(),
+                    # codegraph 是可选依赖，装没装是运维最常问的一件事
+                    "codegraph_available": codegraph_available(),
+                },
                 "admin": {
                     "username": admin_cfg["username"],
                     "bind_local_only": admin_cfg["bind_local_only"],
                 },
             },
-            "writable": {"guest_read": guest_read_enabled(), "guest_retry": guest_retry_enabled()},
+            "writable": {
+                "guest_read": guest_read_enabled(),
+                "guest_retry": guest_retry_enabled(),
+                "survey_guest_read": survey_guest_read_enabled(),
+            },
         }
     )
 
@@ -441,7 +464,339 @@ def api_update_settings():
             repo.set_setting(key, "1" if value else "0")
             logger.info("Admin changed setting %s -> %s", key, bool(value))
 
-    return jsonify({"writable": {"guest_read": guest_read_enabled(), "guest_retry": guest_retry_enabled()}})
+    return jsonify(
+        {
+            "writable": {
+                "guest_read": guest_read_enabled(),
+                "guest_retry": guest_retry_enabled(),
+                "survey_guest_read": survey_guest_read_enabled(),
+            }
+        }
+    )
+
+
+# ---------------------------------------------------------------------------
+# 定期巡检
+#
+# 读接口走 require_survey_viewer（Guest 需两个开关同时打开），
+# 写接口一律 require_admin —— 触发一次巡检会拉几十 GB 代码并花掉真金白银。
+# ---------------------------------------------------------------------------
+
+MAX_SURVEY_SOURCES = 30
+
+
+def _parse_sources(raw) -> list:
+    """校验并规整来源清单。返回规整后的列表，非法时抛 ValueError。"""
+    if not isinstance(raw, list):
+        raise ValueError("sources 必须是数组")
+    if len(raw) > MAX_SURVEY_SOURCES:
+        raise ValueError(f"来源数量不能超过 {MAX_SURVEY_SOURCES} 条")
+
+    sources = []
+    for item in raw:
+        if not isinstance(item, dict):
+            raise ValueError("每条来源必须是对象")
+        url = str(item.get("url") or "").strip()
+        if not url:
+            raise ValueError("来源地址不能为空")
+        kind = str(item.get("kind") or "repo").strip().lower()
+        if kind not in {"repo", "org"}:
+            raise ValueError(f"未知的来源类型：{kind}")
+        patterns = item.get("exclude_patterns") or []
+        if not isinstance(patterns, list):
+            raise ValueError("exclude_patterns 必须是数组")
+        sources.append(
+            {
+                "kind": kind,
+                "url": url,
+                # 分支只对具体仓库有意义；组织下各仓库用各自的默认分支
+                "branch": str(item.get("branch") or "").strip() if kind == "repo" else "",
+                "exclude_patterns": [str(x).strip() for x in patterns if str(x).strip()],
+            }
+        )
+    return sources
+
+
+def _parse_survey_payload(payload: dict, partial: bool) -> tuple:
+    """
+    校验巡检配置入参，返回 (fields, sources)。
+
+    周期在这里就折算一次 cron：非法表达式必须在保存时被挡住，
+    而不是等到某个周一早上没有触发时才由人去翻日志。
+    """
+    fields = {}
+
+    if "name" in payload or not partial:
+        name = str(payload.get("name") or "").strip()
+        if not name:
+            raise ValueError("巡检名称不能为空")
+        fields["name"] = name[:255]
+
+    if any(k in payload for k in ("schedule_kind", "schedule_expr", "timezone")) or not partial:
+        kind = str(payload.get("schedule_kind") or "weekly").strip().lower()
+        expr = str(payload.get("schedule_expr") or "1 09:00").strip()
+        tz = str(payload.get("timezone") or "UTC").strip()
+        # 抛出的 SurveyError 由调用方转成 400，措辞对用户已经足够具体
+        next_fire_time(kind, expr, tz)
+        fields.update({"schedule_kind": kind, "schedule_expr": expr, "timezone": tz})
+
+    for key in ("enabled", "delete_workspace_after"):
+        if key in payload:
+            fields[key] = bool(payload[key])
+
+    if "excluded_skills" in payload:
+        raw = payload["excluded_skills"]
+        if not isinstance(raw, list):
+            raise ValueError("excluded_skills 必须是数组")
+        fields["excluded_skills"] = [str(x).strip() for x in raw if str(x).strip()]
+
+    for key in (
+        "budget_wall_clock_minutes",
+        "budget_l1_max_chars",
+        "budget_l2_max_focus",
+        "budget_index_timeout_seconds",
+        "retention_runs",
+    ):
+        if key in payload:
+            value = payload[key]
+            if value in (None, ""):
+                fields[key] = None
+                continue
+            try:
+                parsed = int(value)
+            except (TypeError, ValueError):
+                raise ValueError(f"{key} 必须是整数")
+            if parsed <= 0:
+                raise ValueError(f"{key} 必须是正整数")
+            fields[key] = parsed
+
+    sources = None
+    if "sources" in payload:
+        sources = _parse_sources(payload["sources"])
+    elif not partial:
+        raise ValueError("必须至少提供一条仓库来源")
+    if sources is not None and not sources:
+        raise ValueError("必须至少提供一条仓库来源")
+
+    return fields, sources
+
+
+def _decorate_survey(survey: dict) -> dict:
+    """给巡检配置补上展示用的派生字段。"""
+    return {
+        **survey,
+        "schedule_desc": describe_schedule(
+            survey["schedule_kind"], survey["schedule_expr"], survey["timezone"]
+        ),
+        "workspace_bytes": workspace_size_bytes(survey["slug"]),
+    }
+
+
+@admin_bp.route("/api/admin/surveys", methods=["GET"])
+@require_survey_viewer
+def api_surveys():
+    """巡检配置列表。"""
+    return jsonify({"items": [_decorate_survey(s) for s in repo.list_surveys()]})
+
+
+@admin_bp.route("/api/admin/surveys", methods=["POST"])
+@require_admin
+def api_create_survey():
+    """新建巡检。"""
+    payload = request.get_json(silent=True) or {}
+    try:
+        fields, sources = _parse_survey_payload(payload, partial=False)
+    except (ValueError, SurveyError) as e:
+        return jsonify({"error": str(e)}), 400
+
+    next_run = next_fire_time(fields["schedule_kind"], fields["schedule_expr"], fields["timezone"])
+    survey = repo.create_survey(
+        name=fields["name"],
+        slug=slugify(fields["name"], fallback="survey"),
+        schedule_kind=fields["schedule_kind"],
+        schedule_expr=fields["schedule_expr"],
+        timezone_name=fields["timezone"],
+        sources=sources,
+        next_run_at=next_run,
+        **{k: v for k, v in fields.items() if k not in {"name", "schedule_kind", "schedule_expr", "timezone"}},
+    )
+    logger.info("Admin created survey: %s (slug=%s)", survey["name"], survey["slug"])
+    return jsonify(_decorate_survey(survey)), 201
+
+
+@admin_bp.route("/api/admin/surveys/<survey_uid>", methods=["GET"])
+@require_survey_viewer
+def api_survey_detail(survey_uid: str):
+    """单个巡检配置。"""
+    survey = repo.get_survey(survey_uid)
+    if survey is None:
+        return jsonify({"error": "巡检不存在"}), 404
+    return jsonify(_decorate_survey(survey))
+
+
+@admin_bp.route("/api/admin/surveys/<survey_uid>", methods=["PATCH"])
+@require_admin
+def api_update_survey(survey_uid: str):
+    """更新巡检配置。周期或启用状态变化时重算下次触发时间。"""
+    payload = request.get_json(silent=True) or {}
+    try:
+        fields, sources = _parse_survey_payload(payload, partial=True)
+    except (ValueError, SurveyError) as e:
+        return jsonify({"error": str(e)}), 400
+
+    current = repo.get_survey(survey_uid)
+    if current is None:
+        return jsonify({"error": "巡检不存在"}), 404
+
+    merged = {**current, **fields}
+    if any(k in fields for k in ("schedule_kind", "schedule_expr", "timezone", "enabled")):
+        fields["next_run_at"] = (
+            next_fire_time(merged["schedule_kind"], merged["schedule_expr"], merged["timezone"])
+            if merged.get("enabled", True)
+            else None
+        )
+
+    survey = repo.update_survey(survey_uid, fields, sources)
+    if survey is None:
+        return jsonify({"error": "巡检不存在"}), 404
+    logger.info("Admin updated survey: %s", survey["name"])
+    return jsonify(_decorate_survey(survey))
+
+
+@admin_bp.route("/api/admin/surveys/<survey_uid>", methods=["DELETE"])
+@require_admin
+def api_delete_survey(survey_uid: str):
+    """
+    删除巡检配置与其全部运行记录。
+
+    **不连带删工作区** —— 误删一个巡检顺手把几十 GB 代码删掉是不可逆的。
+    工作区清理是下面那个独立接口。
+    """
+    slug = repo.delete_survey(survey_uid)
+    if slug is None:
+        return jsonify({"error": "巡检不存在"}), 404
+    logger.info("Admin deleted survey: slug=%s (workspace kept)", slug)
+    return jsonify({"deleted": True, "slug": slug, "workspace_kept": True})
+
+
+@admin_bp.route("/api/admin/surveys/<survey_uid>/run", methods=["POST"])
+@require_admin
+def api_run_survey(survey_uid: str):
+    """
+    立即执行一次巡检。
+
+    走的是和定时触发完全相同的入口，只有 trigger 字段不同。
+    """
+    if repo.get_survey(survey_uid) is None:
+        return jsonify({"error": "巡检不存在"}), 404
+    if not trigger_survey_now(survey_uid):
+        return jsonify({"error": "该巡检已有正在进行的运行"}), 409
+    logger.info("Admin manually triggered survey: %s", survey_uid)
+    return jsonify({"started": True}), 202
+
+
+@admin_bp.route("/api/admin/surveys/<survey_uid>/workspace", methods=["DELETE"])
+@require_admin
+def api_clear_workspace(survey_uid: str):
+    """清理某个巡检的本地工作区。下次执行会退回全量克隆。"""
+    survey = repo.get_survey(survey_uid)
+    if survey is None:
+        return jsonify({"error": "巡检不存在"}), 404
+    if repo.has_running_survey_run(survey_uid):
+        # 正在跑的时候删工作区，等于让那次运行读到半个仓库
+        return jsonify({"error": "该巡检正在运行，无法清理工作区"}), 409
+    removed = delete_workspace(survey["slug"])
+    logger.info("Admin cleared workspace: slug=%s removed=%s", survey["slug"], removed)
+    return jsonify({"removed": removed})
+
+
+@admin_bp.route("/api/admin/surveys/<survey_uid>/ignores", methods=["GET"])
+@require_admin
+def api_survey_ignores(survey_uid: str):
+    """忽略清单。含指纹与理由，属于正文一侧，不对 Guest 开放。"""
+    return jsonify({"items": repo.list_survey_ignores(survey_uid)})
+
+
+@admin_bp.route("/api/admin/surveys/<survey_uid>/ignores", methods=["POST"])
+@require_admin
+def api_add_survey_ignore(survey_uid: str):
+    """把一条发现标记为已知问题，后续巡检不再产出它。"""
+    payload = request.get_json(silent=True) or {}
+    fingerprint = str(payload.get("fingerprint") or "").strip()
+    if not fingerprint:
+        return jsonify({"error": "fingerprint 不能为空"}), 400
+    if not repo.add_survey_ignore(survey_uid, fingerprint, str(payload.get("note") or "")):
+        return jsonify({"error": "巡检不存在"}), 404
+    return jsonify({"ignored": True}), 201
+
+
+@admin_bp.route("/api/admin/surveys/<survey_uid>/ignores/<fingerprint>", methods=["DELETE"])
+@require_admin
+def api_remove_survey_ignore(survey_uid: str, fingerprint: str):
+    """取消忽略。"""
+    removed = repo.remove_survey_ignore(survey_uid, fingerprint)
+    return jsonify({"removed": removed})
+
+
+@admin_bp.route("/api/admin/survey-runs", methods=["GET"])
+@require_survey_viewer
+def api_survey_runs():
+    """巡检运行列表。"""
+    return jsonify(
+        {
+            "items": repo.list_survey_runs(
+                survey_uid=(request.args.get("survey_uid") or "").strip(),
+                limit=_int_arg("limit", 50, 200),
+                stale_after_seconds=_stale_after(),
+            )
+        }
+    )
+
+
+@admin_bp.route("/api/admin/survey-runs/<run_uid>", methods=["GET"])
+@require_survey_viewer
+def api_survey_run_detail(run_uid: str):
+    """
+    单次巡检的完整报告。
+
+    Guest 拿不到发现正文与整合叙述 —— 巡检正文描述的是整个代码库的架构与弱点，
+    正文密度比 MR 审查更高，这条边界只会更严格，不会更松。
+    """
+    detail = repo.get_survey_run_detail(
+        run_uid, include_body=is_admin(), stale_after_seconds=_stale_after()
+    )
+    if detail is None:
+        return jsonify({"error": "运行记录不存在"}), 404
+    return jsonify(detail)
+
+
+@admin_bp.route("/api/admin/survey-runs/<run_uid>/export", methods=["GET"])
+@require_survey_viewer
+def api_export_survey_run(run_uid: str):
+    """
+    导出 Markdown 报告。
+
+    导出走的是和界面同一份数据，因此 Guest 导出的报告同样不含正文 ——
+    否则导出就成了绕过可见范围的后门。
+    """
+    detail = repo.get_survey_run_detail(
+        run_uid, include_body=is_admin(), stale_after_seconds=_stale_after()
+    )
+    if detail is None:
+        return jsonify({"error": "运行记录不存在"}), 404
+    markdown = render_run_markdown(detail)
+    return current_app.response_class(
+        markdown,
+        mimetype="text/markdown; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="survey-{run_uid[:8]}.md"'},
+    )
+
+
+@admin_bp.route("/api/admin/survey-stats", methods=["GET"])
+@require_survey_viewer
+def api_survey_stats():
+    """巡检聚合统计。不含任何正文。"""
+    return jsonify(repo.survey_dashboard_stats(days=_window_days(90)))
 
 
 # ---------------------------------------------------------------------------

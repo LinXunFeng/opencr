@@ -123,3 +123,101 @@ export function formatPercent(value: number | null | undefined): string {
 
 /** 历史审查发现的展示范围与去重口径。 */
 export const HISTORY_NOTE = "展示当前合并请求在保留期内的全部审查批次，按时间倒序排列。历史发现可能针对不同提交并存在重复，不代表当前问题清单；筛选仅影响批次内的发现。"
+
+// ---------------------------------------------------------------------------
+// 定期巡检
+// ---------------------------------------------------------------------------
+
+export const SURVEY_PHASE_LABEL: Record<string, string> = {
+  fetching: "拉取仓库",
+  profiling: "生成画像",
+  matching_skill: "匹配 Skill",
+  integrating: "跨仓库整合",
+  inspecting: "读代码取证",
+  summarizing: "汇总结论",
+  done: "完成"
+}
+
+export const SURVEY_TRIGGER_LABEL: Record<string, string> = {
+  schedule: "定时触发",
+  manual: "手动触发"
+}
+
+export const SCHEDULE_KIND_LABEL: Record<string, string> = {
+  daily: "每天",
+  weekly: "每周",
+  monthly: "每月",
+  cron: "自定义 cron"
+}
+
+/** 索引 0 对应星期一，与 schedule_expr 里 1..7 的取值一一对应 */
+export const WEEKDAY_OPTIONS = [
+  { value: 1, label: "周一" },
+  { value: 2, label: "周二" },
+  { value: 3, label: "周三" },
+  { value: 4, label: "周四" },
+  { value: 5, label: "周五" },
+  { value: 6, label: "周六" },
+  { value: 7, label: "周日" }
+]
+
+export const CATEGORY_LABEL: Record<string, string> = {
+  correctness: "正确性",
+  security: "安全",
+  cross_repo: "跨仓库不一致",
+  architecture: "架构与耦合",
+  performance: "性能",
+  maintainability: "可维护性",
+  dependency: "依赖",
+  convention: "规范与风格"
+}
+
+export const FINDING_STATE_LABEL: Record<string, string> = {
+  new: "新增",
+  persisted: "仍存在",
+  resolved: "已消失"
+}
+
+export const FINDING_STATE_TAG: Record<string, TagType> = {
+  new: "danger",
+  persisted: "warning",
+  resolved: "success"
+}
+
+export const SURVEY_REPO_STATUS_LABEL: Record<string, string> = {
+  ok: "正常",
+  fetch_failed: "拉取失败",
+  index_failed: "索引失败"
+}
+
+export const PROFILE_KIND_LABEL: Record<string, string> = {
+  codegraph: "结构图（含接口与类型）",
+  manifest: "依赖清单级（退化）"
+}
+
+/**
+ * 巡检降级的解释文案。
+ *
+ * 与 MR 审查的降级一样：降级**不代表运行失败**，而是「跑完了，但产出质量受损」。
+ * 这些说法集中放在这里，避免在多个页面各写一遍后逐渐漂移。
+ */
+export const SURVEY_DEGRADATION_LABEL: Record<string, string> = {
+  repo_fetch_failed: "仓库拉取失败（该仓库未参与本次分析）",
+  index_failed: "代码索引失败（该仓库画像退化为依赖清单级）",
+  budget_exhausted: "预算耗尽提前收工（部分关注点未取证）",
+  profile_fallback: "codegraph 不可用（全部画像退化为依赖清单级）"
+}
+
+/** 口径解释，集中放置避免各页面漂移 */
+export const SURVEY_NOTES = {
+  stateDiff:
+    "巡检每次分析的都是全量代码，因此逐轮产出高度重合。报告默认按「新增」优先呈现——只看新增才是有效的信噪比。",
+  resolvedNotStored:
+    "「已消失」指上一次巡检有、本次没有检出的问题，它由指纹比对算出，库里没有对应记录。",
+  guestScope:
+    "游客能看到巡检的运行状态与聚合统计，但看不到发现正文与整体结论——巡检正文描述的是整个代码库的架构与弱点。",
+  candidatePool:
+    "勾选决定的是**候选池**：勾中的 skill 才有资格参与，但仍要由 AI 按仓库画像匹配，未匹配到的不会执行。",
+  workspaceKept:
+    "删除巡检不会连带删除本地工作区——那可能是几十 GB 代码，且删除不可逆。工作区清理是单独的动作。"
+}

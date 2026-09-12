@@ -1,6 +1,8 @@
 # OpenCR
 
-自动代码审查服务：接收 GitLab MR Webhook，调用大模型审查代码变更，并把结果写回 MR。
+自动代码审查服务。两条彼此独立的审查链路：
+接收 GitLab MR Webhook、审查一次变更并把结果写回 MR（ReviewRun）；
+按周期拉取整组仓库的全量代码、做跨仓库整合分析并留档（SurveyRun）。
 本文件是术语表，只定义概念，不含任何实现细节。
 
 ## Language
@@ -31,12 +33,44 @@ _Avoid_: Source、来源
 _Avoid_: 审查策略、Strategy
 
 **Skill / 审查技能**：
-一组针对特定场景的审查规则，由 AI 依据变更的文件路径与内容自动匹配。未匹配到 Skill 的审查分支会被跳过。
+一组针对特定场景的审查规则，由 AI 自动匹配，未匹配到 Skill 的审查分支会被跳过。
+匹配依据随场景而变：MR 审查看变更的文件路径与内容，定期巡检没有变更可看，改看仓库画像（语言构成与依赖清单）。
+Survey 上的勾选决定的是**候选池**而非执行清单——勾中不等于必然执行，仍要过 AI 匹配这一关。
 _Avoid_: Rule、规则集、Prompt 模板
 
 **Phase / 阶段**：
 ReviewRun 内部的进度刻度。overall 模式是单次模型调用，没有百分比可言，阶段是两种 ReviewMode 唯一的公共进度语言。
 _Avoid_: Step、Stage、进度
+
+### 定期巡检
+
+**Survey / 巡检**：
+一份定期执行的全量代码审查配置：一组仓库（或仓库组织）、一个执行周期、一组参与分析的 Skill。
+它是配置，不是执行——"巡检跑了没有"的主语是 SurveyRun。
+_Avoid_: 任务、Task、Job、扫描
+
+**SurveyRun / 巡检运行**：
+一次 Survey 的执行实例。与 ReviewRun 并列而非从属：
+ReviewRun 由 MR 事件驱动、审查一次变更；SurveyRun 由时间驱动、审查全量代码。
+两者产出的都是 Finding，但 SurveyRun 的 Finding 永远不 Trackable——
+它不依附于任何 MR discussion，因此不参与 Verdict 与 Coverage 的统计，两类产出分表存放。
+_Avoid_: 巡检任务、扫描任务
+
+**Workspace / 工作区**：
+一个 Survey 在本地持有的仓库副本集合。每次 SurveyRun 前重置并拉取到最新。
+它是执行的副产物，不是数据——删除 Workspace 不影响任何已产出的 Finding。
+_Avoid_: 缓存、仓库目录
+
+**Profile / 仓库画像**：
+从一个仓库确定性提取出的结构摘要（依赖清单、目录结构、符号与调用关系、路由表），不含模型判断。
+它存在的唯一理由是全量代码进不了模型上下文，必须先降维才能做跨仓库的整合分析。
+_Avoid_: 索引、摘要、Summary
+
+**Category / 问题类别**：
+Finding 的固定分类枚举。它不是描述性标签，而是**指纹的组成部分**——
+巡检每周对同一份代码重跑，靠 `仓库 + 文件路径 + Category` 判定"这条是不是上次那条"。
+因此它必须是闭集：模型只能从枚举里选，不能自由发挥。
+_Avoid_: 标签、Tag、类型
 
 ### 审查产出
 
@@ -87,7 +121,9 @@ _Avoid_: 用户、User、Owner、Root
 _Avoid_: 访客账号、Viewer、Reader、匿名用户
 
 **Guest 可见范围**：
-Guest 能看到审查的**状态与聚合统计**，看不到 Finding 正文。
+Guest 能看到审查的**状态与聚合统计**，看不到 Finding 正文。这条边界对 ReviewRun 与 SurveyRun 一视同仁。
+巡检结果是否对 Guest 开放另有一个独立开关（默认开启），但开启后正文依然剔除——
+开关控制的是"看不看得到这个模块"，不是"看不看得到正文"。
 这条边界的依据是：Finding 正文包含 AI 对私有仓库代码的具体描述（文件、行号、问题与修复建议），
 而"让同事看看审查跑得怎么样"并不需要这些内容。
 _Avoid_: 只读权限、Read-only（这两个词会让人以为 Guest 能读全部内容）
@@ -95,8 +131,9 @@ _Avoid_: 只读权限、Read-only（这两个词会让人以为 Guest 能读全�
 ### 运行状态
 
 **Degradation / 降级**：
-ReviewRun 流程成功完成、但产出质量受损的情况，例如 diff 被截断、行内评论投递失败后降级、Skill 脚本执行失败。
-Degradation 与失败正交：一次 ReviewRun 可以既成功又带有多条 Degradation。
+流程成功完成、但产出质量受损的情况。ReviewRun 的例子：diff 被截断、行内评论投递失败后降级、Skill 脚本执行失败。
+SurveyRun 的例子：某个仓库拉取失败被跳过、codegraph 缺失导致画像退化、预算耗尽提前收工。
+Degradation 与失败正交：一次运行可以既成功又带有多条 Degradation。
 _Avoid_: 警告、Warning、部分失败
 
 **Stale / 疑似中断**：

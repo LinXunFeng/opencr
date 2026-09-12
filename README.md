@@ -16,8 +16,9 @@ Language: English | [中文](https://github.com/LinXunFeng/opencr/blob/main/READ
 4. [Installation](#installation)
 5. [GitLab Configuration](#gitlab-configuration)
 6. [Admin Console](#admin-console)
-7. [Operations and Maintenance](#operations-and-maintenance)
-8. [Troubleshooting](#troubleshooting)
+7. [Scheduled Surveys](#scheduled-surveys)
+8. [Operations and Maintenance](#operations-and-maintenance)
+9. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -59,9 +60,15 @@ opencr/
 ├── backend/                # Backend source (Python package)
 │   ├── review_server.py    # Flask routing and thread scheduling
 │   ├── wsgi.py             # WSGI production entry
-│   ├── review/             # Review execution, settlement, GitLab client
+│   ├── review/             # MR review pipeline: execution, settlement, GitLab client
 │   │   ├── runner.py       # Unified ReviewRun entry point
 │   │   └── settlement.py   # Acceptance verdict logic
+│   ├── survey/             # Scheduled survey pipeline: fetch, profile, cross-repo analysis
+│   │   ├── runner.py       # Unified SurveyRun entry point
+│   │   ├── scheduler.py    # Scheduler thread (its own lease)
+│   │   ├── workspace.py    # Repository fetching and workspace management
+│   │   ├── profile.py      # Repository profiles (codegraph integration)
+│   │   └── crossrepo.py    # Cross-repository endpoint linking
 │   ├── storage/            # Persistence (SQLAlchemy)
 │   ├── migrations/         # Alembic migration scripts
 │   ├── alembic.ini         # Migration config
@@ -73,6 +80,7 @@ opencr/
 ├── backend/                # Copied source
 ├── skills/                 # Copied skills for auto skill routing
 ├── data/                   # SQLite database (review history and acceptance stats)
+├── workspaces/             # Survey workspaces (repo copies; can use a lot of disk)
 ├── logs/                   # Log directory
 ├── venv/                   # Python virtual environment
 ├── config.yaml             # Runtime configuration file
@@ -94,12 +102,40 @@ opencr/
        └────────────────  MR Comment <──────────────────────────┘
 ```
 
+The service runs **two independent review pipelines**:
+
+```text
+Event-driven (MR review)
+┌─────────────┐     Webhook      ┌─────────────────┐     ┌─────────────┐
+│   GitLab    │ ───────────────> │  Review Server  │ --> │ OpenAI API  │
+└─────────────┘  <── MR comment  └─────────────────┘     └─────────────┘
+
+Time-driven (scheduled survey)
+┌───────────┐   due   ┌──────────┐  git fetch  ┌───────────┐  profile  ┌─────────────┐
+│ Scheduler │ ──────> │ SurveyRun│ ──────────> │ Workspace │ ────────> │ Integration │
+└───────────┘         └──────────┘             └───────────┘           └─────────────┘
+                                                                              │
+                                              Console report / Markdown <─────┘
+```
+
 ### Workflow
+
+**MR review**
 
 1. Developer creates or updates an MR and GitLab sends a Webhook event.
 2. Review Server receives the event and fetches MR diff content.
 3. The service calls the OpenAI API to review the code changes.
 4. Review results are posted back to the MR as comments.
+
+**Scheduled survey**
+
+1. The scheduler thread finds a survey that is due.
+2. Each repository is fetched to its latest state (shallow clone first time; local
+   changes are reset and the repository is updated incrementally afterwards).
+3. A structural profile is built per repository (manifests, routes, type skeleton).
+4. All profiles enter a single integration step together, producing focus points.
+5. Real source code is read for each focus point to produce findings.
+6. Results are compared with the previous run and reported as new / persisting / resolved.
 
 ---
 
@@ -312,6 +348,7 @@ The full trade-off is recorded in [ADR-0002](./docs/adr/0002-guest-read-scope.md
 | Findings | Cross-run finding list, filter by project / verdict / severity / window | ✅ (no bodies) |
 | Statistics | Acceptance analysis (rate, coverage, by delivery) and error analysis | ✅ |
 | Skills | Loaded skills and their recent hit counts | ✅ |
+| Surveys | Survey configuration, run history and reports | Configurable (default ✅, no bodies) |
 | Settings | Effective configuration (secrets shown only as "set") and the writable subset | ❌ |
 
 ### Read these definitions before reading the numbers
@@ -370,6 +407,111 @@ produces it:
   "build output missing" message. Install Node and re-run `./install.sh` to enable it.
 
 So changing the front end means committing **source only**. See [`web/README.md`](./web/README.md).
+
+---
+
+---
+
+## Scheduled Surveys
+
+MR review only sees a single change. **Scheduled surveys** cover the other half: on a schedule,
+the whole source of a group of repositories is fetched locally and analysed together. The value
+it adds is finding what single-repository review cannot see — frontend and backend field names
+that disagree, duplicated implementations, conflicting dependency versions.
+
+### Configuring a survey
+
+Admin console → Surveys → Survey configuration → New survey. Four things matter:
+
+| Field | Notes |
+|-------|-------|
+| Schedule | Daily / weekly / monthly plus a time, or a raw cron expression. **Check the time zone** — containers default to UTC, so "Monday 9am" silently becomes something else |
+| Sources | A repository URL (branch optional; empty means that repository's default branch), or an organisation |
+| Skills | Checkboxes, all selected by default |
+| Delete workspace afterwards | Off by default. Keeping it lets the next run fetch incrementally; deleting it means a full clone next time |
+
+**Organisations are expanded at run time**, not when you save. Repositories added to the
+organisation are therefore picked up by the next run automatically. Exclude patterns exist so a
+single large repository pushed into the organisation cannot add an hour to every run.
+
+**Checking a skill defines the candidate pool, not the execution list.** Only checked skills are
+eligible, but the AI still matches them against each repository profile (languages and manifests).
+A pure Dart repository will not be reviewed by the `ts` skill — that only produces invented problems.
+
+### Reading a report
+
+A survey analyses the **whole codebase** every time, so consecutive runs overlap heavily: 80
+findings the first week, the same 80 plus a few new ones the next. Reports are therefore split
+into three sections, opening on "new":
+
+- **New** — absent last time, present now
+- **Persisting** — present in both runs
+- **Resolved since last run** — present last time, not detected now
+
+Matching is done on a fingerprint of `repository + file path + category`, and deliberately
+**excludes the body text**: the model never words the same problem identically twice, so including
+it would mark every finding as new on every run.
+
+Findings you do not want to see again can be marked as known issues; later runs will not report them.
+
+Reports can be exported as Markdown. The export renders the same data as the console, so a guest
+export contains no bodies either.
+
+### codegraph (installed by default)
+
+A survey has to reduce whole-repository source into a structural digest before a model can see it —
+measured at 5.69M characters of source for three medium repositories versus roughly 430K for the
+combined profile. [codegraph](https://github.com/colbymchenry/codegraph) provides the routes and
+type-skeleton layer of that digest, and the language breakdown that skill matching relies on.
+
+**Both deployment paths install it by default**, pinned to `v1.6.0`:
+
+- `install.sh` downloads it into `~/.codegraph` and writes the **absolute path** into
+  `survey.codegraph_bin`
+- Docker bakes it into the image at build time
+
+Installation runs `codegraph telemetry off` afterwards: telemetry is on by default, and the typical
+deployment for this service sits next to a self-signed intranet GitLab where an unexplained outbound
+connection does not belong.
+
+> Its bundle is around 57MB and fetching it from GitHub Releases can be slow (measured at
+> 30–116 KB/s). The installer uses HTTP/1.1 with resume and retries and verifies archive integrity
+> before extracting — the official one-liner neither resumes nor retries and was observed failing
+> outright after more than twenty minutes.
+
+**A failed install does not abort the installation.** `install.sh` warns and continues; Docker builds
+can skip it explicitly with `--build-arg CODEGRAPH_VERSION=`. Surveys then still run, profiles
+degrade to manifest level and a degradation is recorded — the analysis knows which files exist but
+not which endpoints or types do.
+
+`survey.codegraph_bin` holds an absolute path rather than the bare name because **launchd's PATH does
+not include `~/.local/bin`**: a bare name would leave the service unable to find it, showing up as
+every survey silently degrading. Adjust this entry if you install it elsewhere.
+
+**Index each repository separately; never put several repositories into one graph.** This is not a
+style preference: codegraph does not index external dependencies, so unresolved symbols are linked
+by name to any same-named node in the workspace — across languages included. Three unrelated
+repositories indexed together produced 824 cross-repository edges, **all of them wrong**. Full
+evidence is in [`docs/adr/0003-per-repo-codegraph-index.md`](docs/adr/0003-per-repo-codegraph-index.md).
+
+### Disk and budget
+
+- **Workspaces get large.** Full clones of several repositories easily reach tens of GB. They live
+  under `~/opencr/workspaces` by default; `survey.workspace_dir` moves them elsewhere. Deleting a
+  workspace loses no data, it only forces a full clone next time.
+- **Deleting a survey does not delete its workspace.** Removing tens of GB of code as a side effect
+  of a mis-click is not reversible, so workspace cleanup is a separate action in the console.
+- **Every run has a hard budget** (wall clock, integration input size, number of focus points).
+  Hitting it is a degradation, not a failure — whatever was produced is kept, and the report says
+  the budget ran out.
+
+### Deliberate behaviours
+
+- **Missed windows are not made up.** If the service was down across the scheduled time, the run is
+  skipped and rescheduled. Making up a full-codebase analysis costs money and helps no one.
+- **No concurrency.** If the previous run is still going when the next one is due, the tick is skipped.
+- **One failed repository does not fail the run.** A degradation is recorded and the remaining
+  repositories are analysed; only when **every** repository fails is the run marked failed.
 
 ---
 
