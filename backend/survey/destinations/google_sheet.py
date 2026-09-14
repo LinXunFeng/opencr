@@ -10,6 +10,7 @@ Google Sheet 输出目标。
 前者在批量更新时仍要自己拼范围，后者体积大、依赖多，而这里总共只用到五个接口。
 """
 
+import getpass
 import json
 import logging
 import re
@@ -21,8 +22,12 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
 from .base import (
+    CHECK_ERROR,
+    CHECK_OK,
+    CHECK_WARN,
     COLUMN_DATETIME,
     COLUMN_NUMBER,
+    CheckItem,
     Column,
     Destination,
     DestinationError,
@@ -50,6 +55,11 @@ MAX_ATTEMPTS = 5
 RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 
 REQUEST_TIMEOUT_SECONDS = 60
+
+# 连通性测试是用户在表单里点按钮同步等结果，不能套用推送的退避策略（最坏要等一分多钟）。
+# 只重试一次、超时缩短：测试的职责是尽快告诉用户哪里不对，偶发的限流让他再点一次即可。
+CHECK_ATTEMPTS = 2
+CHECK_TIMEOUT_SECONDS = 15
 
 _SPREADSHEET_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{20,}$")
 _SPREADSHEET_URL_PATTERN = re.compile(r"/spreadsheets/d/([A-Za-z0-9_-]+)")
@@ -96,6 +106,38 @@ def parse_spreadsheet_id(value: str) -> str:
     if not _SPREADSHEET_ID_PATTERN.match(raw):
         raise ValueError("无法识别的表格 ID，请填写表格链接或链接中 /d/ 与 /edit 之间的那一段")
     return raw
+
+
+class CredentialsRejected(DestinationError):
+    """Google 拒绝为服务账号签发访问令牌。与网络故障分开：重试没有意义，排查方向也完全不同。"""
+
+
+def _is_credentials_rejection(error: Exception) -> bool:
+    """是否为换取访问令牌时被拒（google-auth 的 RefreshError）。按类名判断，避免未安装 google-auth 时导入失败。"""
+    return any(cls.__name__ == "RefreshError" for cls in type(error).__mro__)
+
+
+def _missing_credentials_message(raw: str, path: Path) -> str:
+    """
+    密钥文件找不到时的报错。
+
+    "路径明明是对的"几乎总是下面两种情况之一，报错里直接点出来，省得用户去翻代码：
+    - 服务运行在容器里，宿主机路径在容器内不存在；
+    - 服务没装 PyYAML，简化解析器不会去掉行内注释，读到的值里带着引号或 # 注释。
+    """
+    try:
+        user = getpass.getuser()
+    except Exception:
+        user = "未知"
+    message = f"服务账号密钥文件不存在：{path}（配置原始值 {raw!r}，服务运行用户 {user}）"
+    hints = []
+    if any(mark in raw for mark in ('"', "'", "#")):
+        hints.append("配置值里带有引号或 # 注释，请删掉这一行的行内注释")
+    if Path("/.dockerenv").exists():
+        hints.append("服务运行在容器内，需要把宿主机上的密钥文件挂载进容器，并在这里填写容器内的路径")
+    if hints:
+        message += "。" + "；".join(hints)
+    return message
 
 
 def _cell_value(column: Column, value: Any) -> Any:
@@ -204,9 +246,10 @@ class GoogleSheetDestination(Destination):
         except ImportError:
             raise DestinationError("缺少依赖 google-auth，请执行 pip install -r requirements.txt")
 
-        path = Path(str(self.options.get("credentials_file") or "")).expanduser()
+        raw = str(self.options.get("credentials_file") or "")
+        path = Path(raw).expanduser()
         if not path.is_file():
-            raise DestinationError(f"服务账号密钥文件不存在：{path}")
+            raise DestinationError(_missing_credentials_message(raw, path))
         try:
             credentials = service_account.Credentials.from_service_account_file(str(path), scopes=SCOPES)
         except (ValueError, OSError) as e:
@@ -215,22 +258,33 @@ class GoogleSheetDestination(Destination):
         self._session = AuthorizedSession(credentials)
         return self._session
 
-    def _call(self, method: str, url: str, params: Optional[dict] = None, body: Optional[dict] = None) -> dict:
+    def _call(
+        self,
+        method: str,
+        url: str,
+        params: Optional[dict] = None,
+        body: Optional[dict] = None,
+        attempts: int = MAX_ATTEMPTS,
+        timeout: int = REQUEST_TIMEOUT_SECONDS,
+    ) -> dict:
         """发一次请求；429 与 5xx 退避重试，其余错误转成可读的 DestinationError。"""
         session = self._get_session()
-        for attempt in range(MAX_ATTEMPTS):
+        for attempt in range(attempts):
             try:
-                response = session.request(
-                    method, url, params=params, json=body, timeout=REQUEST_TIMEOUT_SECONDS
-                )
+                response = session.request(method, url, params=params, json=body, timeout=timeout)
             except Exception as e:
+                if _is_credentials_rejection(e):
+                    raise CredentialsRejected(
+                        f"Google 拒绝了服务账号凭据（{e}）。常见原因：密钥已被删除或服务账号已停用、"
+                        "密钥文件不是这个服务账号的最新密钥、服务器时钟偏差过大"
+                    )
                 # 网络抖动与 5xx 同等对待：本次推送失败的代价是整张台账晚一周更新
-                if attempt < MAX_ATTEMPTS - 1:
+                if attempt < attempts - 1:
                     self._sleep(min(2 ** attempt, 32))
                     continue
                 raise DestinationError(f"无法连接 Google Sheets：{e}")
 
-            if response.status_code in RETRYABLE_STATUS and attempt < MAX_ATTEMPTS - 1:
+            if response.status_code in RETRYABLE_STATUS and attempt < attempts - 1:
                 delay = min(2 ** attempt, 32)
                 retry_after = response.headers.get("Retry-After") if response.headers else None
                 if retry_after and str(retry_after).isdigit():
@@ -260,6 +314,80 @@ class GoogleSheetDestination(Destination):
         if status == 404:
             return f"表格不存在，或{who}无权访问（{message}）"
         return f"Google Sheets 返回 {status}：{message}"
+
+    # ------------------------------------------------------------------
+    # 连通性测试
+    # ------------------------------------------------------------------
+
+    def check(self, target: Dict[str, str], columns: Sequence[Column]) -> List[CheckItem]:
+        """依次检查：凭据 → 读取表格 → 工作表与表头 → 写入权限。不创建工作表，不写任何台账行。"""
+        items: List[CheckItem] = []
+        try:
+            self._get_session()
+        except DestinationError as e:
+            return [CheckItem("服务账号凭据", CHECK_ERROR, str(e))]
+        who = self._client_email or "服务账号"
+        items.append(CheckItem("服务账号凭据", CHECK_OK, f"已通过 {who} 访问 Google，表格需要以「编辑者」身份共享给它"))
+
+        base = f"{API_BASE}/{quote(target['spreadsheet'], safe='')}"
+        call = {"attempts": CHECK_ATTEMPTS, "timeout": CHECK_TIMEOUT_SECONDS}
+        try:
+            meta = self._call(
+                "GET", base, params={"fields": "properties.title,sheets.properties(sheetId,title)"}, **call
+            )
+        except CredentialsRejected as e:
+            # 密钥文件能解析不代表凭据有效，第一次真正请求时才会去换令牌
+            items[0] = CheckItem("服务账号凭据", CHECK_ERROR, str(e))
+            return items
+        except DestinationError as e:
+            items.append(CheckItem("读取表格", CHECK_ERROR, str(e)))
+            return items
+        title = (meta.get("properties") or {}).get("title") or ""
+        items.append(CheckItem("读取表格", CHECK_OK, f"表格「{title}」可以访问"))
+
+        worksheet = target["worksheet"]
+        titles = [(s.get("properties") or {}).get("title") for s in meta.get("sheets") or []]
+        if worksheet not in titles:
+            items.append(CheckItem("工作表", CHECK_WARN, f"工作表「{worksheet}」不存在，首次推送时会自动创建"))
+        else:
+            try:
+                data = self._call(
+                    "GET", f"{base}/values/{quote(quote_sheet_title(worksheet) + '!1:1', safe='')}", **call
+                )
+            except DestinationError as e:
+                items.append(CheckItem("工作表", CHECK_ERROR, str(e)))
+                return items
+            headers = {str(v).strip() for v in ((data.get("values") or [[]])[0] or [])}
+            present = [c.header for c in columns if c.header in headers]
+            if len(present) == len(columns):
+                message = f"工作表「{worksheet}」已存在，系统列齐全"
+            elif present:
+                missing = "、".join(c.header for c in columns if c.header not in headers)
+                message = (
+                    f"工作表「{worksheet}」已存在，已有 {len(present)}/{len(columns)} 个系统列；"
+                    f"缺少的（{missing}）会在首次推送时补在现有表头之后"
+                )
+            elif headers:
+                message = f"工作表「{worksheet}」已存在但没有任何系统列，推送时会把系统列补在现有表头之后"
+            else:
+                message = f"工作表「{worksheet}」已存在且是空表，首次推送时写入表头"
+            items.append(CheckItem("工作表", CHECK_OK, message))
+
+        try:
+            # 用"把表格标题改成它自己"验证写权限：这是一次真实的写请求，查看者会被拒绝，
+            # 但表格内容与标题都不变。只读 GET 证明不了能写，而写一行再删掉会在用户的表里留下痕迹。
+            self._call(
+                "POST", f"{base}:batchUpdate",
+                body={"requests": [{"updateSpreadsheetProperties": {
+                    "properties": {"title": title}, "fields": "title",
+                }}]},
+                **call,
+            )
+        except DestinationError as e:
+            items.append(CheckItem("写入权限", CHECK_ERROR, str(e)))
+            return items
+        items.append(CheckItem("写入权限", CHECK_OK, "可以写入"))
+        return items
 
     # ------------------------------------------------------------------
     # 推送

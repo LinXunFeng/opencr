@@ -165,6 +165,20 @@ export interface DestinationTargetField {
   help: string
 }
 
+/** 连通性测试的一项结论。warn 表示能用但有需要知道的事（例如工作表会在首次推送时自动创建） */
+export interface DestinationCheckItem {
+  title: string
+  level: "ok" | "warn" | "error"
+  message: string
+}
+
+export interface DestinationCheckResult {
+  ok: boolean
+  /** 规整后的目标位置（例如表格链接已解析成 ID） */
+  target: Record<string, string>
+  items: DestinationCheckItem[]
+}
+
 /** config.yaml 里配置的一个输出目标实例 */
 export interface DestinationItem {
   name: string
@@ -450,5 +464,17 @@ export function pushSurveyRunApi(runUid: string, bindingId?: number | null) {
     url: `survey-runs/${runUid}/push`,
     method: "post",
     data: bindingId ? { binding_id: bindingId } : {}
+  })
+}
+
+/**
+ * 连通性测试：用表单里尚未保存的目标位置检查输出目标是否可用。
+ * 不会写入任何台账行；测试失败也以 200 返回检查项，失败是测试的正常结论。
+ */
+export function checkDestinationApi(name: string, target: Record<string, string>, surveyName: string) {
+  return request<DestinationCheckResult>({
+    url: `destinations/${encodeURIComponent(name)}/check`,
+    method: "post",
+    data: { target, survey_name: surveyName }
   })
 }

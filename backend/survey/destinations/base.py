@@ -25,6 +25,12 @@ COLUMN_DATETIME = "datetime"
 COLUMN_NUMBER = "number"
 COLUMN_URL = "url"
 
+# --- CheckItem.level ----------------------------------------------------
+CHECK_OK = "ok"
+# warn 表示"能用，但有需要知道的事"，例如工作表不存在、首次推送时会自动创建
+CHECK_WARN = "warn"
+CHECK_ERROR = "error"
+
 
 class DestinationError(Exception):
     """推送过程中的可预期错误。消息会原样展示给 Admin，措辞要能直接指导排查。"""
@@ -93,6 +99,19 @@ class PushStats:
         return {"updated": self.updated, "inserted": self.inserted, "skipped": self.skipped}
 
 
+@dataclass
+class CheckItem:
+    """连通性测试的一项结论。message 直接展示给 Admin，要能指导下一步操作。"""
+
+    title: str
+    level: str
+    message: str
+
+    def to_dict(self) -> dict:
+        """接口数据。"""
+        return {"title": self.title, "level": self.level, "message": self.message}
+
+
 class Destination(ABC):
     """
     一种 Destination 类型的实现。实例对应 config.yaml 里 `destinations` 下的一项。
@@ -139,6 +158,15 @@ class Destination(ABC):
             if value:
                 parts.append(f"{item.label}：{value}")
         return " / ".join(parts)
+
+    def check(self, target: Dict[str, str], columns: Sequence[Column]) -> List[CheckItem]:
+        """
+        连通性测试：凭据能否加载、目标位置能否读写。**不得写入任何台账行。**
+
+        遇到第一个致命问题就返回，后续检查依赖前面的结论，继续做只会堆出一串同源的报错。
+        可选实现：不支持的类型返回一条 warn，推送本身不受影响。
+        """
+        return [CheckItem("连通性测试", CHECK_WARN, f"{self.label or self.type_name} 暂不支持连通性测试")]
 
     @abstractmethod
     def push(self, target: Dict[str, str], columns: Sequence[Column], rows: List[LedgerRow]) -> PushStats:

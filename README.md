@@ -480,7 +480,7 @@ destinations:
 
 Google Sheet authenticates with a service account: enable the Google Sheets API in Google Cloud, create a service account, download its JSON key, and **share the spreadsheet with the service account's email as an Editor**. In Docker, mount the key file into the container (there is a commented example in `docker-compose.yml`) and point `credentials_file` at the in-container path.
 
-**2. Bind it in the survey configuration.** Edit survey → Destinations → pick an instance, then enter the spreadsheet link (or ID) and worksheet name. A missing worksheet is created automatically; an empty name defaults to the survey name. A survey can bind several destinations, and several surveys can share one worksheet (the "巡检" column tells them apart).
+**2. Bind it in the survey configuration.** Edit survey → Destinations → pick an instance, then enter the spreadsheet link (or ID) and worksheet name. A missing worksheet is created automatically; an empty name defaults to the survey name. A survey can bind several destinations, and several surveys can share one worksheet (the "巡检" column tells them apart). Click "测试连通性" (test connectivity) to check, in order, that the service account key loads, the spreadsheet is readable, the worksheet and its existing system columns, and write access; the service account email is shown so you know whom to share the sheet with. The test never creates a worksheet or writes ledger rows.
 
 **3. When pushes happen.** After a run **succeeds** (with or without degradations) it is pushed automatically; failed runs are not pushed. The report of the latest successful run offers a manual re-push. A failed push is recorded on the push itself and **never changes the run's status or counts as a degradation**.
 
@@ -498,7 +498,7 @@ Rules worth knowing:
 - Values are written as raw text, so a body starting with `=` is never evaluated as a formula.
 - **Pushing hands over control of who can read finding bodies**: that is decided by the spreadsheet's sharing settings, not by the guest switches. Guests in the console see push status but not the target location or error messages.
 
-**Adding a platform**: implement `Destination` from `backend/survey/destinations/base.py` and register it in `backend/survey/destinations/__init__.py`. The core already computes each row's content and state; a plugin only writes rows by key. To judge whether a platform fits, ask three questions: can it look up existing rows by key, can it write in batches, and how strict are its rate limits.
+**Adding a platform**: implement `Destination` from `backend/survey/destinations/base.py` and register it in `backend/survey/destinations/__init__.py`. The core already computes each row's content and state; a plugin only writes rows by key. Implementing `check` is optional and powers the console's connectivity test. To judge whether a platform fits, ask three questions: can it look up existing rows by key, can it write in batches, and how strict are its rate limits.
 
 ### codegraph (installed by default)
 

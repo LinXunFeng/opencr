@@ -13,8 +13,10 @@
 - 推送只覆盖按表头名称定位的系统列，用户在表里加的列从不读写；缺失的系统列补在现有表头之后。用户删掉的行只有状态仍为「存在」时才会补回，新绑定的表第一次推送写入完整台账。写入一律使用 RAW，模型产出的以 `=` 开头的正文不会被当成公式执行。
 - 巡检成功结束后自动推送到全部绑定；报告页可对最近一次成功的运行手动重推（仅管理员，`guest_retry` 不放开它）。同一绑定已有进行中的推送时拒绝新的推送，进行中超过 15 分钟的记录视为中断、不再阻塞。
 - 标记「不再提醒」时，台账里对应的行立即变为「已忽略」；取消忽略不会把它改回「存在」，要等后续巡检给出证据。
+- 巡检配置的输出目标支持「测试连通性」：用尚未保存的目标位置依次检查服务账号凭据、读取表格、工作表与已有系统列、写入权限，并显示服务账号邮箱。测试不创建工作表、不写入台账行；写权限通过把表格标题设为原值的写请求验证。测试只重试一次、超时 15 秒，不套用推送的退避策略。
+- 服务账号密钥文件不存在时，报错会附上配置原始值与服务运行用户，并在值里带引号或 `#` 注释、或服务运行在容器内时给出对应提示。
 - 新增 `server.public_url` 配置，用于在台账里生成运行详情链接；留空时不输出链接列。
-- 新增 `GET /api/admin/destinations`、`POST /api/admin/survey-runs/<run_uid>/push` 接口；巡检配置接口支持 `bindings` 字段，运行详情接口新增 `pushes` 与 `pushable`。
+- 新增 `GET /api/admin/destinations`、`POST /api/admin/destinations/<name>/check`、`POST /api/admin/survey-runs/<run_uid>/push` 接口；巡检配置接口支持 `bindings` 字段，运行详情接口新增 `pushes` 与 `pushable`。
 - 新增 `survey_ledger`、`survey_binding`、`survey_push` 三张表与配套 Alembic 迁移。
 - 新增架构决策记录 `docs/adr/0004-survey-ledger-mirrored-to-destinations.md`。
 

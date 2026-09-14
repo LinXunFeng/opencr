@@ -28,7 +28,7 @@ from ..survey.common import SurveyError, slugify
 from ..survey.config import load_public_url, load_survey_config
 from ..survey.destinations import DESTINATION_TYPES, list_destination_types, load_destinations
 from ..survey.profile import codegraph_available
-from ..survey.push import PushRejected, begin_pushes, execute_pushes_in_background
+from ..survey.push import PushRejected, begin_pushes, check_destination, execute_pushes_in_background
 from ..survey.report import render_run_markdown
 from ..survey.schedule import describe_schedule, next_fire_time
 from ..survey.scheduler import trigger_survey_now
@@ -685,6 +685,23 @@ def api_destinations():
             }
         )
     return jsonify({"items": items, "types": list(types.values()), "public_url": load_public_url()})
+
+
+@admin_bp.route("/api/admin/destinations/<name>/check", methods=["POST"])
+@require_admin
+def api_check_destination(name: str):
+    """
+    连通性测试。body：{"target": {...}, "survey_name": "..."}，目标位置用表单里尚未保存的值。
+
+    检查结果（包括失败）一律以 200 返回检查项：失败是测试的正常结论，不是接口错误。
+    只有 Admin 能调：它会用服务账号访问用户填写的任意表格，并发起一次不改变内容的写请求。
+    """
+    payload = request.get_json(silent=True) or {}
+    target = payload.get("target") if isinstance(payload.get("target"), dict) else {}
+    survey_name = str(payload.get("survey_name") or "").strip()
+    result = check_destination(name, target, survey_name)
+    logger.info("Admin checked destination %s: ok=%s", name, result["ok"])
+    return jsonify(result)
 
 
 @admin_bp.route("/api/admin/surveys", methods=["GET"])

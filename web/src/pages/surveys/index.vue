@@ -1,6 +1,7 @@
 <script lang="ts" setup>
-import type { DestinationItem, Survey, SurveyBinding, SurveySource } from "@@/apis/opencr"
+import type { DestinationCheckResult, DestinationItem, Survey, SurveyBinding, SurveySource } from "@@/apis/opencr"
 import {
+  checkDestinationApi,
   clearSurveyWorkspaceApi,
   createSurveyApi,
   deleteSurveyApi,
@@ -24,6 +25,9 @@ const destinations = ref<DestinationItem[]>([])
 interface BindingForm {
   destination: string
   target: Record<string, string>
+  /** 以下两项只在界面上使用，保存时不提交 */
+  checking?: boolean
+  check?: DestinationCheckResult | null
 }
 
 const dialogVisible = ref(false)
@@ -180,7 +184,27 @@ function removeBinding(index: number) {
 /** 换了实例就清空目标位置：不同类型的字段含义不同，沿用旧值只会得到一个看起来合法的错误位置 */
 function onDestinationChange(binding: BindingForm) {
   binding.target = {}
+  binding.check = null
 }
+
+/** 测试结果对应的是点击那一刻的填写内容，改了之后旧结论就不再成立，直接清掉免得误读 */
+function onTargetInput(binding: BindingForm) {
+  binding.check = null
+}
+
+async function checkBinding(binding: BindingForm) {
+  binding.checking = true
+  binding.check = null
+  try {
+    binding.check = await checkDestinationApi(binding.destination, binding.target, form.name.trim())
+  } catch (error) {
+    ElMessage.error((error as Error).message)
+  } finally {
+    binding.checking = false
+  }
+}
+
+const CHECK_ALERT_TYPE = { ok: "success", warn: "warning", error: "error" } as const
 
 /** 实例已从 config.yaml 删除时，原样展示旧的目标位置，保存时原样提交 */
 function describeTarget(target: Record<string, string>) {
@@ -213,7 +237,9 @@ async function save() {
       budget_wall_clock_minutes: form.budget_wall_clock_minutes,
       budget_l2_max_focus: form.budget_l2_max_focus,
       sources,
-      bindings: form.bindings.filter(b => b.destination)
+      bindings: form.bindings
+        .filter(b => b.destination)
+        .map(b => ({ destination: b.destination, target: b.target }))
     }
     if (editingUid.value) {
       await updateSurveyApi(editingUid.value, payload as any)
@@ -485,6 +511,13 @@ onMounted(load)
                     <span v-if="d.error" class="sub">{{ d.error }}</span>
                   </el-option>
                 </el-select>
+                <el-button
+                  link type="primary" :loading="binding.checking"
+                  :disabled="!destinationOf(binding.destination) || !!destinationOf(binding.destination)?.error"
+                  @click="checkBinding(binding)"
+                >
+                  测试连通性
+                </el-button>
                 <el-button link type="danger" @click="removeBinding(index)">
                   移除
                 </el-button>
@@ -496,14 +529,27 @@ onMounted(load)
                 >
                   <span class="field-label">{{ field.label }}</span>
                   <div class="field-input">
-                    <el-input v-model="binding.target[field.key]" :placeholder="field.placeholder" />
+                    <el-input
+                      v-model="binding.target[field.key]" :placeholder="field.placeholder"
+                      @input="onTargetInput(binding)"
+                    />
                     <div v-if="field.help" class="sub">
                       {{ field.help }}
                     </div>
                   </div>
                 </div>
               </template>
-              <div v-else-if="binding.destination" class="sub degraded">
+              <div v-if="binding.check" class="check-result">
+                <el-alert
+                  v-for="(item, i) in binding.check.items" :key="i"
+                  :type="CHECK_ALERT_TYPE[item.level]" :title="item.title" :description="item.message"
+                  :closable="false" show-icon class="check-item"
+                />
+                <div class="sub">
+                  {{ binding.check.ok ? "测试通过。以上检查不会写入任何台账行。" : "测试未通过，按上面的提示处理后可以再测一次。" }}
+                </div>
+              </div>
+              <div v-else-if="binding.destination && !destinationOf(binding.destination)" class="sub degraded">
                 config.yaml 中已没有这个实例，绑定会原样保留，但推送会失败。原目标位置：{{ describeTarget(binding.target) }}
               </div>
             </div>
@@ -622,6 +668,14 @@ onMounted(load)
 
 .field-input {
   flex: 1;
+}
+
+.check-result {
+  margin: 4px 0 8px;
+}
+
+.check-item {
+  margin-bottom: 6px;
 }
 
 .binding-tag {

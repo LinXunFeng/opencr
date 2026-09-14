@@ -13,7 +13,8 @@ from typing import List, Optional
 from ..storage import repo
 from ..storage.models import PUSH_FAILED, PUSH_SUCCEEDED
 from .config import load_public_url
-from .destinations import DestinationError, build_destination
+from .destinations import DESTINATION_TYPES, DestinationError, build_destination
+from .destinations.base import CHECK_ERROR, CheckItem
 from .ledger import build_ledger_rows, ledger_columns
 
 logger = logging.getLogger(__name__)
@@ -26,6 +27,40 @@ class PushRejected(ValueError):
         """构造可直接展示给 Admin 的拒绝原因。"""
         super().__init__(message)
         self.status = status
+
+
+def check_destination(name: str, target: dict, survey_name: str) -> dict:
+    """
+    连通性测试：用表单里尚未保存的目标位置，检查某个 Destination 实例是否可用。
+
+    返回 {"ok": bool, "target": 规整后的目标位置, "items": [检查项...]}。
+    与推送走同一套实例构造与目标位置规整，否则"测试通过、推送失败"会让这个按钮失去意义。
+    """
+    items: List[CheckItem] = []
+    normalized: dict = {}
+    try:
+        destination = build_destination(name)
+    except DestinationError as e:
+        items.append(CheckItem("实例配置", CHECK_ERROR, str(e)))
+    else:
+        try:
+            normalized = DESTINATION_TYPES[destination.type_name].normalize_target(target, survey_name)
+        except ValueError as e:
+            items.append(CheckItem("目标位置", CHECK_ERROR, str(e)))
+        else:
+            public_url = load_public_url()
+            try:
+                items.extend(destination.check(normalized, ledger_columns(include_link=bool(public_url))))
+            except Exception as e:
+                # 插件的检查逻辑本身出错，也要以检查项的形式交给用户，而不是让接口 500
+                logger.exception("Destination check crashed: %s", name)
+                items.append(CheckItem("连通性测试", CHECK_ERROR, f"未预期的错误：{e}"))
+
+    return {
+        "ok": not any(item.level == CHECK_ERROR for item in items),
+        "target": normalized,
+        "items": [item.to_dict() for item in items],
+    }
 
 
 def begin_pushes(run_uid: str, trigger: str, binding_id: Optional[int] = None) -> dict:

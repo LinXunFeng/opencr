@@ -539,6 +539,39 @@ class DestinationRouteTests(PushTestCase):
         self.assertEqual(destinations["items"][0]["name"], "fake-1")
         self.assertEqual(destinations["items"][0]["target_fields"][0]["key"], "table")
 
+    def test_check_endpoint_returns_items_for_admin_only(self):
+        from backend.survey.destinations.base import CHECK_OK, CheckItem
+
+        url = "/api/admin/destinations/fake-1/check"
+        self.assertEqual(self.client.post(url, json={"target": {"table": "T"}}).status_code, 401)
+
+        self._admin()
+        cls = _fake_destination_class()
+        with mock.patch.object(cls, "check", return_value=[CheckItem("读取", CHECK_OK, "可以访问")]), \
+                mock.patch.dict("backend.survey.destinations.DESTINATION_TYPES", {"fake": cls}):
+            ok = self.client.post(url, json={"target": {"table": " T "}, "survey_name": "巡检"}).json
+        self.assertTrue(ok["ok"])
+        self.assertEqual(ok["target"], {"table": "T"})
+        self.assertEqual(ok["items"], [{"title": "读取", "level": "ok", "message": "可以访问"}])
+
+        # 目标位置不合法、实例不存在：都是测试的正常结论，以检查项返回而不是 4xx
+        invalid = self.client.post(url, json={"target": {}}).json
+        self.assertFalse(invalid["ok"])
+        self.assertEqual(invalid["items"][0]["title"], "目标位置")
+        missing = self.client.post("/api/admin/destinations/nope/check", json={"target": {}}).json
+        self.assertFalse(missing["ok"])
+        self.assertIn("输出目标未配置", missing["items"][0]["message"])
+
+    def test_check_endpoint_survives_plugin_crash(self):
+        self._admin()
+        cls = _fake_destination_class()
+        with mock.patch.object(cls, "check", side_effect=RuntimeError("boom")), \
+                mock.patch.dict("backend.survey.destinations.DESTINATION_TYPES", {"fake": cls}):
+            response = self.client.post("/api/admin/destinations/fake-1/check", json={"target": {"table": "T"}})
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.json["ok"])
+        self.assertIn("boom", response.json["items"][-1]["message"])
+
     def test_binding_to_removed_destination_can_be_kept(self):
         """实例从 config.yaml 删掉后，保存巡检的其它改动不能被这个 Binding 挡住。"""
         from backend.survey import destinations
@@ -744,6 +777,108 @@ class GoogleSheetTests(unittest.TestCase):
             destination.push(self.TARGET, self._columns(), [])
         self.assertIn("opencr@proj.iam.gserviceaccount.com", str(ctx.exception))
         self.assertIn("编辑者", str(ctx.exception))
+
+    def _check_meta(self, sheets=("巡检",)):
+        return _Response(payload={
+            "properties": {"title": "质量台账"},
+            "sheets": [{"properties": {"sheetId": i, "title": t}} for i, t in enumerate(sheets)],
+        })
+
+    def test_check_passes_without_writing_ledger_rows(self):
+        """测试不写任何台账行：写权限用"把标题改成它自己"验证，内容与标题都不变。"""
+        from backend.survey.destinations.base import CHECK_OK
+
+        destination, session, _ = self._destination([
+            self._check_meta(),
+            _Response(payload={"values": [["键", "负责人", "标题"]]}),
+            _Response(payload={}),
+        ])
+        items = destination.check(self.TARGET, self._columns())
+        self.assertEqual([i.level for i in items], [CHECK_OK] * 4)
+        self.assertIn("2/4", items[2].message)
+        self.assertIn("状态、同类条数", items[2].message)
+
+        write = session.requests[-1]
+        self.assertTrue(write["url"].endswith(":batchUpdate"))
+        self.assertEqual(write["json"]["requests"], [{"updateSpreadsheetProperties": {
+            "properties": {"title": "质量台账"}, "fields": "title",
+        }}])
+        self.assertFalse(any("/values:" in r["url"] or ":append" in r["url"] for r in session.requests))
+
+    def test_check_reports_missing_worksheet_as_warning(self):
+        from backend.survey.destinations.base import CHECK_WARN
+
+        destination, session, _ = self._destination([self._check_meta(sheets=("Sheet1",)), _Response(payload={})])
+        items = destination.check(self.TARGET, self._columns())
+        self.assertEqual(items[2].level, CHECK_WARN)
+        self.assertIn("自动创建", items[2].message)
+        # 测试不创建工作表
+        self.assertNotIn("addSheet", json.dumps([r["json"] for r in session.requests]))
+
+    def test_check_stops_at_first_fatal_problem(self):
+        from backend.survey.destinations.base import CHECK_ERROR
+
+        destination, session, sleeps = self._destination([
+            _Response(status=404, payload={"error": {"message": "Requested entity was not found."}}),
+        ])
+        items = destination.check(self.TARGET, self._columns())
+        self.assertEqual([i.title for i in items], ["服务账号凭据", "读取表格"])
+        self.assertEqual(items[-1].level, CHECK_ERROR)
+        self.assertEqual(len(session.requests), 1)
+
+    def test_rejected_credentials_are_not_reported_as_network_failure(self):
+        """密钥能解析不代表凭据有效；被 Google 拒绝时不重试，也不能说成"无法连接"。"""
+        from backend.survey.destinations.base import CHECK_ERROR
+
+        class RefreshError(Exception):
+            pass
+
+        destination, session, sleeps = self._destination([])
+        session.request = mock.Mock(side_effect=RefreshError("invalid_grant: account not found"))
+        items = destination.check(self.TARGET, self._columns())
+        self.assertEqual([(i.title, i.level) for i in items], [("服务账号凭据", CHECK_ERROR)])
+        self.assertIn("invalid_grant", items[0].message)
+        self.assertNotIn("无法连接", items[0].message)
+        self.assertEqual(session.request.call_count, 1)
+        self.assertEqual(sleeps, [])
+
+    def test_check_reports_read_only_access(self):
+        from backend.survey.destinations.base import CHECK_ERROR
+
+        destination, _, _ = self._destination([
+            self._check_meta(),
+            _Response(payload={"values": [["键", "标题", "状态", "同类条数"]]}),
+            _Response(status=403, payload={"error": {"message": "The caller does not have permission"}}),
+        ])
+        items = destination.check(self.TARGET, self._columns())
+        self.assertEqual((items[-1].title, items[-1].level), ("写入权限", CHECK_ERROR))
+        self.assertIn("编辑者", items[-1].message)
+
+    def test_check_does_not_wait_out_long_backoff(self):
+        """测试是用户在表单里同步等结果，不能套用推送的五次退避。"""
+        destination, session, sleeps = self._destination([
+            _Response(status=429, payload={}),
+            _Response(status=429, payload={"error": {"message": "quota"}}),
+        ])
+        items = destination.check(self.TARGET, self._columns())
+        self.assertEqual(len(session.requests), 2)
+        self.assertEqual(len(sleeps), 1)
+        self.assertIn("429", items[-1].message)
+
+    def test_missing_credentials_message_points_at_likely_causes(self):
+        """"路径明明是对的"几乎总是行内注释被读进了值里，或者服务跑在容器里。"""
+        from backend.survey.destinations import DestinationError
+        from backend.survey.destinations.google_sheet import GoogleSheetDestination
+
+        raw = '"/Users/lxf/path/to/accout.json"  # 服务账号'
+        destination = GoogleSheetDestination("sheet", {"credentials_file": raw})
+        with mock.patch.dict(sys.modules, {"google.auth.transport.requests": mock.Mock(),
+                                           "google.oauth2": mock.Mock()}):
+            with self.assertRaises(DestinationError) as ctx:
+                destination._get_session()
+        message = str(ctx.exception)
+        self.assertIn(repr(raw), message)
+        self.assertIn("行内注释", message)
 
     def test_long_cells_are_truncated_under_the_hard_limit(self):
         """超过五万字符会让整批写入失败，而不是只截断那一格。"""
