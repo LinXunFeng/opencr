@@ -34,6 +34,12 @@ services:
       # 只是下次巡检要重新全量克隆。全量克隆多个仓库可能占几十 GB，
       # 磁盘紧张时把它换成指向大盘的 bind mount。
       - opencr-workspaces:/app/workspaces
+      # 巡检输出目标的凭据（可选）：例如 Google Sheet 的服务账号密钥。
+      # config.yaml 的 destinations 里写容器内路径 /app/secrets/xxx.json。
+      # - type: bind
+      #   source: ./secrets
+      #   target: /app/secrets
+      #   read_only: true
     environment:
       # 容器内固定路径，覆盖 config.yaml 里的默认推导
       OPENCR_DATABASE_URL: sqlite:////app/data/opencr.db

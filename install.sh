@@ -124,6 +124,20 @@ read_yaml_value() {
     ' "$file_path"
 }
 
+# 原样提取一个顶层配置段（含段名行），直到下一个顶层行为止。
+# 用于 destinations 这类"键名由用户自取"的嵌套段：read_yaml_value 只能按已知键名取值，
+# 逐项读取再拼回去做不到，而重新生成配置时丢掉这一段会让所有巡检的推送静默失败。
+extract_yaml_section() {
+    local file_path="$1"
+    local section="$2"
+
+    awk -v section="$section" '
+        $0 ~ ("^" section ":[[:space:]]*$") { in_section = 1; print; next }
+        in_section && /^[^[:space:]]/ { exit }
+        in_section { print }
+    ' "$file_path"
+}
+
 # 加载项目配置文件
 load_project_config_file() {
     print_step "读取项目配置文件"
@@ -146,6 +160,8 @@ load_project_config_file() {
         REVIEW_SERVER_HOST=$(read_yaml_value "$config_yaml" "server" "host")
         REVIEW_SERVER_PORT=$(read_yaml_value "$config_yaml" "server" "port")
         REVIEW_LOG_LEVEL=$(read_yaml_value "$config_yaml" "server" "log_level")
+        OPENCR_PUBLIC_URL=$(read_yaml_value "$config_yaml" "server" "public_url")
+        DESTINATIONS_BLOCK=$(extract_yaml_section "$config_yaml" "destinations")
 
         REVIEW_MAX_DIFF_SIZE=$(read_yaml_value "$config_yaml" "review" "max_diff_size")
         REVIEW_TIMEOUT=$(read_yaml_value "$config_yaml" "review" "timeout")
@@ -581,6 +597,11 @@ generate_config_file() {
     REVIEW_SERVER_HOST=${REVIEW_SERVER_HOST:-0.0.0.0}
     REVIEW_SERVER_PORT=${REVIEW_SERVER_PORT:-9034}
     REVIEW_LOG_LEVEL=${REVIEW_LOG_LEVEL:-INFO}
+    OPENCR_PUBLIC_URL=${OPENCR_PUBLIC_URL:-}
+    DESTINATIONS_BLOCK=${DESTINATIONS_BLOCK:-"# destinations:
+#   quality-sheet:
+#     type: google_sheet
+#     credentials_file: \"/path/to/service-account.json\""}
     REVIEW_MAX_DIFF_SIZE=${REVIEW_MAX_DIFF_SIZE:-50000}
     REVIEW_TIMEOUT=${REVIEW_TIMEOUT:-180}
     REVIEW_SKILLS_DIR=${REVIEW_SKILLS_DIR:-skills}
@@ -628,6 +649,7 @@ server:
   host: "${REVIEW_SERVER_HOST}"
   port: ${REVIEW_SERVER_PORT}
   log_level: "${REVIEW_LOG_LEVEL}"
+  public_url: "${OPENCR_PUBLIC_URL}"
 
 review:
   max_diff_size: ${REVIEW_MAX_DIFF_SIZE}
@@ -651,6 +673,10 @@ survey:
     l2_max_chars_per_focus: ${OPENCR_SURVEY_L2_MAX_CHARS_PER_FOCUS}
     index_timeout_seconds: ${OPENCR_SURVEY_INDEX_TIMEOUT_SECONDS}
     fetch_timeout_seconds: ${OPENCR_SURVEY_FETCH_TIMEOUT_SECONDS}
+
+# 巡检输出目标：把巡检的问题台账镜像到外部平台，由各巡检在后台绑定。
+# 凭据只写在这里、不入库；说明见 config.example.yaml。
+${DESTINATIONS_BLOCK}
 
 # 后台管理：默认关闭。开启需同时填写密码，否则服务会拒绝启动。
 # password 可直接写明文，首次启动时会自动替换为哈希。

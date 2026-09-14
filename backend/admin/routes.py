@@ -7,6 +7,7 @@
 前端隐藏不是安全边界，见 docs/adr/0002-guest-read-scope.md。
 """
 
+import json
 import logging
 from pathlib import Path
 from urllib.parse import quote, urlsplit, urlunsplit
@@ -22,9 +23,12 @@ from ..review.config import (
     load_storage_config,
 )
 from ..storage import repo
+from ..storage.models import PUSH_TRIGGER_MANUAL
 from ..survey.common import SurveyError, slugify
-from ..survey.config import load_survey_config
+from ..survey.config import load_public_url, load_survey_config
+from ..survey.destinations import DESTINATION_TYPES, list_destination_types, load_destinations
 from ..survey.profile import codegraph_available
+from ..survey.push import PushRejected, begin_pushes, execute_pushes_in_background
 from ..survey.report import render_run_markdown
 from ..survey.schedule import describe_schedule, next_fire_time
 from ..survey.scheduler import trigger_survey_now
@@ -483,6 +487,7 @@ def api_update_settings():
 # ---------------------------------------------------------------------------
 
 MAX_SURVEY_SOURCES = 30
+MAX_SURVEY_BINDINGS = 10
 
 
 def _parse_sources(raw) -> list:
@@ -581,15 +586,105 @@ def _parse_survey_payload(payload: dict, partial: bool) -> tuple:
     return fields, sources
 
 
+def _parse_bindings(raw, survey_name: str, current: list) -> list:
+    """
+    校验并规整 Binding 清单，返回 [{destination, target}]；非法时抛 ValueError。
+
+    实例已从 config.yaml 删掉的 Binding 允许原样保留（绑定不因配置变动而丢失，推送时记失败），
+    但不允许新建指向未配置实例的 Binding —— 那只会得到一条注定失败的推送。
+    """
+    if not isinstance(raw, list):
+        raise ValueError("bindings 必须是数组")
+    if len(raw) > MAX_SURVEY_BINDINGS:
+        raise ValueError(f"输出目标不能超过 {MAX_SURVEY_BINDINGS} 个")
+
+    destinations = load_destinations()
+    kept = {
+        (b["destination"], json.dumps(b["target"], sort_keys=True, ensure_ascii=False))
+        for b in current or []
+    }
+    bindings = []
+    for item in raw:
+        if not isinstance(item, dict):
+            raise ValueError("每个输出目标必须是对象")
+        name = str(item.get("destination") or "").strip()
+        if not name:
+            raise ValueError("请选择输出目标")
+        target = item.get("target") if isinstance(item.get("target"), dict) else {}
+
+        info = destinations.get(name)
+        if info is None or info.error:
+            identity = (name, json.dumps(target, sort_keys=True, ensure_ascii=False))
+            if identity in kept:
+                bindings.append({"destination": name, "target": target})
+                continue
+            reason = info.error if info else "config.yaml 的 destinations 中没有这一项"
+            raise ValueError(f"输出目标 {name} 不可用：{reason}")
+
+        try:
+            normalized = DESTINATION_TYPES[info.type_name].normalize_target(target, survey_name)
+        except ValueError as e:
+            raise ValueError(f"输出目标 {name}：{e}")
+        bindings.append({"destination": name, "target": normalized})
+    return bindings
+
+
 def _decorate_survey(survey: dict) -> dict:
-    """给巡检配置补上展示用的派生字段。"""
+    """
+    给巡检配置补上展示用的派生字段。
+
+    Guest 看不到 Binding 的目标位置：表格 ID 本身就是访问入口，
+    推送出去的内容又恰恰是 Guest 看不到的发现正文。实例名与类型可见，说明"结果推到了哪类地方"。
+    """
+    destinations = load_destinations()
+    admin = is_admin()
+    bindings = []
+    for binding in survey.get("bindings") or []:
+        info = destinations.get(binding["destination"])
+        cls = DESTINATION_TYPES.get(info.type_name) if info else None
+        item = {
+            "id": binding["id"],
+            "destination": binding["destination"],
+            "destination_label": cls.label if cls else "",
+            "available": bool(info and not info.error),
+        }
+        if admin:
+            item["target"] = binding["target"]
+            item["target_desc"] = cls.describe_target(binding["target"]) if cls else ""
+            item["last_succeeded_push_at"] = binding["last_succeeded_push_at"]
+        bindings.append(item)
     return {
         **survey,
+        "bindings": bindings,
         "schedule_desc": describe_schedule(
             survey["schedule_kind"], survey["schedule_expr"], survey["timezone"]
         ),
         "workspace_bytes": workspace_size_bytes(survey["slug"]),
     }
+
+
+@admin_bp.route("/api/admin/destinations", methods=["GET"])
+@require_admin
+def api_destinations():
+    """
+    config.yaml 里配置的 Destination 实例，以及各类型声明的目标位置字段。
+
+    只返回实例名、类型与配置错误，不返回任何凭据相关的配置项。
+    """
+    types = {t["type"]: t for t in list_destination_types()}
+    items = []
+    for info in load_destinations().values():
+        type_info = types.get(info.type_name)
+        items.append(
+            {
+                "name": info.name,
+                "type": info.type_name,
+                "type_label": type_info["label"] if type_info else "",
+                "target_fields": type_info["target_fields"] if type_info else [],
+                "error": info.error,
+            }
+        )
+    return jsonify({"items": items, "types": list(types.values()), "public_url": load_public_url()})
 
 
 @admin_bp.route("/api/admin/surveys", methods=["GET"])
@@ -609,6 +704,11 @@ def api_create_survey():
     except (ValueError, SurveyError) as e:
         return jsonify({"error": str(e)}), 400
 
+    try:
+        bindings = _parse_bindings(payload.get("bindings") or [], fields["name"], [])
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
     next_run = next_fire_time(fields["schedule_kind"], fields["schedule_expr"], fields["timezone"])
     survey = repo.create_survey(
         name=fields["name"],
@@ -618,6 +718,7 @@ def api_create_survey():
         timezone_name=fields["timezone"],
         sources=sources,
         next_run_at=next_run,
+        bindings=bindings,
         **{k: v for k, v in fields.items() if k not in {"name", "schedule_kind", "schedule_expr", "timezone"}},
     )
     logger.info("Admin created survey: %s (slug=%s)", survey["name"], survey["slug"])
@@ -656,7 +757,14 @@ def api_update_survey(survey_uid: str):
             else None
         )
 
-    survey = repo.update_survey(survey_uid, fields, sources)
+    bindings = None
+    if "bindings" in payload:
+        try:
+            bindings = _parse_bindings(payload["bindings"], merged["name"], current["bindings"])
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 400
+
+    survey = repo.update_survey(survey_uid, fields, sources, bindings)
     if survey is None:
         return jsonify({"error": "巡检不存在"}), 404
     logger.info("Admin updated survey: %s", survey["name"])
@@ -762,12 +870,47 @@ def api_survey_run_detail(run_uid: str):
     Guest 拿不到发现正文与整合叙述 —— 巡检正文描述的是整个代码库的架构与弱点，
     正文密度比 MR 审查更高，这条边界只会更严格，不会更松。
     """
+    admin = is_admin()
     detail = repo.get_survey_run_detail(
-        run_uid, include_body=is_admin(), stale_after_seconds=_stale_after()
+        run_uid, include_body=admin, stale_after_seconds=_stale_after()
     )
     if detail is None:
         return jsonify({"error": "运行记录不存在"}), 404
+    # 推送记录与报告同源同权：Guest 看得到推送状态，看不到目标位置与错误信息
+    detail["pushes"] = repo.list_survey_pushes(run_uid, include_detail=admin)
+    context = repo.get_survey_push_context(run_uid)
+    detail["pushable"] = bool(
+        context and context["is_latest_succeeded"] and context["survey"]["bindings"]
+    )
     return jsonify(detail)
+
+
+@admin_bp.route("/api/admin/survey-runs/<run_uid>/push", methods=["POST"])
+@require_admin
+def api_push_survey_run(run_uid: str):
+    """
+    手动推送到输出目标。body 可带 binding_id 只推其中一个，不带则推全部。
+
+    只有 Admin 能做，guest_retry 也不放开它：推送是对外部平台的写入。
+    推送在后台线程执行，接口登记完推送记录即返回 202。
+    """
+    payload = request.get_json(silent=True) or {}
+    binding_id = payload.get("binding_id")
+    try:
+        binding_id = int(binding_id) if binding_id not in (None, "") else None
+    except (TypeError, ValueError):
+        return jsonify({"error": "binding_id 必须是整数"}), 400
+
+    try:
+        result = begin_pushes(run_uid, PUSH_TRIGGER_MANUAL, binding_id)
+    except PushRejected as e:
+        return jsonify({"error": str(e)}), e.status
+
+    if not result["started"]:
+        return jsonify({"error": "该输出目标正在推送中，请稍后再试", "busy": result["busy"]}), 409
+    execute_pushes_in_background(result["started"])
+    logger.info("Admin triggered survey push: run=%s pushes=%s", run_uid, result["started"])
+    return jsonify({"started": len(result["started"]), "busy": result["busy"]}), 202
 
 
 @admin_bp.route("/api/admin/survey-runs/<run_uid>/export", methods=["GET"])

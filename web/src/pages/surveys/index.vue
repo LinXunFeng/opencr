@@ -1,9 +1,10 @@
 <script lang="ts" setup>
-import type { Survey, SurveySource } from "@@/apis/opencr"
+import type { DestinationItem, Survey, SurveyBinding, SurveySource } from "@@/apis/opencr"
 import {
   clearSurveyWorkspaceApi,
   createSurveyApi,
   deleteSurveyApi,
+  getDestinationsApi,
   getSkillsApi,
   getSurveysApi,
   runSurveyApi,
@@ -16,6 +17,14 @@ const userStore = useUserStore()
 const loading = ref(true)
 const surveys = ref<Survey[]>([])
 const allSkills = ref<string[]>([])
+/** config.yaml 里配置的输出目标实例。接口只对 Admin 开放，Guest 不请求 */
+const destinations = ref<DestinationItem[]>([])
+
+/** 表单里的 Binding：target 一律是对象，模板里才能直接按字段双向绑定 */
+interface BindingForm {
+  destination: string
+  target: Record<string, string>
+}
 
 const dialogVisible = ref(false)
 const saving = ref(false)
@@ -41,7 +50,8 @@ const form = reactive({
   retention_runs: 20,
   budget_wall_clock_minutes: null as number | null,
   budget_l2_max_focus: null as number | null,
-  sources: [] as SurveySource[]
+  sources: [] as SurveySource[],
+  bindings: [] as BindingForm[]
 })
 
 function formatBytes(bytes?: number) {
@@ -63,9 +73,14 @@ function formatTime(value: string) {
 async function load() {
   loading.value = true
   try {
-    const [list, skills] = await Promise.all([getSurveysApi(), getSkillsApi(30)])
+    const [list, skills, targets] = await Promise.all([
+      getSurveysApi(),
+      getSkillsApi(30),
+      userStore.isAdmin ? getDestinationsApi() : Promise.resolve({ items: [] as DestinationItem[] })
+    ])
     surveys.value = list.items
     allSkills.value = (skills.items ?? []).map((s: any) => s.name).filter(Boolean)
+    destinations.value = targets.items
   } catch (error) {
     ElMessage.error((error as Error).message)
   } finally {
@@ -89,6 +104,7 @@ function resetForm() {
   form.budget_wall_clock_minutes = null
   form.budget_l2_max_focus = null
   form.sources = [{ kind: "repo", url: "", branch: "", exclude_patterns: [] }]
+  form.bindings = []
 }
 
 function openCreate() {
@@ -124,6 +140,10 @@ function openEdit(row: any) {
   form.sources = row.sources.length
     ? row.sources.map((s: SurveySource) => ({ ...s, exclude_patterns: [...s.exclude_patterns] }))
     : [{ kind: "repo", url: "", branch: "", exclude_patterns: [] }]
+  form.bindings = (row.bindings ?? []).map((b: SurveyBinding) => ({
+    destination: b.destination,
+    target: { ...(b.target ?? {}) }
+  }))
   dialogVisible.value = true
 }
 
@@ -142,6 +162,29 @@ function addSource() {
 
 function removeSource(index: number) {
   form.sources.splice(index, 1)
+}
+
+function destinationOf(name: string) {
+  return destinations.value.find(d => d.name === name)
+}
+
+function addBinding() {
+  const first = destinations.value.find(d => !d.error)
+  form.bindings.push({ destination: first?.name ?? "", target: {} })
+}
+
+function removeBinding(index: number) {
+  form.bindings.splice(index, 1)
+}
+
+/** 换了实例就清空目标位置：不同类型的字段含义不同，沿用旧值只会得到一个看起来合法的错误位置 */
+function onDestinationChange(binding: BindingForm) {
+  binding.target = {}
+}
+
+/** 实例已从 config.yaml 删除时，原样展示旧的目标位置，保存时原样提交 */
+function describeTarget(target: Record<string, string>) {
+  return Object.entries(target).map(([k, v]) => `${k}: ${v}`).join(" / ") || "—"
 }
 
 async function save() {
@@ -169,7 +212,8 @@ async function save() {
       retention_runs: form.retention_runs,
       budget_wall_clock_minutes: form.budget_wall_clock_minutes,
       budget_l2_max_focus: form.budget_l2_max_focus,
-      sources
+      sources,
+      bindings: form.bindings.filter(b => b.destination)
     }
     if (editingUid.value) {
       await updateSurveyApi(editingUid.value, payload as any)
@@ -292,6 +336,20 @@ onMounted(load)
             {{ row.sources.length }} 条
           </template>
         </el-table-column>
+        <el-table-column label="输出目标" min-width="140">
+          <template #default="{ row }">
+            <el-tooltip
+              v-for="b in row.bindings" :key="b.id"
+              :content="b.target_desc || b.destination_label || b.destination"
+              placement="top"
+            >
+              <el-tag size="small" effect="plain" :type="b.available ? 'info' : 'danger'" class="binding-tag">
+                {{ b.destination }}
+              </el-tag>
+            </el-tooltip>
+            <span v-if="!row.bindings.length" class="sub">—</span>
+          </template>
+        </el-table-column>
         <el-table-column label="下次执行" min-width="170">
           <template #default="{ row }">
             {{ formatTime(row.next_run_at) }}
@@ -411,6 +469,56 @@ onMounted(load)
           </div>
         </el-form-item>
 
+        <el-form-item label="输出目标">
+          <div class="sources">
+            <div v-for="(binding, index) in form.bindings" :key="index" class="binding">
+              <div class="source-row">
+                <el-select
+                  v-model="binding.destination" placeholder="选择输出目标" style="width: 260px"
+                  @change="onDestinationChange(binding)"
+                >
+                  <el-option
+                    v-for="d in destinations" :key="d.name"
+                    :label="`${d.name}（${d.type_label || d.type}）`" :value="d.name" :disabled="!!d.error"
+                  >
+                    <span>{{ d.name }}（{{ d.type_label || d.type }}）</span>
+                    <span v-if="d.error" class="sub">{{ d.error }}</span>
+                  </el-option>
+                </el-select>
+                <el-button link type="danger" @click="removeBinding(index)">
+                  移除
+                </el-button>
+              </div>
+              <template v-if="destinationOf(binding.destination)">
+                <div
+                  v-for="field in destinationOf(binding.destination)!.target_fields" :key="field.key"
+                  class="field-row"
+                >
+                  <span class="field-label">{{ field.label }}</span>
+                  <div class="field-input">
+                    <el-input v-model="binding.target[field.key]" :placeholder="field.placeholder" />
+                    <div v-if="field.help" class="sub">
+                      {{ field.help }}
+                    </div>
+                  </div>
+                </div>
+              </template>
+              <div v-else-if="binding.destination" class="sub degraded">
+                config.yaml 中已没有这个实例，绑定会原样保留，但推送会失败。原目标位置：{{ describeTarget(binding.target) }}
+              </div>
+            </div>
+            <el-button link type="primary" :disabled="!destinations.length" @click="addBinding">
+              + 添加输出目标
+            </el-button>
+            <div v-if="!destinations.length" class="sub">
+              config.yaml 中还没有配置 destinations，写法见 config.example.yaml。
+            </div>
+            <div class="sub">
+              {{ SURVEY_NOTES.destinationScope }}
+            </div>
+          </div>
+        </el-form-item>
+
         <el-form-item label="巡检后删除工作区">
           <el-switch v-model="form.delete_workspace_after" />
           <div class="sub">
@@ -490,5 +598,37 @@ onMounted(load)
   gap: 8px;
   align-items: center;
   margin-bottom: 8px;
+}
+
+.binding {
+  padding: 8px 12px 4px;
+  margin-bottom: 8px;
+  border: 1px dashed var(--el-border-color);
+  border-radius: 4px;
+}
+
+.field-row {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  margin-bottom: 8px;
+}
+
+.field-label {
+  flex: 0 0 56px;
+  line-height: 24px;
+  color: var(--el-text-color-regular);
+}
+
+.field-input {
+  flex: 1;
+}
+
+.binding-tag {
+  margin: 0 4px 4px 0;
+}
+
+.degraded {
+  color: var(--el-color-warning);
 }
 </style>

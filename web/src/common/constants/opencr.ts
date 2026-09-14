@@ -208,6 +208,23 @@ export const SURVEY_DEGRADATION_LABEL: Record<string, string> = {
   profile_fallback: "codegraph 不可用（全部画像退化为依赖清单级）"
 }
 
+export const PUSH_STATUS_LABEL: Record<string, string> = {
+  running: "推送中",
+  succeeded: "成功",
+  failed: "失败"
+}
+
+export const PUSH_STATUS_TAG: Record<string, TagType> = {
+  running: "primary",
+  succeeded: "success",
+  failed: "danger"
+}
+
+export const PUSH_TRIGGER_LABEL: Record<string, string> = {
+  auto: "运行结束自动推送",
+  manual: "手动推送"
+}
+
 /** 口径解释，集中放置避免各页面漂移 */
 export const SURVEY_NOTES = {
   stateDiff:
@@ -218,6 +235,12 @@ export const SURVEY_NOTES = {
     "游客能看到巡检的运行状态与聚合统计，但看不到发现正文与整体结论——巡检正文描述的是整个代码库的架构与弱点。",
   candidatePool:
     "勾选决定的是**候选池**：勾中的 skill 才有资格参与，但仍要由 AI 按仓库画像匹配，未匹配到的不会执行。",
+  destinationScope:
+    "推送的是该巡检的问题台账：一个指纹一行，每轮只更新系统列，你在表里加的列（负责人、处理进度等）不会被读取或改写。推送即交出了发现正文的可见性控制——谁能看到正文由目标平台的共享设置决定。",
+  ledgerUnseen:
+    "台账里的「本轮未发现」只说明这一轮没看到，不说明问题已修复：巡检只取证模型选中的关注点。仓库拉取或索引失败、预算耗尽的轮次不会标记它。",
+  pushOnlyLatest:
+    "推送的内容永远是台账的当前状态，因此只能以该巡检最近一次成功的运行发起推送。推送失败不影响运行本身的状态。",
   workspaceKept:
     "删除巡检不会连带删除本地工作区——那可能是几十 GB 代码，且删除不可逆。工作区清理是单独的动作。"
 }

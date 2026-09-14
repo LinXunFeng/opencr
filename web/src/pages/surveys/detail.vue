@@ -1,8 +1,11 @@
 <script lang="ts" setup>
-import type { SurveyFinding, SurveyRunDetail } from "@@/apis/opencr"
-import { addSurveyIgnoreApi, getSurveyRunDetailApi } from "@@/apis/opencr"
+import type { SurveyFinding, SurveyPush, SurveyRunDetail } from "@@/apis/opencr"
+import { addSurveyIgnoreApi, getSurveyRunDetailApi, pushSurveyRunApi } from "@@/apis/opencr"
 import {
   PROFILE_KIND_LABEL,
+  PUSH_STATUS_LABEL,
+  PUSH_STATUS_TAG,
+  PUSH_TRIGGER_LABEL,
   RUN_STATUS_LABEL,
   RUN_STATUS_TAG,
   SURVEY_DEGRADATION_LABEL,
@@ -23,15 +26,58 @@ const activeTab = ref("new")
 
 const runUid = computed(() => String(route.params.runUid || ""))
 
-async function load() {
-  loading.value = true
+async function load(silent = false) {
+  if (!silent) loading.value = true
   try {
     detail.value = await getSurveyRunDetailApi(runUid.value)
   } catch (error) {
     ElMessage.error((error as Error).message)
   } finally {
     loading.value = false
+    schedulePushPolling()
   }
+}
+
+/**
+ * 推送在后台线程执行，接口登记完就返回。有进行中的推送时轮询刷新，直到全部结束。
+ * 疑似中断的记录不再等：它们大概率永远不会结束。
+ */
+let pollTimer: ReturnType<typeof setTimeout> | undefined
+function schedulePushPolling() {
+  clearTimeout(pollTimer)
+  const pending = detail.value?.pushes.some(p => p.status === "running" && !p.is_stale)
+  if (pending) pollTimer = setTimeout(load, 3000, true)
+}
+onBeforeUnmount(() => clearTimeout(pollTimer))
+
+const pushing = ref(false)
+async function push(bindingId?: number | null) {
+  pushing.value = true
+  try {
+    const result = await pushSurveyRunApi(runUid.value, bindingId)
+    ElMessage.success(
+      result.busy.length
+        ? `已开始推送 ${result.started} 个输出目标，另有 ${result.busy.length} 个正在推送中`
+        : "已开始推送"
+    )
+    await load(true)
+  } catch (error) {
+    ElMessage.error((error as Error).message)
+  } finally {
+    pushing.value = false
+  }
+}
+
+// el-table 的插槽把 row 定为 DefaultRow，在边界处收窄（与 FindingTable.vue 的写法一致）
+function describeStats(row: any) {
+  const item = row as SurveyPush
+  if (item.status !== "succeeded") return "—"
+  const { updated = 0, inserted = 0, skipped = 0 } = item.stats
+  return `更新 ${updated} / 新增 ${inserted}${skipped ? ` / 跳过 ${skipped}` : ""}`
+}
+
+function describeTarget(target?: Record<string, string>) {
+  return target ? Object.values(target).filter(Boolean).join(" / ") : ""
 }
 
 const newFindings = computed(() => (detail.value?.findings ?? []).filter(f => f.state === "new"))
@@ -66,7 +112,7 @@ async function ignore(finding: SurveyFinding) {
   }
 }
 
-onMounted(load)
+onMounted(() => load())
 </script>
 
 <template>
@@ -128,6 +174,71 @@ onMounted(load)
             </ul>
           </el-alert>
         </div>
+      </el-card>
+
+      <el-card v-if="detail.pushes.length || detail.pushable" shadow="never" class="mb">
+        <template #header>
+          <div class="header">
+            <span>推送到输出目标</span>
+            <el-button
+              v-if="userStore.isAdmin && detail.pushable"
+              size="small" type="primary" :loading="pushing" @click="push()"
+            >
+              推送到全部输出目标
+            </el-button>
+          </div>
+        </template>
+
+        <div class="sub mb-sm">
+          {{ SURVEY_NOTES.pushOnlyLatest }} {{ SURVEY_NOTES.ledgerUnseen }}
+        </div>
+
+        <el-table :data="detail.pushes" size="small" empty-text="这次运行还没有推送记录">
+          <el-table-column label="输出目标" min-width="200">
+            <template #default="{ row }">
+              <div>{{ row.destination }}</div>
+              <div v-if="row.target" class="sub">
+                {{ describeTarget(row.target) }}
+              </div>
+            </template>
+          </el-table-column>
+          <el-table-column label="触发" width="140">
+            <template #default="{ row }">
+              {{ PUSH_TRIGGER_LABEL[row.trigger] || row.trigger }}
+            </template>
+          </el-table-column>
+          <el-table-column label="状态" width="150">
+            <template #default="{ row }">
+              <el-tag size="small" :type="PUSH_STATUS_TAG[row.status] || 'info'">
+                {{ PUSH_STATUS_LABEL[row.status] || row.status }}
+              </el-tag>
+              <el-tag v-if="row.is_stale" size="small" type="warning" effect="plain" class="ml">
+                疑似中断
+              </el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column label="开始时间" min-width="160">
+            <template #default="{ row }">
+              {{ formatTime(row.started_at) }}
+            </template>
+          </el-table-column>
+          <el-table-column label="写入" min-width="150">
+            <template #default="{ row }">
+              {{ describeStats(row) }}
+            </template>
+          </el-table-column>
+          <el-table-column v-if="userStore.isAdmin" prop="error_message" label="错误" min-width="200" show-overflow-tooltip />
+          <el-table-column v-if="userStore.isAdmin && detail.pushable" label="操作" width="80" fixed="right">
+            <template #default="{ row }">
+              <el-button
+                v-if="row.binding_id && row.status !== 'running'"
+                link type="primary" size="small" :disabled="pushing" @click="push(row.binding_id)"
+              >
+                重推
+              </el-button>
+            </template>
+          </el-table-column>
+        </el-table>
       </el-card>
 
       <el-card shadow="never" class="mb">
@@ -214,6 +325,14 @@ onMounted(load)
 }
 .mt {
   margin-top: 16px;
+}
+.mb-sm {
+  margin-bottom: 8px;
+}
+.sub {
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
+  line-height: 1.6;
 }
 .ml {
   margin-left: 4px;

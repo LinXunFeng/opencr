@@ -72,6 +72,8 @@ except Exception:
 以 [`CONTEXT.md`](./CONTEXT.md) 为唯一真相。几个最容易用错的：
 
 - **ReviewRun**：一次 MR 审查执行。一个 MR 对应**多个** ReviewRun（创建一次 + 每次推送一次）。
+- **Ledger / 问题台账**：Destination 上那张表的唯一真相在库里，表格只是镜像。
+  **「本轮未发现」不是已修复**，不要在任何地方把它写成 resolved / fixed。
 - **SurveyRun**：一次定期巡检执行。它与 ReviewRun **并列而非从属**：前者由时间驱动、审查全量代码，
   后者由事件驱动、审查一次变更。两者产出的都叫 Finding，但**分表存放** ——
   SurveyRun 的 Finding 永远不 Trackable，混进 `finding` 表会污染 Coverage 与采纳率的分母。
@@ -110,7 +112,10 @@ backend/                # 后端 Python 包
 │   ├── profile.py      # L0 仓库画像；codegraph 集成
 │   ├── crossrepo.py    # 跨仓库接口连接；确定性匹配，不含模型判断
 │   ├── analysis.py     # L1 整合 / L2 取证 / L3 汇总的模型调用
-│   └── report.py       # Markdown 报告渲染（渲染产物，不是存储真相）
+│   ├── report.py       # Markdown 报告渲染（渲染产物，不是存储真相）
+│   ├── ledger.py       # Ledger 状态判定与镜像行生成；判定逻辑是纯函数
+│   ├── push.py         # Push 的唯一执行入口（自动推送与手动重推都走这里）
+│   └── destinations/   # Destination 插件：base.py 定义接口，__init__.py 显式注册
 ├── storage/            # 持久化；上层只通过 repo.py 访问，不直接持有 Session
 ├── admin/              # 后台 API、鉴权，以及前端构建产物 static/（不进 Git）
 ├── migrations/         # Alembic 迁移脚本
@@ -144,7 +149,7 @@ web/                    # 后台前端源码，独立构建单元，详见 web/R
 ## 六、常用命令
 
 ```bash
-# 测试（144 个用例，无需外部依赖）
+# 测试（184 个用例，无需外部依赖）
 python3 -m unittest discover -s tests -t .
 
 # 数据库迁移（部署脚本走的就是这条）
@@ -185,5 +190,11 @@ pnpm build    # 构建到 backend/admin/static/（产物不进 Git）
   `docs/adr/0003-per-repo-codegraph-index.md`，那里有实测数据与复现方式。
 - **巡检的清理逻辑永远不能删掉每个 Survey 的最近一次运行。** 跨轮次比对依赖它，
   删掉之后下一轮报告会把所有问题标成"新增"——这个故障发生在某个凌晨，且看起来完全正常。
+- **Destination 插件只做"按键写行"，不要在插件里判定台账状态。** "本轮未发现"的可信度判定、
+  删行补不补回，都在 `backend/survey/ledger.py` 里统一算好；每个插件各写一遍迟早会写出不一致的版本。
+  写入 Google Sheet 必须用 `RAW`，正文来自模型，`USER_ENTERED` 会把以 `=` 开头的内容当公式执行。
+  动这块之前读 `docs/adr/0004-survey-ledger-mirrored-to-destinations.md`。
+- **Ledger 系统列的表头文案发布后不要改。** 插件按表头名称定位列，改名后已有表格里的旧列会变成人工列，
+  下次推送再补出一个新列。
 - 新增巡检链路的代码放 `backend/survey/`，**不要**写进 `backend/review/`。两条链路唯一的
   共用物是 skill 加载与模型配置，其余一律分开。

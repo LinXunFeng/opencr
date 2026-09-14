@@ -940,7 +940,67 @@ def _survey_to_dict(survey: "Survey") -> dict:
             }
             for s in sorted(survey.sources, key=lambda x: x.id)
         ],
+        "bindings": [_survey_binding_to_dict(b) for b in sorted(survey.bindings, key=lambda x: x.id)],
     }
+
+
+def _survey_binding_to_dict(binding: "SurveyBinding") -> dict:
+    """Binding 的接口数据。target 含表格 ID 这类访问入口，Guest 视角由路由层剔除。"""
+    return {
+        "id": binding.id,
+        "destination": binding.destination,
+        "target": _json_object(binding.target),
+        "last_succeeded_push_at": (
+            binding.last_succeeded_push_at.isoformat() if binding.last_succeeded_push_at else ""
+        ),
+    }
+
+
+def _json_object(raw: Optional[str]) -> dict:
+    """解析 JSON 对象字段；脏数据退化为空对象。"""
+    try:
+        value = json.loads(raw) if raw else {}
+    except (ValueError, TypeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _binding_identity(destination: str, target: dict) -> tuple:
+    """判定"是不是同一个 Binding"的依据：实例名 + 规整后的目标位置。"""
+    return (destination, json.dumps(target or {}, sort_keys=True, ensure_ascii=False))
+
+
+def _sync_survey_bindings(session, survey: "Survey", bindings: List[dict]) -> None:
+    """
+    按"实例名 + 目标位置"增量同步 Binding：相同的保留，多出的新建，缺少的删除。
+
+    **不能整体删掉重建**（来源清单就是这么做的）：Binding 上记着最近一次成功推送的时刻，
+    它决定"用户在表里删掉的行要不要补回"。整体重建会让每次保存巡检配置都把这个时刻清空，
+    下一次推送就会把用户删掉的行统统写回去。
+    """
+    from .models import SurveyBinding
+
+    wanted = []
+    seen = set()
+    for item in bindings or []:
+        identity = _binding_identity(item["destination"], item.get("target") or {})
+        if identity not in seen:
+            seen.add(identity)
+            wanted.append((identity, item))
+
+    current = {_binding_identity(b.destination, _json_object(b.target)): b for b in survey.bindings}
+    for identity, binding in current.items():
+        if identity not in seen:
+            survey.bindings.remove(binding)
+    for identity, item in wanted:
+        if identity not in current:
+            survey.bindings.append(
+                SurveyBinding(
+                    destination=item["destination"],
+                    target=identity[1],
+                )
+            )
+    session.flush()
 
 
 def create_survey(
@@ -951,9 +1011,10 @@ def create_survey(
     timezone_name: str,
     sources: List[dict],
     next_run_at: Optional[datetime] = None,
+    bindings: Optional[List[dict]] = None,
     **options,
 ) -> dict:
-    """新建一个巡检配置，返回它的完整数据。"""
+    """新建一个巡检配置，返回它的完整数据。bindings 为 [{destination, target}]，target 须已规整。"""
     from .models import Survey, SurveySource
 
     survey_uid = str(uuid.uuid4())
@@ -988,13 +1049,21 @@ def create_survey(
                 )
             )
         session.flush()
+        if bindings:
+            _sync_survey_bindings(session, survey, bindings)
         session.refresh(survey)
         return _survey_to_dict(survey)
 
 
-def update_survey(survey_uid: str, fields: dict, sources: Optional[List[dict]] = None) -> Optional[dict]:
+def update_survey(
+    survey_uid: str,
+    fields: dict,
+    sources: Optional[List[dict]] = None,
+    bindings: Optional[List[dict]] = None,
+) -> Optional[dict]:
     """
-    更新巡检配置。sources 传 None 表示不动来源清单，传列表表示整体替换。
+    更新巡检配置。sources 传 None 表示不动来源清单，传列表表示整体替换；
+    bindings 同理，但按实例名 + 目标位置增量同步（见 _sync_survey_bindings）。
 
     **slug 永不随改名变化** —— 改个名字就要搬几十 GB 代码，不划算，
     而且搬运过程中断会留下一个谁也说不清状态的工作区。
@@ -1029,6 +1098,8 @@ def update_survey(survey_uid: str, fields: dict, sources: Optional[List[dict]] =
                         exclude_patterns=json.dumps(item.get("exclude_patterns") or [], ensure_ascii=False),
                     )
                 )
+        if bindings is not None:
+            _sync_survey_bindings(session, survey, bindings)
         session.flush()
         session.refresh(survey)
         return _survey_to_dict(survey)
@@ -1495,7 +1566,7 @@ def get_survey_run_detail(
 
 def add_survey_ignore(survey_uid: str, fingerprint: str, note: str = "") -> bool:
     """把一条发现标记为"已知问题、不再提醒"。已存在时视为成功。"""
-    from .models import Survey, SurveyIgnore
+    from .models import LEDGER_IGNORED, Survey, SurveyIgnore, SurveyLedgerEntry
 
     with session_scope() as session:
         survey_id = session.scalar(select(Survey.id).where(Survey.survey_uid == survey_uid))
@@ -1510,11 +1581,23 @@ def add_survey_ignore(survey_uid: str, fingerprint: str, note: str = "") -> bool
             session.add(
                 SurveyIgnore(survey_id=survey_id, fingerprint=fingerprint, note=(note or "")[:2000] or None)
             )
+        # 台账里已有的那一行立刻转为已忽略，而不是等下一轮巡检：
+        # 忽略之后手动重推一次，表里就应该看到变化。不删行 —— 人工列里可能已经写了处理记录。
+        session.execute(
+            update(SurveyLedgerEntry)
+            .where(SurveyLedgerEntry.survey_id == survey_id, SurveyLedgerEntry.fingerprint == fingerprint)
+            .values(state=LEDGER_IGNORED, updated_at=utcnow())
+        )
         return True
 
 
 def remove_survey_ignore(survey_uid: str, fingerprint: str) -> bool:
-    """取消忽略。"""
+    """
+    取消忽略。
+
+    台账状态不在这里改回：该行会停在已忽略，直到下一轮出现（变回存在）
+    或下一轮结论可信地没出现（变为本轮未发现）。凭空把它改成"存在"是没有证据的判断。
+    """
     from .models import Survey, SurveyIgnore
 
     with session_scope() as session:
@@ -1558,7 +1641,7 @@ def purge_survey_runs(survey_id: int, retention_runs: int) -> int:
     "新增/仍存在"的比对依赖上一次的记录还在，删掉它之后下一轮报告会把
     所有问题都标成新增。这类故障发生在某个凌晨，且看起来完全正常。
     """
-    from .models import SurveyFinding, SurveyRun
+    from .models import SurveyFinding, SurveyPush, SurveyRun
 
     keep = max(int(retention_runs or 1), 1)
     with session_scope() as session:
@@ -1571,6 +1654,7 @@ def purge_survey_runs(survey_id: int, retention_runs: int) -> int:
         if not stale_ids:
             return 0
         session.execute(delete(SurveyFinding).where(SurveyFinding.run_id.in_(stale_ids)))
+        session.execute(delete(SurveyPush).where(SurveyPush.run_id.in_(stale_ids)))
         session.execute(delete(SurveyRun).where(SurveyRun.id.in_(stale_ids)))
         return len(stale_ids)
 
@@ -1641,3 +1725,305 @@ def purge_survey_runs_by_uid(survey_uid: str) -> int:
     if row is None:
         return 0
     return purge_survey_runs(row[0], row[1])
+
+
+# ==========================================================================
+# 巡检输出：Ledger / Binding / Push
+#
+# Ledger 是系统持有的问题台账，Destination 上的表格只是镜像（ADR-0004）。
+# 状态判定在 survey/ledger.py 里是纯函数，这里只做存取。
+# ==========================================================================
+
+# 一条推送记录停在进行中超过这个时长，就不再阻止同一 Binding 发起新的推送。
+# 推送没有心跳：进程在推送中途被杀掉时记录会永远停在进行中，不设上限的话这个 Binding 就再也推不出去了。
+# 取 15 分钟：几千行的台账在限流退避下也能在这个时间内推完。
+PUSH_STALE_SECONDS = 900
+
+
+def get_survey_run_ledger_inputs(run_uid: str) -> Optional[dict]:
+    """
+    更新 Ledger 所需的一次运行的全部输入：运行状态、逐条发现（含正文）、仓库处理结果、降级与忽略清单。
+
+    运行不存在时返回 None。
+    """
+    from .models import SurveyFinding, SurveyIgnore, SurveyRun, SurveyRunRepo
+
+    with session_scope() as session:
+        run = session.scalar(select(SurveyRun).where(SurveyRun.run_uid == run_uid))
+        if run is None:
+            return None
+        findings = session.scalars(select(SurveyFinding).where(SurveyFinding.run_id == run.id)).all()
+        repos = session.scalars(select(SurveyRunRepo).where(SurveyRunRepo.run_id == run.id)).all()
+        ignored = set(
+            session.scalars(
+                select(SurveyIgnore.fingerprint).where(SurveyIgnore.survey_id == run.survey_id)
+            ).all()
+        )
+        return {
+            "survey_id": run.survey_id,
+            "status": run.status,
+            "degradations": _survey_run_to_dict(run)["degradations"],
+            "findings": [
+                {
+                    "fingerprint": f.fingerprint,
+                    "repo_slug": f.repo_slug,
+                    "file_path": f.file_path or "",
+                    "line": f.line,
+                    "category": f.category,
+                    "severity": f.severity,
+                    "title": f.title or "",
+                    "body": f.body or "",
+                }
+                for f in findings
+            ],
+            "repos": [{"repo_slug": r.repo_slug, "status": r.status} for r in repos],
+            "ignored": ignored,
+        }
+
+
+def _ledger_entry_to_dict(entry: "SurveyLedgerEntry") -> dict:
+    """Ledger 条目的数据形态。"""
+    try:
+        lines = json.loads(entry.lines) if entry.lines else []
+    except (ValueError, TypeError):
+        lines = []
+    return {
+        "fingerprint": entry.fingerprint,
+        "repo_slug": entry.repo_slug,
+        "file_path": entry.file_path or "",
+        "category": entry.category,
+        "severity": entry.severity,
+        "title": entry.title or "",
+        "body": entry.body or "",
+        "lines": lines if isinstance(lines, list) else [],
+        "finding_count": entry.finding_count,
+        "state": entry.state,
+        "first_seen_at": entry.first_seen_at,
+        "last_seen_at": entry.last_seen_at,
+        "last_run_uid": entry.last_run_uid or "",
+    }
+
+
+def get_survey_ledger_map(survey_id: int) -> Dict[str, dict]:
+    """某个 Survey 的全部 Ledger 条目，{指纹: 条目}。"""
+    from .models import SurveyLedgerEntry
+
+    with session_scope() as session:
+        rows = session.scalars(
+            select(SurveyLedgerEntry).where(SurveyLedgerEntry.survey_id == int(survey_id))
+        ).all()
+        return {r.fingerprint: _ledger_entry_to_dict(r) for r in rows}
+
+
+def list_survey_ledger(survey_id: int) -> List[dict]:
+    """某个 Survey 的全部 Ledger 条目，按首次发现时间排序 —— 新表里的行序就是问题出现的先后。"""
+    entries = list(get_survey_ledger_map(survey_id).values())
+    return sorted(entries, key=lambda e: (e["first_seen_at"], e["fingerprint"]))
+
+
+def earliest_survey_finding_times(survey_id: int, fingerprints: List[str]) -> Dict[str, datetime]:
+    """
+    若干指纹在库里仍保留的最早出现时刻。
+
+    用于新进入 Ledger 的行的首次发现时间。运行记录按次数清理，
+    更早的历史已经不在了，这个时间会偏晚 —— 这是有意接受的偏差，库里没有更好的证据。
+    """
+    from .models import SurveyFinding
+
+    if not fingerprints:
+        return {}
+    result: Dict[str, datetime] = {}
+    with session_scope() as session:
+        # SQLite 单条语句的参数上限是 999，分批查
+        for start in range(0, len(fingerprints), 500):
+            batch = fingerprints[start:start + 500]
+            rows = session.execute(
+                select(SurveyFinding.fingerprint, func.min(SurveyFinding.created_at))
+                .where(SurveyFinding.survey_id == int(survey_id), SurveyFinding.fingerprint.in_(batch))
+                .group_by(SurveyFinding.fingerprint)
+            ).all()
+            result.update({fp: ts for fp, ts in rows if ts is not None})
+    return result
+
+
+def upsert_survey_ledger(survey_id: int, changes: List[dict]) -> None:
+    """按指纹写入 Ledger 变更：已有的只覆盖变更里给出的字段，没有的新建。"""
+    from .models import SurveyLedgerEntry
+
+    if not changes:
+        return
+    now = utcnow()
+    columns = {c.key for c in SurveyLedgerEntry.__table__.columns} - {"id", "survey_id", "fingerprint"}
+    with session_scope() as session:
+        existing = {
+            e.fingerprint: e
+            for e in session.scalars(
+                select(SurveyLedgerEntry).where(SurveyLedgerEntry.survey_id == int(survey_id))
+            ).all()
+        }
+        for change in changes:
+            entry = existing.get(change["fingerprint"])
+            if entry is None:
+                entry = SurveyLedgerEntry(survey_id=int(survey_id), fingerprint=change["fingerprint"])
+                session.add(entry)
+                existing[change["fingerprint"]] = entry
+            for key, value in change.items():
+                if key not in columns:
+                    continue
+                if key == "title" and value:
+                    value = str(value)[:512]
+                if key == "repo_slug":
+                    value = str(value or "")[:128]
+                if key == "file_path":
+                    value = str(value or "")[:1024] or None
+                setattr(entry, key, value)
+            entry.updated_at = now
+
+
+def get_survey_push_context(run_uid: str) -> Optional[dict]:
+    """
+    判断一次运行能否推送所需的上下文：所属 Survey、运行状态、是否为最近一次成功运行，以及全部 Binding。
+
+    运行不存在时返回 None。
+    """
+    from .models import Survey, SurveyRun
+
+    with session_scope() as session:
+        run = session.scalar(select(SurveyRun).where(SurveyRun.run_uid == run_uid))
+        if run is None:
+            return None
+        survey = session.get(Survey, run.survey_id)
+        latest_id = session.scalar(
+            select(SurveyRun.id)
+            .where(SurveyRun.survey_id == run.survey_id, SurveyRun.status == RUN_SUCCEEDED)
+            .order_by(SurveyRun.id.desc())
+            .limit(1)
+        )
+        return {
+            "survey": _survey_to_dict(survey),
+            "survey_id": run.survey_id,
+            "status": run.status,
+            "is_latest_succeeded": run.status == RUN_SUCCEEDED and latest_id == run.id,
+        }
+
+
+def start_survey_push(run_uid: str, binding_id: int, trigger: str) -> Optional[int]:
+    """
+    登记一次推送，返回推送记录 id；该 Binding 已有进行中的推送时返回 None。
+
+    同一 Binding 并发推送会让两边都读到"键不存在"然后各追加一行，
+    因此在写锁内检查并登记，挡住跨 worker 的并发（自动推送与手动重推可能落在不同进程）。
+    """
+    from .models import PUSH_RUNNING, SurveyBinding, SurveyPush, SurveyRun
+
+    with session_scope() as session:
+        session.execute(text("BEGIN IMMEDIATE"))
+        run_id = session.scalar(select(SurveyRun.id).where(SurveyRun.run_uid == run_uid))
+        binding = session.get(SurveyBinding, int(binding_id))
+        if run_id is None or binding is None:
+            return None
+        busy = session.scalar(
+            select(SurveyPush.id).where(
+                SurveyPush.binding_id == binding.id,
+                SurveyPush.status == PUSH_RUNNING,
+                SurveyPush.started_at > utcnow() - timedelta(seconds=PUSH_STALE_SECONDS),
+            ).limit(1)
+        )
+        if busy is not None:
+            return None
+        push = SurveyPush(
+            run_id=run_id,
+            binding_id=binding.id,
+            destination=binding.destination,
+            target=binding.target,
+            trigger=trigger,
+            status=PUSH_RUNNING,
+            started_at=utcnow(),
+        )
+        session.add(push)
+        session.flush()
+        return push.id
+
+
+def get_survey_push(push_id: int) -> Optional[dict]:
+    """执行一次推送所需的全部信息：推送记录、所属 Survey 与 Binding 当前状态。"""
+    from .models import Survey, SurveyBinding, SurveyPush, SurveyRun
+
+    with session_scope() as session:
+        push = session.get(SurveyPush, int(push_id))
+        if push is None:
+            return None
+        run = session.get(SurveyRun, push.run_id)
+        survey = session.get(Survey, run.survey_id) if run else None
+        binding = session.get(SurveyBinding, push.binding_id) if push.binding_id else None
+        return {
+            "id": push.id,
+            "run_uid": run.run_uid if run else "",
+            "survey": _survey_to_dict(survey) if survey else None,
+            "survey_id": survey.id if survey else None,
+            "destination": push.destination,
+            "target": _json_object(push.target),
+            "first_push": binding is not None and binding.last_succeeded_push_at is None,
+        }
+
+
+def finish_survey_push(
+    push_id: int, status: str, stats: Optional[dict] = None, error_message: str = ""
+) -> None:
+    """收尾一次推送；成功时刷新对应 Binding 的最近成功推送时刻。"""
+    from .models import PUSH_SUCCEEDED, SurveyBinding, SurveyPush
+
+    now = utcnow()
+    with session_scope() as session:
+        push = session.get(SurveyPush, int(push_id))
+        if push is None:
+            return
+        push.status = status
+        push.finished_at = now
+        if stats is not None:
+            push.stats = json.dumps(stats, ensure_ascii=False)
+        if error_message:
+            push.error_message = str(error_message)[:4000]
+        if status == PUSH_SUCCEEDED and push.binding_id:
+            binding = session.get(SurveyBinding, push.binding_id)
+            # 目标位置在推送期间被改掉时不刷新：刷新的话，新位置会被当成"已经推送过"，
+            # 第一次推送时就不会补写本轮未发现与已忽略的行
+            if binding is not None and binding.target == push.target:
+                binding.last_succeeded_push_at = now
+
+
+def list_survey_pushes(run_uid: str, include_detail: bool) -> List[dict]:
+    """
+    一次运行的推送记录，按时间倒序。
+
+    include_detail=False（Guest）时不返回目标位置与错误信息：表格 ID 本身就是访问入口，
+    错误信息里也可能带着表格链接或服务账号邮箱。
+    """
+    from .models import PUSH_RUNNING, SurveyPush, SurveyRun
+
+    with session_scope() as session:
+        run_id = session.scalar(select(SurveyRun.id).where(SurveyRun.run_uid == run_uid))
+        if run_id is None:
+            return []
+        rows = session.scalars(
+            select(SurveyPush).where(SurveyPush.run_id == run_id).order_by(SurveyPush.id.desc())
+        ).all()
+        stale_before = utcnow() - timedelta(seconds=PUSH_STALE_SECONDS)
+        items = []
+        for p in rows:
+            item = {
+                "id": p.id,
+                "binding_id": p.binding_id,
+                "destination": p.destination,
+                "trigger": p.trigger,
+                "status": p.status,
+                "is_stale": p.status == PUSH_RUNNING and p.started_at < stale_before,
+                "stats": _json_object(p.stats),
+                "started_at": p.started_at.isoformat() if p.started_at else "",
+                "finished_at": p.finished_at.isoformat() if p.finished_at else "",
+            }
+            if include_detail:
+                item["target"] = _json_object(p.target)
+                item["error_message"] = p.error_message or ""
+            items.append(item)
+        return items

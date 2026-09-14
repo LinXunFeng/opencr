@@ -5,3 +5,4 @@ python-dotenv==1.2.2
 requests==2.34.2
 SQLAlchemy==2.0.52
 alembic==1.19.2
+google-auth==2.58.0

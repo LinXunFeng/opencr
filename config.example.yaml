@@ -42,6 +42,11 @@ server:
   # Log verbosity level: DEBUG / INFO / WARNING / ERROR.
   # 日志级别：DEBUG / INFO / WARNING / ERROR。
   log_level: "INFO"
+  # Public base URL of this service, used to link survey ledger rows back to run
+  # details (e.g. https://opencr.company.com). Leave empty to omit the link column.
+  # 服务的对外访问地址，用于在巡检台账里生成运行详情链接（例如 https://opencr.company.com）。
+  # 服务监听的是 0.0.0.0，前面通常还有反向代理，自己推不出这个地址；留空则不输出链接列。
+  public_url: ""
 
 # Review process behavior controls.
 # 审查流程控制参数。
@@ -113,6 +118,31 @@ survey:
     # Timeout for cloning or fetching one repository, in seconds.
     # 单个仓库克隆/拉取的超时时间（秒）。
     fetch_timeout_seconds: 600
+
+# Survey destinations: external platforms that mirror each survey's issue ledger.
+# Each key is an instance name; surveys bind to instances in the console and choose
+# where to write (e.g. which spreadsheet and worksheet). Credentials live only here,
+# never in the database. Available types: google_sheet.
+# 巡检输出目标：把每个巡检的问题台账（Ledger）镜像到外部平台。
+# 每个键是一个实例名；各巡检在后台绑定实例，并指定写到哪里（例如哪张表、哪个工作表）。
+# 凭据只写在这里，不入库。当前可用类型：google_sheet。
+#
+# The ledger has one row per survey + fingerprint. Pushes only overwrite system columns
+# located by header name; columns you add (owner, progress...) are never read or written.
+# 台账按「巡检 + 指纹」一行，推送只覆盖按表头名称定位的系统列；你在表里加的列
+# （负责人、处理进度等）系统从不读取也从不改写。系统列的表头不要改名。
+#
+# Pushing hands finding bodies to the platform: who can read them is decided by the
+# spreadsheet's sharing settings, not by the guest switches below.
+# 推送即交出了发现正文的可见性控制：谁能看到正文由表格的共享设置决定，不受游客开关约束。
+destinations:
+  # quality-sheet:
+  #   # Google Sheet via a service account. Share the spreadsheet with the service
+  #   # account's email as an Editor. In Docker, mount the key file into the container.
+  #   # 通过服务账号写入 Google Sheet。需把表格以「编辑者」身份共享给服务账号邮箱；
+  #   # Docker 部署时把密钥文件挂载进容器，并在这里写容器内路径。
+  #   type: google_sheet
+  #   credentials_file: "/path/to/service-account.json"
 
 # Admin console settings. Disabled by default.
 # 后台管理配置。默认关闭 —— 从旧版本升级上来的实例不会平白多出一个管理面板。
