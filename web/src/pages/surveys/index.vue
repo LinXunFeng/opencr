@@ -172,6 +172,10 @@ function destinationOf(name: string) {
   return destinations.value.find(d => d.name === name)
 }
 
+function destinationLabel(d: DestinationItem) {
+  return [d.type_label || d.type, d.summary].filter(Boolean).join(" · ")
+}
+
 function addBinding() {
   const first = destinations.value.find(d => !d.error)
   form.bindings.push({ destination: first?.name ?? "", target: {} })
@@ -505,9 +509,9 @@ onMounted(load)
                 >
                   <el-option
                     v-for="d in destinations" :key="d.name"
-                    :label="`${d.name}（${d.type_label || d.type}）`" :value="d.name" :disabled="!!d.error"
+                    :label="`${d.name}（${destinationLabel(d)}）`" :value="d.name" :disabled="!!d.error"
                   >
-                    <span>{{ d.name }}（{{ d.type_label || d.type }}）</span>
+                    <span>{{ d.name }}（{{ destinationLabel(d) }}）</span>
                     <span v-if="d.error" class="sub">{{ d.error }}</span>
                   </el-option>
                 </el-select>

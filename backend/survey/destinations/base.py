@@ -150,6 +150,11 @@ class Destination(ABC):
         return normalized
 
     @classmethod
+    def describe_options(cls, options: Dict[str, Any]) -> str:
+        """实例配置的一行摘要（例如鉴权方式），用于后台下拉框。不得包含任何凭据内容。"""
+        return ""
+
+    @classmethod
     def describe_target(cls, target: Dict[str, Any]) -> str:
         """目标位置的一行摘要，用于后台展示。"""
         parts = []

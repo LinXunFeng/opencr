@@ -34,6 +34,9 @@ services:
       # 只是下次巡检要重新全量克隆。全量克隆多个仓库可能占几十 GB，
       # 磁盘紧张时把它换成指向大盘的 bind mount。
       - opencr-workspaces:/app/workspaces
+      # gogcli 的数据目录（可选，仅 Google Sheet 使用 auth: gogcli 时需要）：
+      # OAuth 客户端信息与加密后的令牌都在这里。删掉它等于在容器里退出登录。
+      - opencr-gogcli:/app/gogcli
       # 巡检输出目标的凭据（可选）：例如 Google Sheet 的服务账号密钥。
       # config.yaml 的 destinations 里写容器内路径 /app/secrets/xxx.json。
       # - type: bind
@@ -45,8 +48,15 @@ services:
       OPENCR_DATABASE_URL: sqlite:////app/data/opencr.db
       OPENCR_LOG_FILE: /app/logs/server.log
       OPENCR_SURVEY_WORKSPACE_DIR: /app/workspaces
+      # gogcli：容器里没有系统钥匙串，令牌只能存成加密文件。
+      # 密码写在与 docker-compose.yml 同目录的 .env 里（GOG_KEYRING_PASSWORD=...，已在 .gitignore 中），
+      # 导入令牌之后不能再改，否则已存的令牌解不开。不用 gogcli 时留空即可。
+      GOG_HOME: /app/gogcli
+      GOG_KEYRING_BACKEND: file
+      GOG_KEYRING_PASSWORD: ${GOG_KEYRING_PASSWORD:-}
 
 volumes:
   opencr-data:
   opencr-logs:
   opencr-workspaces:
+  opencr-gogcli:

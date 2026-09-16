@@ -143,6 +143,21 @@ destinations:
   #   # Docker 部署时把密钥文件挂载进容器，并在这里写容器内路径。
   #   type: google_sheet
   #   credentials_file: "/path/to/service-account.json"
+  #
+  # team-sheet:
+  #   # Google Sheet as a user already signed in with gogcli (https://github.com/openclaw/gogcli).
+  #   # The service shells out to gogcli and never holds user tokens itself. `account` is
+  #   # required: gogcli's default account can be changed by anyone running `gog auth add`.
+  #   # launchd: use an absolute gogcli_bin, its PATH has no Homebrew or ~/.local/bin.
+  #   # Docker: gogcli is baked into the image; tokens live in the opencr-gogcli volume.
+  #   # 以 gogcli 中已登录的用户身份写入 Google Sheet。服务调用 gogcli，自己不持有任何用户令牌。
+  #   # account 必填：别人执行一次 `gog auth add` 就能换掉 gogcli 的默认账号。
+  #   # launchd 部署时 gogcli_bin 写绝对路径（其 PATH 里没有 Homebrew 与 ~/.local/bin）；
+  #   # Docker 镜像已内置 gogcli，令牌存放在 opencr-gogcli 卷里，准备方式见 README。
+  #   type: google_sheet
+  #   auth: gogcli
+  #   account: "someone@company.com"
+  #   gogcli_bin: "/opt/homebrew/bin/gog"
 
 # Admin console settings. Disabled by default.
 # 后台管理配置。默认关闭 —— 从旧版本升级上来的实例不会平白多出一个管理面板。

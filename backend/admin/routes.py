@@ -680,6 +680,10 @@ def api_destinations():
                 "name": info.name,
                 "type": info.type_name,
                 "type_label": type_info["label"] if type_info else "",
+                "summary": (
+                    DESTINATION_TYPES[info.type_name].describe_options(info.options)
+                    if info.type_name in DESTINATION_TYPES and not info.error else ""
+                ),
                 "target_fields": type_info["target_fields"] if type_info else [],
                 "error": info.error,
             }

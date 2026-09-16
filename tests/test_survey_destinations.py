@@ -772,7 +772,7 @@ class GoogleSheetTests(unittest.TestCase):
         destination, _, _ = self._destination([
             _Response(status=403, payload={"error": {"message": "The caller does not have permission"}}),
         ])
-        destination._client_email = "opencr@proj.iam.gserviceaccount.com"
+        destination._transport.client_email = "opencr@proj.iam.gserviceaccount.com"
         with self.assertRaises(DestinationError) as ctx:
             destination.push(self.TARGET, self._columns(), [])
         self.assertIn("opencr@proj.iam.gserviceaccount.com", str(ctx.exception))
@@ -875,7 +875,7 @@ class GoogleSheetTests(unittest.TestCase):
         with mock.patch.dict(sys.modules, {"google.auth.transport.requests": mock.Mock(),
                                            "google.oauth2": mock.Mock()}):
             with self.assertRaises(DestinationError) as ctx:
-                destination._get_session()
+                destination._transport._get_session()
         message = str(ctx.exception)
         self.assertIn(repr(raw), message)
         self.assertIn("行内注释", message)
@@ -897,6 +897,216 @@ class GoogleSheetTests(unittest.TestCase):
         batches = _chunks_by_size(items, max_bytes=1000)
         self.assertGreater(len(batches), 1)
         self.assertEqual(sum(len(b) for b in batches), 50)
+
+
+# ---------------------------------------------------------------------------
+# Google Sheet 插件：gogcli 鉴权方式（假子进程，不依赖真实安装的 gogcli）
+# ---------------------------------------------------------------------------
+
+class _FakeGogcli:
+    """按顺序回放预设结果；记录每次调用的参数、环境与请求体文件内容。"""
+
+    def __init__(self, results):
+        self.results = list(results)
+        self.calls = []
+
+    def __call__(self, args, capture_output=None, text=None, timeout=None, env=None):
+        import subprocess
+
+        body = None
+        if "--body" in args:
+            path = args[args.index("--body") + 1].lstrip("@")
+            body = json.loads(Path(path).read_text(encoding="utf-8"))
+            self.body_paths = getattr(self, "body_paths", []) + [path]
+        self.calls.append({"args": args, "env": env, "timeout": timeout, "body": body})
+        result = self.results.pop(0)
+        if isinstance(result, Exception):
+            raise result
+        code, stdout, stderr = result
+        return subprocess.CompletedProcess(args, code, stdout, stderr)
+
+
+def _ok(payload=None):
+    return (0, json.dumps(payload if payload is not None else {}), "")
+
+
+class GogcliTests(unittest.TestCase):
+    TARGET = {"spreadsheet": "x" * 30, "worksheet": "巡检"}
+    ACCOUNT = "someone@company.com"
+
+    def _destination(self, results, options=None):
+        from backend.survey.destinations.google_sheet import GoogleSheetDestination
+
+        runner = _FakeGogcli(results)
+        sleeps = []
+        destination = GoogleSheetDestination(
+            "sheet", {"auth": "gogcli", "account": self.ACCOUNT, "gogcli_bin": "/opt/bin/gog", **(options or {})},
+            runner=runner, sleep=sleeps.append,
+        )
+        return destination, runner, sleeps
+
+    def _columns(self):
+        from backend.survey.destinations.base import Column
+
+        return [Column("key", "键"), Column("title", "标题")]
+
+    def _row(self, key):
+        from backend.survey.destinations.base import LedgerRow
+
+        return LedgerRow(key=key, values={"key": key, "title": "=IMPORTXML(x)"}, restore_if_missing=True)
+
+    def test_options_require_explicit_account(self):
+        from backend.survey.destinations import DestinationError
+        from backend.survey.destinations.google_sheet import GoogleSheetDestination
+
+        GoogleSheetDestination.validate_options({"credentials_file": "/k.json"})  # 缺省仍是服务账号
+        for options in ({"auth": "gogcli"}, {"auth": "gogcli", "account": "auto"}, {"auth": "oauth"}):
+            with self.subTest(options=options), self.assertRaises(DestinationError):
+                GoogleSheetDestination.validate_options(options)
+
+    def test_dropdown_summary_names_auth_mode_without_secrets(self):
+        from backend.survey.destinations.google_sheet import GoogleSheetDestination
+
+        self.assertEqual(GoogleSheetDestination.describe_options({"credentials_file": "/secret/k.json"}), "服务账号")
+        self.assertEqual(
+            GoogleSheetDestination.describe_options({"auth": "gogcli", "account": self.ACCOUNT}),
+            f"gogcli · {self.ACCOUNT}",
+        )
+
+    def test_push_goes_through_api_call_with_body_file(self):
+        """
+        全部走 `gog api call`：写操作带 --allow-write --force，读操作不带；
+        请求体经临时文件传入而不出现在参数里，调用结束后文件被删除；写入仍是 RAW。
+        """
+        destination, runner, _ = self._destination([
+            _ok({"sheets": [{"properties": {"sheetId": 3, "title": "巡检", "gridProperties": {"columnCount": 26}}}]}),
+            _ok({"values": [["键", "标题"]]}),
+            _ok({"values": [["other:1"]]}),
+            _ok({}),
+        ])
+        stats = destination.push(self.TARGET, self._columns(), [self._row("s:new")])
+        self.assertEqual(stats.inserted, 1)
+
+        methods = [c["args"][5] for c in runner.calls]
+        self.assertEqual(methods, [
+            "spreadsheets.get", "spreadsheets.values.get", "spreadsheets.values.get", "spreadsheets.values.append",
+        ])
+        for call in runner.calls:
+            args = call["args"]
+            self.assertEqual(args[:5], ["/opt/bin/gog", "api", "call", "sheets", "v4"])
+            self.assertEqual(args[args.index("--account") + 1], self.ACCOUNT)
+            self.assertEqual(args[args.index("--scope") + 1], "https://www.googleapis.com/auth/spreadsheets")
+            self.assertIn("--no-input", args)
+            self.assertEqual(call["env"]["GOG_KEYRING_LOCK_TIMEOUT"], "30s")
+        self.assertNotIn("--allow-write", runner.calls[0]["args"])
+
+        append = runner.calls[-1]
+        self.assertIn("--allow-write", append["args"])
+        self.assertIn("--force", append["args"])
+        params = json.loads(append["args"][append["args"].index("--params") + 1])
+        self.assertEqual(params["valueInputOption"], "RAW")
+        self.assertEqual(params["range"], "'巡检'!A1")
+        self.assertEqual(append["body"]["values"], [["s:new", "=IMPORTXML(x)"]])
+        # 正文不出现在命令行参数里
+        self.assertFalse(any("IMPORTXML" in a for a in append["args"]))
+        self.assertTrue(all(not Path(p).exists() for p in runner.body_paths))
+
+    def test_exit_codes_become_actionable_errors(self):
+        from backend.survey.destinations import DestinationError
+        from backend.survey.destinations.google_transport import AuthRejected
+
+        cases = [
+            ((6, "", "Google API error (403 forbidden): nope"), DestinationError, ["编辑者", self.ACCOUNT]),
+            ((5, "", "Google API error (404)"), DestinationError, ["表格不存在"]),
+            ((4, "", "refresh token expired or revoked"), AuthRejected, ["gog auth add " + self.ACCOUNT, "Testing"]),
+            ((1, "", "macOS Keychain may be waiting for a permission prompt"), AuthRejected, ["始终允许"]),
+            ((1, "", "no TTY available for keyring file backend password prompt"), AuthRejected, ["GOG_KEYRING_PASSWORD"]),
+            ((2, "", "unknown flag"), DestinationError, ["版本不兼容"]),
+            ((10, "", "OAuth client credentials missing (OAuth client ID JSON)."), AuthRejected, ["gog auth credentials set"]),
+        ]
+        for result, error, phrases in cases:
+            with self.subTest(result=result):
+                destination, _, _ = self._destination([result])
+                with self.assertRaises(error) as ctx:
+                    destination.push(self.TARGET, self._columns(), [])
+                for phrase in phrases:
+                    self.assertIn(phrase, str(ctx.exception))
+
+    def test_missing_binary_points_at_absolute_path(self):
+        from backend.survey.destinations import DestinationError
+
+        destination, _, _ = self._destination([FileNotFoundError("gog")])
+        with self.assertRaises(DestinationError) as ctx:
+            destination.push(self.TARGET, self._columns(), [])
+        self.assertIn("gogcli_bin", str(ctx.exception))
+
+    def test_rate_limit_retried_after_gogcli_gives_up_but_not_in_check(self):
+        """gogcli 自己已经重试过；推送时再补两次长间隔重试，测试时一次都不补。"""
+        destination, runner, sleeps = self._destination([
+            (7, "", "rate limited"), (8, "", "timeout"),
+            _ok({"sheets": [{"properties": {"sheetId": 1, "title": "巡检", "gridProperties": {"columnCount": 26}}}]}),
+            _ok({"values": [["键", "标题"]]}),
+            _ok({"values": []}),
+        ])
+        destination.push(self.TARGET, self._columns(), [])
+        self.assertEqual(sleeps, [15, 45])
+
+        destination, runner, sleeps = self._destination([
+            _ok(), _ok({"accounts": [{"email": self.ACCOUNT, "services": ["sheets"]}]}),
+            (7, "", "rate limited"),
+        ])
+        items = destination.check(self.TARGET, self._columns())
+        self.assertEqual(sleeps, [])
+        self.assertEqual(items[-1].title, "读取表格")
+        self.assertIn("限流", items[-1].message)
+
+    def test_check_verifies_binary_and_account_first(self):
+        from backend.survey.destinations.base import CHECK_ERROR, CHECK_OK
+
+        missing, _, _ = self._destination([FileNotFoundError("gog")])
+        items = missing.check(self.TARGET, self._columns())
+        self.assertEqual([(i.title, i.level) for i in items], [("gogcli 可执行文件", CHECK_ERROR)])
+
+        other, _, _ = self._destination([(0, "v0.40.0", ""), _ok({"accounts": [{"email": "a@b.com"}]})])
+        items = other.check(self.TARGET, self._columns())
+        self.assertEqual(items[-1].level, CHECK_ERROR)
+        self.assertIn("a@b.com", items[-1].message)
+        self.assertIn("gog auth add " + self.ACCOUNT, items[-1].message)
+
+        no_sheets, _, _ = self._destination([
+            (0, "v0.40.0", ""), _ok({"accounts": [{"email": self.ACCOUNT.upper(), "services": ["gmail"]}]}),
+        ])
+        items = no_sheets.check(self.TARGET, self._columns())
+        self.assertEqual(items[-1].level, CHECK_ERROR)
+        self.assertIn("没有包含 Sheets", items[-1].message)
+
+        ok, runner, _ = self._destination([
+            (0, "v0.40.0", ""),
+            _ok({"accounts": [{"email": self.ACCOUNT, "services": ["sheets", "drive"]}]}),
+            _ok({"properties": {"title": "质量台账"}, "sheets": [{"properties": {"title": "巡检"}}]}),
+            _ok({"values": [["键", "标题"]]}),
+            _ok({}),
+        ])
+        items = ok.check(self.TARGET, self._columns())
+        self.assertEqual([i.level for i in items], [CHECK_OK] * 5)
+        self.assertEqual(items[0].title, "gogcli 可执行文件")
+        self.assertIn("v0.40.0", items[0].message)
+        write = runner.calls[-1]
+        self.assertEqual(write["args"][5], "spreadsheets.batchUpdate")
+        self.assertIn("updateSpreadsheetProperties", json.dumps(write["body"]))
+
+    def test_expired_authorization_is_reported_under_account_item(self):
+        """账号在 gogcli 里，但令牌已失效：第一次真实请求才会暴露，结论要归到账号授权那一项。"""
+        from backend.survey.destinations.base import CHECK_ERROR
+
+        destination, _, _ = self._destination([
+            (0, "v0.40.0", ""),
+            _ok({"accounts": [{"email": self.ACCOUNT, "services": ["sheets"]}]}),
+            (4, "", "refresh token expired or revoked"),
+        ])
+        items = destination.check(self.TARGET, self._columns())
+        self.assertEqual([(i.title, i.level) for i in items][-1], ("gogcli 账号授权", CHECK_ERROR))
+        self.assertEqual(len(items), 2)
 
 
 if __name__ == "__main__":

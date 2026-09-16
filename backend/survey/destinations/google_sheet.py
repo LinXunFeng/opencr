@@ -2,24 +2,21 @@
 """
 Google Sheet 输出目标。
 
-鉴权用 Service Account：服务端无人值守定时运行，OAuth 用户授权需要回调地址、
-要存 refresh token，还会在 token 失效后要求有人重新点一次授权 —— 那一天巡检会静默地不再推送。
-使用方需要把表格共享给服务账号的邮箱（编辑者权限）。
+支持两种鉴权方式（实例配置的 auth）：
+- service_account（缺省）：服务端无人值守定时运行，OAuth 用户授权需要回调地址、要存 refresh token，
+  还会在 token 失效后要求有人重新点一次授权。使用方把表格共享给服务账号的邮箱（编辑者权限）。
+- gogcli：复用构建机上 gogcli 已登录的用户身份，服务不持有任何用户令牌（ADR-0005）。
 
-依赖只用 google-auth + 直接调 Sheets REST API，不引 gspread / google-api-python-client：
-前者在批量更新时仍要自己拼范围，后者体积大、依赖多，而这里总共只用到五个接口。
+请求怎么发出去由 google_transport.py 负责，这里只描述调哪个接口、带什么参数，
+因此推送、检查、表头定位与补回规则两种方式共用一份。
 """
 
-import getpass
 import json
 import logging
 import re
 import threading
-import time
 from datetime import datetime
-from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
-from urllib.parse import quote
 
 from .base import (
     CHECK_ERROR,
@@ -35,11 +32,12 @@ from .base import (
     PushStats,
     TargetField,
 )
+from .google_transport import AuthRejected, GogcliTransport, ServiceAccountTransport, SheetsTransport
 
 logger = logging.getLogger(__name__)
 
-API_BASE = "https://sheets.googleapis.com/v4/spreadsheets"
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+AUTH_SERVICE_ACCOUNT = "service_account"
+AUTH_GOGCLI = "gogcli"
 
 # 单元格字符上限是 Google 的硬限制，超出会让整批写入失败，而不是只截断那一格
 CELL_CHAR_LIMIT = 50000
@@ -48,18 +46,6 @@ TRUNCATED_SUFFIX = "\n…（内容过长已截断，完整内容见运行详情�
 # 单次请求的负载上限。Google 建议不超过 2MB；台账正文可能很长（每行上限五万字），
 # 不分批的话几百行就能撞上请求体上限。
 MAX_BATCH_BYTES = 2_000_000
-
-# 写入配额是每分钟 60 次（按项目 + 用户），推送一个几百行的台账只需几次请求，
-# 撞上 429 基本是多个 Survey 同时推送。退避上限 32 秒、最多 5 次，足够等过一个配额窗口。
-MAX_ATTEMPTS = 5
-RETRYABLE_STATUS = {429, 500, 502, 503, 504}
-
-REQUEST_TIMEOUT_SECONDS = 60
-
-# 连通性测试是用户在表单里点按钮同步等结果，不能套用推送的退避策略（最坏要等一分多钟）。
-# 只重试一次、超时缩短：测试的职责是尽快告诉用户哪里不对，偶发的限流让他再点一次即可。
-CHECK_ATTEMPTS = 2
-CHECK_TIMEOUT_SECONDS = 15
 
 _SPREADSHEET_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{20,}$")
 _SPREADSHEET_URL_PATTERN = re.compile(r"/spreadsheets/d/([A-Za-z0-9_-]+)")
@@ -108,38 +94,6 @@ def parse_spreadsheet_id(value: str) -> str:
     return raw
 
 
-class CredentialsRejected(DestinationError):
-    """Google 拒绝为服务账号签发访问令牌。与网络故障分开：重试没有意义，排查方向也完全不同。"""
-
-
-def _is_credentials_rejection(error: Exception) -> bool:
-    """是否为换取访问令牌时被拒（google-auth 的 RefreshError）。按类名判断，避免未安装 google-auth 时导入失败。"""
-    return any(cls.__name__ == "RefreshError" for cls in type(error).__mro__)
-
-
-def _missing_credentials_message(raw: str, path: Path) -> str:
-    """
-    密钥文件找不到时的报错。
-
-    "路径明明是对的"几乎总是下面两种情况之一，报错里直接点出来，省得用户去翻代码：
-    - 服务运行在容器里，宿主机路径在容器内不存在；
-    - 服务没装 PyYAML，简化解析器不会去掉行内注释，读到的值里带着引号或 # 注释。
-    """
-    try:
-        user = getpass.getuser()
-    except Exception:
-        user = "未知"
-    message = f"服务账号密钥文件不存在：{path}（配置原始值 {raw!r}，服务运行用户 {user}）"
-    hints = []
-    if any(mark in raw for mark in ('"', "'", "#")):
-        hints.append("配置值里带有引号或 # 注释，请删掉这一行的行内注释")
-    if Path("/.dockerenv").exists():
-        hints.append("服务运行在容器内，需要把宿主机上的密钥文件挂载进容器，并在这里填写容器内的路径")
-    if hints:
-        message += "。" + "；".join(hints)
-    return message
-
-
 def _cell_value(column: Column, value: Any) -> Any:
     """
     把逻辑值转成写入单元格的值。
@@ -186,7 +140,7 @@ class GoogleSheetDestination(Destination):
             key="spreadsheet",
             label="表格",
             placeholder="表格链接或表格 ID",
-            help="需要先把表格以「编辑者」身份共享给服务账号的邮箱。",
+            help="需要先把表格以「编辑者」身份共享给写表的身份：服务账号邮箱，或 gogcli 中授权的账号。",
         ),
         TargetField(
             key="worksheet",
@@ -202,21 +156,56 @@ class GoogleSheetDestination(Destination):
         name: str,
         options: Dict[str, Any],
         session: Any = None,
-        sleep: Callable[[float], None] = time.sleep,
+        sleep: Optional[Callable[[float], None]] = None,
+        runner: Optional[Callable[..., Any]] = None,
     ):
-        """session 与 sleep 仅供测试注入；生产环境按 credentials_file 惰性创建会话。"""
+        """session / runner / sleep 仅供测试注入：分别替换服务账号的 HTTP 会话与 gogcli 的子进程调用。"""
         super().__init__(name, options)
-        self._session = session
-        self._sleep = sleep
-        self._client_email = ""
+        extra = {"sleep": sleep} if sleep else {}
+        if self.auth == AUTH_GOGCLI:
+            self._transport: SheetsTransport = GogcliTransport(
+                account=str(options.get("account") or "").strip(),
+                binary=str(options.get("gogcli_bin") or "gog").strip(),
+                **({"runner": runner} if runner else {}), **extra,
+            )
+        else:
+            self._transport = ServiceAccountTransport(
+                str(options.get("credentials_file") or ""), session=session, **extra,
+            )
         # 追加列要用数值 sheetId 而不是标题，由 _ensure_worksheet 填入
         self._sheet_id: Optional[int] = None
 
+    @property
+    def auth(self) -> str:
+        """鉴权方式。缺省为服务账号，0.7.0 之前写好的实例配置不受影响。"""
+        return str(self.options.get("auth") or AUTH_SERVICE_ACCOUNT).strip()
+
     @classmethod
     def validate_options(cls, options: Dict[str, Any]) -> None:
-        """必须提供服务账号的 JSON 密钥文件路径。文件是否存在留到推送时检查，以免挂载延迟时整个实例被判为不可用。"""
-        if not str((options or {}).get("credentials_file") or "").strip():
-            raise DestinationError("缺少 credentials_file（服务账号 JSON 密钥文件路径）")
+        """
+        按鉴权方式校验必填项。文件或可执行文件是否存在留到推送时检查，以免挂载延迟时整个实例被判为不可用。
+        """
+        options = options or {}
+        auth = str(options.get("auth") or AUTH_SERVICE_ACCOUNT).strip()
+        if auth == AUTH_SERVICE_ACCOUNT:
+            if not str(options.get("credentials_file") or "").strip():
+                raise DestinationError("缺少 credentials_file（服务账号 JSON 密钥文件路径）")
+        elif auth == AUTH_GOGCLI:
+            account = str(options.get("account") or "").strip()
+            # 必须显式指定：别人在构建机上执行一次 `gog auth add` 就能换掉默认账号，
+            # 推送随之以另一个人的身份写表
+            if not account or account.lower() in {"auto", "default"}:
+                raise DestinationError("auth 为 gogcli 时必须填写 account（gogcli 中已授权的账号邮箱）")
+        else:
+            raise DestinationError(f"未知的鉴权方式：{auth}；可选 {AUTH_SERVICE_ACCOUNT} 或 {AUTH_GOGCLI}")
+
+    @classmethod
+    def describe_options(cls, options: Dict[str, Any]) -> str:
+        """鉴权方式；gogcli 方式带上账号，方便在下拉框里分清同一张表的不同身份。"""
+        options = options or {}
+        if str(options.get("auth") or AUTH_SERVICE_ACCOUNT).strip() == AUTH_GOGCLI:
+            return f"gogcli · {str(options.get('account') or '').strip()}"
+        return "服务账号"
 
     @classmethod
     def normalize_target(cls, target: Dict[str, Any], survey_name: str) -> Dict[str, str]:
@@ -233,112 +222,25 @@ class GoogleSheetDestination(Destination):
         return {"spreadsheet": parse_spreadsheet_id(spreadsheet), "worksheet": worksheet}
 
     # ------------------------------------------------------------------
-    # HTTP
-    # ------------------------------------------------------------------
-
-    def _get_session(self) -> Any:
-        """惰性创建带服务账号凭据的会话。"""
-        if self._session is not None:
-            return self._session
-        try:
-            from google.auth.transport.requests import AuthorizedSession
-            from google.oauth2 import service_account
-        except ImportError:
-            raise DestinationError("缺少依赖 google-auth，请执行 pip install -r requirements.txt")
-
-        raw = str(self.options.get("credentials_file") or "")
-        path = Path(raw).expanduser()
-        if not path.is_file():
-            raise DestinationError(_missing_credentials_message(raw, path))
-        try:
-            credentials = service_account.Credentials.from_service_account_file(str(path), scopes=SCOPES)
-        except (ValueError, OSError) as e:
-            raise DestinationError(f"服务账号密钥文件无法解析：{e}")
-        self._client_email = getattr(credentials, "service_account_email", "") or ""
-        self._session = AuthorizedSession(credentials)
-        return self._session
-
-    def _call(
-        self,
-        method: str,
-        url: str,
-        params: Optional[dict] = None,
-        body: Optional[dict] = None,
-        attempts: int = MAX_ATTEMPTS,
-        timeout: int = REQUEST_TIMEOUT_SECONDS,
-    ) -> dict:
-        """发一次请求；429 与 5xx 退避重试，其余错误转成可读的 DestinationError。"""
-        session = self._get_session()
-        for attempt in range(attempts):
-            try:
-                response = session.request(method, url, params=params, json=body, timeout=timeout)
-            except Exception as e:
-                if _is_credentials_rejection(e):
-                    raise CredentialsRejected(
-                        f"Google 拒绝了服务账号凭据（{e}）。常见原因：密钥已被删除或服务账号已停用、"
-                        "密钥文件不是这个服务账号的最新密钥、服务器时钟偏差过大"
-                    )
-                # 网络抖动与 5xx 同等对待：本次推送失败的代价是整张台账晚一周更新
-                if attempt < attempts - 1:
-                    self._sleep(min(2 ** attempt, 32))
-                    continue
-                raise DestinationError(f"无法连接 Google Sheets：{e}")
-
-            if response.status_code in RETRYABLE_STATUS and attempt < attempts - 1:
-                delay = min(2 ** attempt, 32)
-                retry_after = response.headers.get("Retry-After") if response.headers else None
-                if retry_after and str(retry_after).isdigit():
-                    delay = min(int(retry_after), 60)
-                logger.info("Google Sheets %s, retrying in %ss", response.status_code, delay)
-                self._sleep(delay)
-                continue
-
-            if response.status_code >= 400:
-                raise DestinationError(self._describe_error(response))
-            if not response.content:
-                return {}
-            return response.json()
-        raise DestinationError("Google Sheets 请求多次重试后仍失败")
-
-    def _describe_error(self, response: Any) -> str:
-        """把接口错误翻译成能指导排查的一句话。"""
-        message = ""
-        try:
-            message = response.json().get("error", {}).get("message", "")
-        except Exception:
-            message = (getattr(response, "text", "") or "")[:300]
-        status = response.status_code
-        who = f"服务账号 {self._client_email}" if self._client_email else "服务账号"
-        if status == 403:
-            return f"没有权限写入该表格，请确认已把表格以「编辑者」身份共享给{who}（{message}）"
-        if status == 404:
-            return f"表格不存在，或{who}无权访问（{message}）"
-        return f"Google Sheets 返回 {status}：{message}"
-
-    # ------------------------------------------------------------------
     # 连通性测试
     # ------------------------------------------------------------------
 
     def check(self, target: Dict[str, str], columns: Sequence[Column]) -> List[CheckItem]:
-        """依次检查：凭据 → 读取表格 → 工作表与表头 → 写入权限。不创建工作表，不写任何台账行。"""
-        items: List[CheckItem] = []
-        try:
-            self._get_session()
-        except DestinationError as e:
-            return [CheckItem("服务账号凭据", CHECK_ERROR, str(e))]
-        who = self._client_email or "服务账号"
-        items.append(CheckItem("服务账号凭据", CHECK_OK, f"已通过 {who} 访问 Google，表格需要以「编辑者」身份共享给它"))
-
-        base = f"{API_BASE}/{quote(target['spreadsheet'], safe='')}"
-        call = {"attempts": CHECK_ATTEMPTS, "timeout": CHECK_TIMEOUT_SECONDS}
-        try:
-            meta = self._call(
-                "GET", base, params={"fields": "properties.title,sheets.properties(sheetId,title)"}, **call
-            )
-        except CredentialsRejected as e:
-            # 密钥文件能解析不代表凭据有效，第一次真正请求时才会去换令牌
-            items[0] = CheckItem("服务账号凭据", CHECK_ERROR, str(e))
+        """依次检查：身份 → 读取表格 → 工作表与表头 → 写入权限。不创建工作表，不写任何台账行。"""
+        items = self._transport.preflight()
+        if not items or items[-1].level == CHECK_ERROR:
             return items
+
+        spreadsheet = target["spreadsheet"]
+        try:
+            meta = self._transport.call(
+                "spreadsheets.get",
+                {"spreadsheetId": spreadsheet, "fields": "properties.title,sheets.properties(sheetId,title)"},
+                quick=True,
+            )
+        except AuthRejected as e:
+            # 凭据能加载不代表有效，第一次真正请求时才会去换令牌；结论归到身份那一项
+            return self._replace_auth_item(items, str(e))
         except DestinationError as e:
             items.append(CheckItem("读取表格", CHECK_ERROR, str(e)))
             return items
@@ -351,8 +253,10 @@ class GoogleSheetDestination(Destination):
             items.append(CheckItem("工作表", CHECK_WARN, f"工作表「{worksheet}」不存在，首次推送时会自动创建"))
         else:
             try:
-                data = self._call(
-                    "GET", f"{base}/values/{quote(quote_sheet_title(worksheet) + '!1:1', safe='')}", **call
+                data = self._transport.call(
+                    "spreadsheets.values.get",
+                    {"spreadsheetId": spreadsheet, "range": quote_sheet_title(worksheet) + "!1:1"},
+                    quick=True,
                 )
             except DestinationError as e:
                 items.append(CheckItem("工作表", CHECK_ERROR, str(e)))
@@ -376,18 +280,26 @@ class GoogleSheetDestination(Destination):
         try:
             # 用"把表格标题改成它自己"验证写权限：这是一次真实的写请求，查看者会被拒绝，
             # 但表格内容与标题都不变。只读 GET 证明不了能写，而写一行再删掉会在用户的表里留下痕迹。
-            self._call(
-                "POST", f"{base}:batchUpdate",
+            self._transport.call(
+                "spreadsheets.batchUpdate",
+                {"spreadsheetId": spreadsheet},
                 body={"requests": [{"updateSpreadsheetProperties": {
                     "properties": {"title": title}, "fields": "title",
                 }}]},
-                **call,
+                quick=True,
             )
         except DestinationError as e:
             items.append(CheckItem("写入权限", CHECK_ERROR, str(e)))
             return items
         items.append(CheckItem("写入权限", CHECK_OK, "可以写入"))
         return items
+
+    def _replace_auth_item(self, items: List[CheckItem], message: str) -> List[CheckItem]:
+        """把身份那一项改判为失败，并丢弃它之后的检查项。"""
+        for index, item in enumerate(items):
+            if item.title == self._transport.auth_title:
+                return items[:index] + [CheckItem(item.title, CHECK_ERROR, message)]
+        return items + [CheckItem(self._transport.auth_title, CHECK_ERROR, message)]
 
     # ------------------------------------------------------------------
     # 推送
@@ -404,18 +316,17 @@ class GoogleSheetDestination(Destination):
         self, spreadsheet_id: str, worksheet: str, columns: List[Column], rows: List[LedgerRow]
     ) -> PushStats:
         """持锁执行的推送主体。"""
-        base = f"{API_BASE}/{quote(spreadsheet_id, safe='')}"
         sheet_ref = quote_sheet_title(worksheet)
 
-        grid_columns = self._ensure_worksheet(base, worksheet)
-        positions, new_headers = self._resolve_columns(base, sheet_ref, columns)
+        grid_columns = self._ensure_worksheet(spreadsheet_id, worksheet)
+        positions, new_headers = self._resolve_columns(spreadsheet_id, sheet_ref, columns)
 
         needed = max(positions.values()) + 1
         if needed > grid_columns:
             # 写到网格之外会被接口直接拒绝，而不是自动扩列
-            self._append_columns(base, worksheet, needed - grid_columns)
+            self._append_columns(spreadsheet_id, worksheet, needed - grid_columns)
         if new_headers:
-            self._write_cells(base, [
+            self._write_cells(spreadsheet_id, [
                 {"range": f"{sheet_ref}!{column_letter(index)}1", "values": [[header]]}
                 for index, header in new_headers
             ])
@@ -425,7 +336,7 @@ class GoogleSheetDestination(Destination):
             # 键列是刚补出来的，说明表里还没有任何台账行，不必再读
             existing: Dict[str, List[int]] = {}
         else:
-            existing = self._read_keys(base, sheet_ref, positions[key_column.key])
+            existing = self._read_keys(spreadsheet_id, sheet_ref, positions[key_column.key])
 
         stats = PushStats()
         updates: List[dict] = []
@@ -447,15 +358,15 @@ class GoogleSheetDestination(Destination):
                 stats.skipped += 1
 
         if updates:
-            self._write_cells(base, updates)
+            self._write_cells(spreadsheet_id, updates)
         if appends:
-            self._append_rows(base, sheet_ref, appends)
+            self._append_rows(spreadsheet_id, sheet_ref, appends)
         return stats
 
-    def _ensure_worksheet(self, base: str, worksheet: str) -> int:
+    def _ensure_worksheet(self, spreadsheet_id: str, worksheet: str) -> int:
         """确保工作表存在，返回它当前的列数。"""
-        meta = self._call(
-            "GET", base, params={"fields": "sheets.properties(sheetId,title,gridProperties)"}
+        meta = self._transport.call(
+            "spreadsheets.get", {"spreadsheetId": spreadsheet_id, "fields": "sheets.properties(sheetId,title,gridProperties)"}
         )
         for sheet in meta.get("sheets", []) or []:
             props = sheet.get("properties", {}) or {}
@@ -463,26 +374,26 @@ class GoogleSheetDestination(Destination):
                 self._sheet_id = props.get("sheetId")
                 return int((props.get("gridProperties") or {}).get("columnCount") or 26)
 
-        reply = self._call(
-            "POST", f"{base}:batchUpdate",
+        reply = self._transport.call(
+            "spreadsheets.batchUpdate", {"spreadsheetId": spreadsheet_id},
             body={"requests": [{"addSheet": {"properties": {"title": worksheet}}}]},
         )
         props = ((reply.get("replies") or [{}])[0].get("addSheet") or {}).get("properties") or {}
         self._sheet_id = props.get("sheetId")
-        logger.info("Created worksheet %r in spreadsheet %s", worksheet, base.rsplit("/", 1)[-1])
+        logger.info("Created worksheet %r in spreadsheet %s", worksheet, spreadsheet_id)
         return int((props.get("gridProperties") or {}).get("columnCount") or 26)
 
-    def _append_columns(self, base: str, worksheet: str, count: int) -> None:
+    def _append_columns(self, spreadsheet_id: str, worksheet: str, count: int) -> None:
         """在工作表末尾追加列。"""
-        self._call(
-            "POST", f"{base}:batchUpdate",
+        self._transport.call(
+            "spreadsheets.batchUpdate", {"spreadsheetId": spreadsheet_id},
             body={"requests": [{"appendDimension": {
                 "sheetId": self._sheet_id, "dimension": "COLUMNS", "length": int(count),
             }}]},
         )
 
     def _resolve_columns(
-        self, base: str, sheet_ref: str, columns: List[Column]
+        self, spreadsheet_id: str, sheet_ref: str, columns: List[Column]
     ) -> Tuple[Dict[str, int], List[Tuple[int, str]]]:
         """
         读表头，按名称定位每个系统列。
@@ -490,7 +401,7 @@ class GoogleSheetDestination(Destination):
         返回 ({column.key: 列序号}, [(列序号, 需要补写的表头)])。
         缺失的系统列补在现有表头之后，不插到中间 —— 插列会挪动用户的人工列。
         """
-        data = self._call("GET", f"{base}/values/{quote(sheet_ref + '!1:1', safe='')}")
+        data = self._transport.call("spreadsheets.values.get", {"spreadsheetId": spreadsheet_id, "range": sheet_ref + "!1:1"})
         header_row = [str(v).strip() for v in ((data.get("values") or [[]])[0] or [])]
 
         index_by_header: Dict[str, int] = {}
@@ -510,13 +421,15 @@ class GoogleSheetDestination(Destination):
                 next_index += 1
         return positions, new_headers
 
-    def _read_keys(self, base: str, sheet_ref: str, key_index: int) -> Dict[str, List[int]]:
+    def _read_keys(self, spreadsheet_id: str, sheet_ref: str, key_index: int) -> Dict[str, List[int]]:
         """读键列，返回 {键: [行号...]}。同一个键出现多行（用户复制过行）时每一行都更新。"""
         letter = column_letter(key_index)
-        data = self._call(
-            "GET",
-            f"{base}/values/{quote(f'{sheet_ref}!{letter}2:{letter}', safe='')}",
-            params={"majorDimension": "ROWS", "valueRenderOption": "UNFORMATTED_VALUE"},
+        data = self._transport.call(
+            "spreadsheets.values.get",
+            {
+                "spreadsheetId": spreadsheet_id, "range": f"{sheet_ref}!{letter}2:{letter}",
+                "majorDimension": "ROWS", "valueRenderOption": "UNFORMATTED_VALUE",
+            },
         )
         keys: Dict[str, List[int]] = {}
         for offset, cells in enumerate(data.get("values") or []):
@@ -546,7 +459,7 @@ class GoogleSheetDestination(Destination):
         ranges.append(_range(sheet_ref, row_number, start, values))
         return ranges
 
-    def _write_cells(self, base: str, data: List[dict]) -> None:
+    def _write_cells(self, spreadsheet_id: str, data: List[dict]) -> None:
         """
         批量写入若干范围。
 
@@ -554,20 +467,27 @@ class GoogleSheetDestination(Destination):
         会被当成公式执行（例如 =IMPORTXML 把表内数据发往外部地址）。
         """
         for batch in _chunks_by_size(data):
-            self._call("POST", f"{base}/values:batchUpdate", body={"valueInputOption": "RAW", "data": batch})
+            self._transport.call(
+                "spreadsheets.values.batchUpdate", {"spreadsheetId": spreadsheet_id},
+                body={"valueInputOption": "RAW", "data": batch},
+            )
 
-    def _append_rows(self, base: str, sheet_ref: str, rows: List[List[Any]]) -> None:
+    def _append_rows(self, spreadsheet_id: str, sheet_ref: str, rows: List[List[Any]]) -> None:
         """
         在表格末尾追加行。
 
         人工列位置填 null：追加接口会跳过 null，不会往用户的列里写空串。
         INSERT_ROWS 让接口自动扩行，不受网格行数限制。
         """
-        url = f"{base}/values/{quote(sheet_ref + '!A1', safe='')}:append"
         for batch in _chunks_by_size(rows):
-            self._call(
-                "POST", url,
-                params={"valueInputOption": "RAW", "insertDataOption": "INSERT_ROWS"},
+            # 5xx 后重试追加存在重复写入的可能（请求其实已经生效）。影响有限：同一个键的多行
+            # 在下次推送时都会被更新，数据不会出错，只是多出一行
+            self._transport.call(
+                "spreadsheets.values.append",
+                {
+                    "spreadsheetId": spreadsheet_id, "range": sheet_ref + "!A1",
+                    "valueInputOption": "RAW", "insertDataOption": "INSERT_ROWS",
+                },
                 body={"majorDimension": "ROWS", "values": batch},
             )
 

@@ -478,7 +478,43 @@ destinations:
     credentials_file: "/path/to/service-account.json"
 ```
 
-Google Sheet authenticates with a service account: enable the Google Sheets API in Google Cloud, create a service account, download its JSON key, and **share the spreadsheet with the service account's email as an Editor**. In Docker, mount the key file into the container (there is a commented example in `docker-compose.yml`) and point `credentials_file` at the in-container path.
+Google Sheet supports two authentication modes, chosen by the instance's `auth`:
+
+- **Service account (`auth: service_account`, the default)**: enable the Google Sheets API in Google Cloud, create a service account, download its JSON key, and **share the spreadsheet with the service account's email as an Editor**. In Docker, mount the key file into the container (there is a commented example in `docker-compose.yml`) and point `credentials_file` at the in-container path.
+- **gogcli (`auth: gogcli`)**: reuse a user already signed in with [gogcli](https://github.com/openclaw/gogcli) and share the spreadsheet with that account. The service sends requests through `gog api call` and never holds user tokens itself; see [`docs/adr/0005-google-sheet-via-gogcli.md`](docs/adr/0005-google-sheet-via-gogcli.md).
+
+```yaml
+destinations:
+  team-sheet:
+    type: google_sheet
+    auth: gogcli
+    account: "someone@company.com"     # required; never relies on gogcli's default account
+    gogcli_bin: "/opt/homebrew/bin/gog" # absolute path for launchd
+```
+
+`account` must be explicit: anyone running `gog auth add` on the build machine could otherwise change gogcli's default account, and pushes would silently write as someone else.
+
+**launchd**: install gogcli yourself (for example `brew install openclaw/tap/gogcli`) and run `gog auth add <account> --services sheets` as the user the service runs as; tokens stay in the system keychain and the service reuses them. Set `gogcli_bin` to the absolute path from `command -v gog`, since launchd's PATH has neither Homebrew nor `~/.local/bin`. The first keychain read from a background service may be held by a permission prompt; the connectivity test says so, and running `gog auth list` once in a terminal and clicking "Always Allow" fixes it.
+
+**Docker**: the image ships a pinned gogcli by default (skip it with `--build-arg GOGCLI_VERSION=`). There is no keychain in the container, so tokens are stored as encrypted files in the `opencr-gogcli` volume:
+
+```bash
+# 1. Set the token encryption password in .env next to docker-compose.yml (do not change it after importing)
+echo 'GOG_KEYRING_PASSWORD=<a long random string>' >> .env
+docker compose up -d
+
+# 2. Import the OAuth client (the same JSON used with `gog auth credentials set` on the host)
+docker compose cp client_secret.json opencr:/tmp/client_secret.json
+docker compose exec opencr gog auth credentials set /tmp/client_secret.json
+
+# 3. Export the token on the host and import it into the container; delete both copies afterwards, it contains a refresh token
+gog auth tokens export someone@company.com --out tokens.json
+docker compose cp tokens.json opencr:/tmp/tokens.json
+docker compose exec opencr gog auth tokens import /tmp/tokens.json
+docker compose exec opencr rm -f /tmp/tokens.json /tmp/client_secret.json && rm -f tokens.json
+```
+
+Alternatively authorize inside the container with `docker compose exec -it opencr gog auth add someone@company.com --services sheets --manual`. Either way, **publish the OAuth app to production**: refresh tokens issued by an app in Testing status expire after 7 days, and pushes start failing silently one week.
 
 **2. Bind it in the survey configuration.** Edit survey → Destinations → pick an instance, then enter the spreadsheet link (or ID) and worksheet name. A missing worksheet is created automatically; an empty name defaults to the survey name. A survey can bind several destinations, and several surveys can share one worksheet (the "巡检" column tells them apart). Click "测试连通性" (test connectivity) to check, in order, that the service account key loads, the spreadsheet is readable, the worksheet and its existing system columns, and write access; the service account email is shown so you know whom to share the sheet with. The test never creates a worksheet or writes ledger rows.
 
@@ -496,6 +532,7 @@ Rules worth knowing:
 - **Deleted rows.** A row whose state is still "present" is restored if you delete it, otherwise a live problem would silently vanish; "not seen" and "ignored" rows stay deleted. The first push to a newly bound sheet writes the full ledger.
 - **Marking a finding as a known issue** flips its ledger row to "ignored" immediately; the next push updates the sheet without deleting the row.
 - Values are written as raw text, so a body starting with `=` is never evaluated as a formula.
+- Appending rows is retried on server 5xx errors; if the failed request had in fact been applied, the sheet gets a duplicate row with the same key. The impact is limited: the next push updates both rows, the data stays correct, and the extra row can be deleted by hand.
 - **Pushing hands over control of who can read finding bodies**: that is decided by the spreadsheet's sharing settings, not by the guest switches. Guests in the console see push status but not the target location or error messages.
 
 **Adding a platform**: implement `Destination` from `backend/survey/destinations/base.py` and register it in `backend/survey/destinations/__init__.py`. The core already computes each row's content and state; a plugin only writes rows by key. Implementing `check` is optional and powers the console's connectivity test. To judge whether a platform fits, ask three questions: can it look up existing rows by key, can it write in batches, and how strict are its rate limits.

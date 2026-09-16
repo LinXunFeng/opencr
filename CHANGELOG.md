@@ -23,6 +23,10 @@
 ### Changed
 
 - 新增依赖 `google-auth`，Google Sheet 通过它直接调用 Sheets REST API，不引入 gspread 或 google-api-python-client。
+- Google Sheet 输出目标新增 `auth: gogcli` 鉴权方式：复用 [gogcli](https://github.com/openclaw/gogcli) 已登录的用户身份写表，服务通过 `gog api call` 发出请求、自己不持有用户令牌。`account` 必填，不依赖 gogcli 的默认账号；`gogcli_bin` 建议写绝对路径。请求体经仅本用户可读的临时文件传入，不出现在命令行参数与进程列表中；gogcli 调用在进程内串行执行，并把令牌锁等待时间放宽到 30 秒。缺省仍为服务账号方式，已有配置不受影响。理由见 `docs/adr/0005-google-sheet-via-gogcli.md`。
+- gogcli 方式的连通性测试额外检查可执行文件与账号授权（账号是否存在、是否包含 Sheets），退出码被翻译为可读报错，钥匙串授权弹窗、文件存储缺少密码、OAuth 应用处于 Testing 导致令牌 7 天过期等情况给出对应提示。推送时对限流与可重试错误在 gogcli 自身重试之外再补两次长间隔重试，连通性测试不补。
+- Docker 镜像默认内置 gogcli（版本钉死为 v0.40.0，按官方 checksums 校验），可用 `--build-arg GOGCLI_VERSION=` 跳过；`docker-compose.yml` 新增 `opencr-gogcli` 卷与 `GOG_HOME`、`GOG_KEYRING_BACKEND=file`、`GOG_KEYRING_PASSWORD` 环境变量。
+- 后台的输出目标下拉框显示实例的鉴权方式与账号。
 - 巡检中 codegraph 可用但单个仓库建索引失败时，该仓库的处理状态由「正常」改记为「索引失败」。台账依据它判断该仓库本轮结论是否可信；降级记录与之前一致。
 - `install.sh` 重新生成配置时保留项目配置里的 `destinations` 段与 `server.public_url`。
 - `docker-compose.yml` 增加挂载凭据目录的注释示例。
@@ -30,6 +34,7 @@
 ### Notes
 
 - 推送失败只记在推送记录里，不改变巡检运行的状态，也不算降级。
+- 追加行遇到服务端 5xx 时会重试，若那次请求其实已经生效，表里会多出同一个键的重复行；下次推送会同时更新这些行，数据不会出错。
 - 推送即交出了发现正文的可见性控制：谁能看到表里的正文由表格的共享设置决定，不受游客开关约束。游客在后台能看到推送状态与实例名，看不到目标位置与错误信息。
 - 巡检报告里的「较上次已消失」仍是与上一次运行的朴素差集，未采用台账的可信度判定，两者口径不同。
 

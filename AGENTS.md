@@ -115,7 +115,8 @@ backend/                # 后端 Python 包
 │   ├── report.py       # Markdown 报告渲染（渲染产物，不是存储真相）
 │   ├── ledger.py       # Ledger 状态判定与镜像行生成；判定逻辑是纯函数
 │   ├── push.py         # Push 的唯一执行入口（自动推送与手动重推都走这里）
-│   └── destinations/   # Destination 插件：base.py 定义接口，__init__.py 显式注册
+│   └── destinations/   # Destination 插件：base.py 定义接口，__init__.py 显式注册；
+│                       # google_transport.py 是 Google Sheet 两种鉴权方式各自发请求的传输层
 ├── storage/            # 持久化；上层只通过 repo.py 访问，不直接持有 Session
 ├── admin/              # 后台 API、鉴权，以及前端构建产物 static/（不进 Git）
 ├── migrations/         # Alembic 迁移脚本
@@ -149,7 +150,7 @@ web/                    # 后台前端源码，独立构建单元，详见 web/R
 ## 六、常用命令
 
 ```bash
-# 测试（193 个用例，无需外部依赖）
+# 测试（201 个用例，无需外部依赖）
 python3 -m unittest discover -s tests -t .
 
 # 数据库迁移（部署脚本走的就是这条）
@@ -194,6 +195,9 @@ pnpm build    # 构建到 backend/admin/static/（产物不进 Git）
   删行补不补回，都在 `backend/survey/ledger.py` 里统一算好；每个插件各写一遍迟早会写出不一致的版本。
   写入 Google Sheet 必须用 `RAW`，正文来自模型，`USER_ENTERED` 会把以 `=` 开头的内容当公式执行。
   动这块之前读 `docs/adr/0004-survey-ledger-mirrored-to-destinations.md`。
+- **Google Sheet 的 gogcli 方式只通过 `gog api call` 透传，不要改用高层 `gog sheets` 命令。** 高层命令缺少追加列与
+  修改表格属性，而且默认按 `USER_ENTERED` 写入。gogcli 的退出码映射与调用参数是我们自己维护的约定，
+  升级 Dockerfile 里的 `GOGCLI_VERSION` 前先复核 `google_transport.py`，理由见 `docs/adr/0005-google-sheet-via-gogcli.md`。
 - **Ledger 系统列的表头文案发布后不要改。** 插件按表头名称定位列，改名后已有表格里的旧列会变成人工列，
   下次推送再补出一个新列。
 - 新增巡检链路的代码放 `backend/survey/`，**不要**写进 `backend/review/`。两条链路唯一的

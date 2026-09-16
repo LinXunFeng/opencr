@@ -184,6 +184,8 @@ export interface DestinationItem {
   name: string
   type: string
   type_label: string
+  /** 实例配置摘要，例如鉴权方式与账号；不含凭据 */
+  summary: string
   target_fields: DestinationTargetField[]
   /** 非空表示配置有误、不可用 */
   error: string
