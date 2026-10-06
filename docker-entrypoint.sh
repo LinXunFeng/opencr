@@ -15,6 +15,12 @@ if [ ! -f /app/config.yaml ]; then
   exit 1
 fi
 
+# compose 在 .env 没有设置时会传入空串。空密码的文件存储不等于"没有密码"，
+# gogcli 会拿空串去加解密令牌；删掉这个变量，让缺配置的情况以明确的报错暴露出来。
+if [ -z "${GOG_KEYRING_PASSWORD:-}" ]; then
+  unset GOG_KEYRING_PASSWORD
+fi
+
 # 迁移在这里跑一次，而不是在每个 gunicorn worker 里 ——
 # 多个进程同时执行 DDL 只会互相抢锁。
 python3 -m backend.storage.migrate

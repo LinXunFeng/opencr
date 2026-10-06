@@ -19,7 +19,9 @@ from ..storage.models import (
     ERROR_SURVEY,
     ERROR_UNEXPECTED,
     PROFILE_MANIFEST,
+    PUSH_TRIGGER_AUTO,
     REPO_FETCH_FAILED,
+    REPO_INDEX_FAILED,
     REPO_OK,
     RUN_FAILED,
     RUN_SUCCEEDED,
@@ -34,7 +36,9 @@ from .analysis import Budget, inspect_focus, load_skill_prompt, match_skills, pl
 from .common import SurveyError, finding_fingerprint
 from .config import load_survey_config, resolve_budget
 from .crossrepo import build_cross_repo_map
+from .ledger import update_ledger_for_run
 from .profile import build_profile, codegraph_available, save_profile
+from .push import PushRejected, begin_pushes, execute_pushes
 from .sources import resolve_sources
 from .workspace import artifacts_dir, count_files, delete_workspace, prepare_repo
 
@@ -100,13 +104,17 @@ def _prepare_workspaces(
 
         repo.update_survey_progress(run_uid, phase=SURVEY_PHASE_PROFILING, repos_done=index)
         profile = build_profile(slug, repo_dir, index_timeout=budget_cfg["index_timeout_seconds"])
+        status = REPO_OK
         if codegraph_ok and profile["kind"] == PROFILE_MANIFEST:
-            # codegraph 装着但这个仓库没建成索引，是单仓库级别的问题
+            # codegraph 装着但这个仓库没建成索引，是单仓库级别的问题。
+            # 状态单独记成 index_failed 而不是 ok：Ledger 靠它判断这个仓库本轮的结论是否可信，
+            # 偶发的索引失败会让关注点选偏，不能据此把该仓库的问题标成本轮未发现。
             repo.add_survey_degradation(run_uid, DEGRADE_INDEX_FAILED)
+            status = REPO_INDEX_FAILED
         save_profile(artifacts, profile)
 
         repo.record_survey_repo(
-            run_uid, slug, target["url"], branch, sha, REPO_OK,
+            run_uid, slug, target["url"], branch, sha, status,
             profile_kind=profile["kind"], file_count=count_files(repo_dir),
         )
         prepared.append({"slug": slug, "dir": repo_dir, "profile": profile})
@@ -158,6 +166,7 @@ def execute_survey_run(survey_uid: str, trigger: str) -> Optional[str]:
     run_uid = repo.start_survey_run(survey_uid, trigger)
     if run_uid is None:
         return None
+    succeeded = False
 
     cfg = load_survey_config()
     budget_cfg = resolve_budget(survey)
@@ -212,6 +221,7 @@ def execute_survey_run(survey_uid: str, trigger: str) -> Optional[str]:
         summary = summarize(raw_findings, cross_map, budget)
 
         repo.finish_survey_run(run_uid, RUN_SUCCEEDED, summary=summary)
+        succeeded = True
         logger.info(
             "SurveyRun finished: survey=%s run=%s repos=%s findings=%s",
             survey["slug"], run_uid, len(prepared), counters,
@@ -225,7 +235,37 @@ def execute_survey_run(survey_uid: str, trigger: str) -> Optional[str]:
     finally:
         _cleanup(survey)
 
+    if succeeded:
+        _publish(run_uid)
     return run_uid
+
+
+def _publish(run_uid: str) -> None:
+    """
+    成功的运行结束后：更新 Ledger，再推送到该 Survey 绑定的全部 Destination。
+
+    放在运行收尾之后而不是之内：两者的失败都不该改写已经落库的运行状态 ——
+    分析产出本身没有受损。台账更新失败时不推送，否则推出去的是一份旧台账，
+    表里看起来"这一轮什么都没变"，比推送失败更难被发现。
+    """
+    try:
+        update_ledger_for_run(run_uid)
+    except Exception:
+        logger.exception("Ledger update failed, skipping push: run=%s", run_uid)
+        return
+
+    try:
+        started = begin_pushes(run_uid, PUSH_TRIGGER_AUTO)
+    except PushRejected as e:
+        # 没有配置输出目标是常态，不是问题
+        logger.info("No auto push for run %s: %s", run_uid, e)
+        return
+    except Exception:
+        logger.exception("Registering pushes failed: run=%s", run_uid)
+        return
+    if started["busy"]:
+        logger.warning("Auto push skipped for busy bindings: run=%s bindings=%s", run_uid, started["busy"])
+    execute_pushes(started["started"])
 
 
 def _cleanup(survey: dict) -> None:

@@ -141,6 +141,56 @@ export interface SurveySource {
   exclude_patterns: string[]
 }
 
+/**
+ * Binding：巡检选用某个输出目标（Destination），并指明写到平台上的哪个位置。
+ * 凭据在 config.yaml 里，这里只有实例名。
+ */
+export interface SurveyBinding {
+  id?: number
+  destination: string
+  destination_label?: string
+  /** 实例已从 config.yaml 删除或配置有误时为 false；绑定保留，推送会记失败 */
+  available?: boolean
+  /** Guest 拿不到目标位置：表格 ID 本身就是访问入口（服务端剔除，不是前端隐藏） */
+  target?: Record<string, string>
+  target_desc?: string
+  last_succeeded_push_at?: string
+}
+
+export interface DestinationTargetField {
+  key: string
+  label: string
+  required: boolean
+  placeholder: string
+  help: string
+}
+
+/** 连通性测试的一项结论。warn 表示能用但有需要知道的事（例如工作表会在首次推送时自动创建） */
+export interface DestinationCheckItem {
+  title: string
+  level: "ok" | "warn" | "error"
+  message: string
+}
+
+export interface DestinationCheckResult {
+  ok: boolean
+  /** 规整后的目标位置（例如表格链接已解析成 ID） */
+  target: Record<string, string>
+  items: DestinationCheckItem[]
+}
+
+/** config.yaml 里配置的一个输出目标实例 */
+export interface DestinationItem {
+  name: string
+  type: string
+  type_label: string
+  /** 实例配置摘要，例如鉴权方式与账号；不含凭据 */
+  summary: string
+  target_fields: DestinationTargetField[]
+  /** 非空表示配置有误、不可用 */
+  error: string
+}
+
 export interface Survey {
   survey_uid: string
   name: string
@@ -162,6 +212,7 @@ export interface Survey {
   next_run_at: string
   created_at: string
   sources: SurveySource[]
+  bindings: SurveyBinding[]
   schedule_desc?: string
   workspace_bytes?: number
 }
@@ -212,6 +263,24 @@ export interface SurveyRunRepo {
   error_message: string
 }
 
+/** Push：一次运行的结果同步到一个输出目标的记录。失败不改变运行本身的状态 */
+export interface SurveyPush {
+  id: number
+  /** 绑定被删除后为 null，记录保留但不能再从这里重推 */
+  binding_id: number | null
+  destination: string
+  trigger: "auto" | "manual"
+  status: "running" | "succeeded" | "failed"
+  /** 进行中超过上限，大概率是进程在推送中途被终止 */
+  is_stale: boolean
+  stats: { updated?: number, inserted?: number, skipped?: number }
+  started_at: string
+  finished_at: string
+  /** 以下两项 Guest 拿不到 */
+  target?: Record<string, string>
+  error_message?: string
+}
+
 export interface SurveyRunDetail extends SurveyRun {
   summary: string
   body_included: boolean
@@ -220,6 +289,9 @@ export interface SurveyRunDetail extends SurveyRun {
   /** 上一次有、本次没有的发现。它们没有对应的库记录，是比对算出来的 */
   resolved_findings: SurveyFinding[]
   counts: { new: number, persisted: number, resolved: number, total: number }
+  pushes: SurveyPush[]
+  /** 是该巡检最近一次成功的运行、且配置了输出目标 */
+  pushable: boolean
 }
 
 export interface SurveyStats {
@@ -382,4 +454,29 @@ export function getSurveyRunDetailApi(runUid: string) {
 
 export function getSurveyStatsApi(days = 90) {
   return request<SurveyStats>({ url: "survey-stats", method: "get", params: { days } })
+}
+
+export function getDestinationsApi() {
+  return request<{ items: DestinationItem[], public_url: string }>({ url: "destinations", method: "get" })
+}
+
+/** 手动推送到输出目标。不传 bindingId 表示推送全部；推送在后台执行，返回即表示已登记 */
+export function pushSurveyRunApi(runUid: string, bindingId?: number | null) {
+  return request<{ started: number, busy: number[] }>({
+    url: `survey-runs/${runUid}/push`,
+    method: "post",
+    data: bindingId ? { binding_id: bindingId } : {}
+  })
+}
+
+/**
+ * 连通性测试：用表单里尚未保存的目标位置检查输出目标是否可用。
+ * 不会写入任何台账行；测试失败也以 200 返回检查项，失败是测试的正常结论。
+ */
+export function checkDestinationApi(name: string, target: Record<string, string>, surveyName: string) {
+  return request<DestinationCheckResult>({
+    url: `destinations/${encodeURIComponent(name)}/check`,
+    method: "post",
+    data: { target, survey_name: surveyName }
+  })
 }

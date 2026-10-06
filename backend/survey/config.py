@@ -111,6 +111,19 @@ def load_survey_config() -> dict:
     return resolved
 
 
+def load_public_url() -> str:
+    """
+    服务的对外访问地址（server.public_url），用于在 Destination 里生成运行详情链接。
+
+    服务自己推不出这个地址：它监听的是 0.0.0.0:9034，前面通常还有反向代理。
+    留空时 Ledger 不输出链接列，而不是写一列打不开的地址。
+    """
+    config_data = load_file_config()
+    value = _pick_config_value(config_data, "server.public_url")
+    env_value = os.getenv("OPENCR_PUBLIC_URL", "").strip()
+    return (env_value or value or "").strip().rstrip("/")
+
+
 def resolve_budget(survey: dict) -> dict:
     """
     合并全局默认与单个 Survey 的覆盖项。

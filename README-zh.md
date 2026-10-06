@@ -68,7 +68,10 @@ opencr/
 │   │   ├── scheduler.py    # 调度线程（独立租约）
 │   │   ├── workspace.py    # 仓库拉取与工作区管理
 │   │   ├── profile.py      # 仓库画像（codegraph 集成）
-│   │   └── crossrepo.py    # 跨仓库接口连接
+│   │   ├── crossrepo.py    # 跨仓库接口连接
+│   │   ├── ledger.py       # 问题台账：状态判定与镜像行生成
+│   │   ├── push.py         # 推送到输出目标
+│   │   └── destinations/   # 输出目标插件（当前：Google Sheet）
 │   ├── storage/            # 持久化（SQLAlchemy）
 │   ├── migrations/         # Alembic 迁移脚本
 │   ├── alembic.ini         # 迁移配置
@@ -425,6 +428,83 @@ MR 审查只看一次变更。**定期巡检**补的是另一半：按周期把�
 觉得某条问题不用再提，可以标记为「不再提醒」，后续巡检不会再产出它。
 
 报告支持导出 Markdown。导出与界面同源，因此游客导出的报告同样不含正文。
+
+### 推送到外部平台（输出目标）
+
+巡检结果可以镜像到外部平台，方便在表格里分派和跟进。当前支持 **Google Sheet**；接口按「按键 upsert」设计，飞书多维表格等平台可以按同样的方式接入。
+
+**推送的是问题台账，不是每轮的快照。** 台账按「巡检 + 指纹」一行，每轮结束后只更新状态与最近发现时间。逐轮追加快照的话，每周跑一次，同一个问题会在表里出现几十行，没法跟进。台账由服务自己持有，平台上的表格只是它的镜像，理由见 [`docs/adr/0004-survey-ledger-mirrored-to-destinations.md`](docs/adr/0004-survey-ledger-mirrored-to-destinations.md)。
+
+**1. 在 `config.yaml` 里配置实例。** 凭据只写在这里，不入库：
+
+```yaml
+server:
+  public_url: "https://opencr.company.com"   # 可选；填了才会输出「运行详情」链接列
+
+destinations:
+  quality-sheet:                              # 实例名，后台绑定时选择它
+    type: google_sheet
+    credentials_file: "/path/to/service-account.json"
+```
+
+Google Sheet 支持两种鉴权方式，由实例的 `auth` 决定：
+
+- **服务账号（`auth: service_account`，缺省）**：在 Google Cloud 控制台启用 Google Sheets API，创建服务账号并下载 JSON 密钥，然后**把表格以「编辑者」身份共享给服务账号的邮箱**。Docker 部署时把密钥文件挂载进容器（`docker-compose.yml` 里有注释好的示例），`credentials_file` 写容器内路径。
+- **gogcli（`auth: gogcli`）**：复用 [gogcli](https://github.com/openclaw/gogcli) 里已登录的用户身份，把表格共享给这个账号即可。服务通过 `gog api call` 发出请求，自己不持有任何用户令牌，理由见 [`docs/adr/0005-google-sheet-via-gogcli.md`](docs/adr/0005-google-sheet-via-gogcli.md)。
+
+```yaml
+destinations:
+  team-sheet:
+    type: google_sheet
+    auth: gogcli
+    account: "someone@company.com"     # 必填，不依赖 gogcli 的默认账号
+    gogcli_bin: "/opt/homebrew/bin/gog" # launchd 部署写绝对路径
+```
+
+`account` 必须显式填写：别人在构建机上执行一次 `gog auth add` 就能换掉 gogcli 的默认账号，推送就会以另一个人的身份写表。
+
+**launchd 部署**：自行安装 gogcli（例如 `brew install openclaw/tap/gogcli`），以运行服务的用户执行 `gog auth add <account> --services sheets` 完成授权，令牌存在系统钥匙串里，服务直接复用。`gogcli_bin` 写 `command -v gog` 输出的绝对路径——launchd 的 PATH 里没有 Homebrew 与 `~/.local/bin`。后台服务第一次读钥匙串时可能被授权弹窗挡住，连通性测试会提示；在终端执行一次 `gog auth list` 并点「始终允许」即可。
+
+**Docker 部署**：镜像默认内置固定版本的 gogcli（不需要时用 `--build-arg GOGCLI_VERSION=` 跳过）。容器里没有钥匙串，令牌以加密文件存放在 `opencr-gogcli` 卷里：
+
+```bash
+# 1. 在 docker-compose.yml 同目录的 .env 里设置令牌加密密码（导入后不要再改）
+echo 'GOG_KEYRING_PASSWORD=<一个足够长的随机串>' >> .env
+docker compose up -d
+
+# 2. 导入 OAuth 客户端信息（与宿主机上 `gog auth credentials set` 用的是同一个 JSON）
+docker compose cp client_secret.json opencr:/tmp/client_secret.json
+docker compose exec opencr gog auth credentials set /tmp/client_secret.json
+
+# 3. 在宿主机导出令牌，再导入容器；完成后删掉两边的令牌文件，它含有 refresh token
+gog auth tokens export someone@company.com --out tokens.json
+docker compose cp tokens.json opencr:/tmp/tokens.json
+docker compose exec opencr gog auth tokens import /tmp/tokens.json
+docker compose exec opencr rm -f /tmp/tokens.json /tmp/client_secret.json && rm -f tokens.json
+```
+
+也可以不导出，直接在容器里用 `docker compose exec -it opencr gog auth add someone@company.com --services sheets --manual` 走粘贴回调地址的授权流程。无论哪种方式，**OAuth 应用都要发布为正式版本**：处于 Testing 状态的应用签发的 refresh token 7 天就会过期，推送会从某一周开始静默失败。
+
+**2. 在巡检配置里绑定。** 编辑巡检 → 输出目标 → 选择实例，填写表格链接（或 ID）与工作表名。工作表不存在时自动创建，留空则使用巡检名称。一个巡检可以绑定多个输出目标，多个巡检也可以共用同一张工作表（靠「巡检」列区分）。填好后点「测试连通性」，会依次检查服务账号凭据、能否读取表格、工作表与已有的系统列、能否写入，并给出服务账号邮箱方便去共享表格；测试不会创建工作表，也不会写入任何台账行。
+
+**3. 推送时机。** 巡检**成功**结束后（带降级也算成功）自动推送；失败的运行不推送。在最近一次成功运行的报告页可以手动重推。推送失败只记在推送记录里，**不改变运行本身的状态，也不算降级**。
+
+表里的列分两类：
+
+- **系统列**：键、巡检、仓库、文件、行号、问题类别、严重度、标题、正文、状态、首次发现、最近发现、同类条数，以及可选的运行详情。**按表头名称定位**，所以可以随意调整列序；但**不要改系统列的表头**，改名后下次推送会补出一个新列。
+- **人工列**：你自己加的负责人、处理进度等，系统从不读取也从不改写。
+
+几条需要知道的规则：
+
+- **「本轮未发现」不等于已修复。** 巡检只取证模型选中的关注点，没被选中的文件本来就不会被检查。只有当该仓库本轮成功拉取并建好索引、且未因预算耗尽提前收工时才会标记；否则保持原状态。
+- **同一轮里共享指纹的多条发现合并成一行**：严重度取最高，行号全列，正文按条拼接，超过单元格上限（5 万字符）时截断。
+- **删掉的行补不补回。** 状态仍为「存在」的行被删后会补回，否则问题就被悄悄吞掉了；「本轮未发现」和「已忽略」的行被删后不再补回。新绑定的表第一次推送会写入完整台账。
+- **标记「不再提醒」后**，台账里对应的行立刻变为「已忽略」，下次推送时同步到表里，不删行。
+- 写入一律按原始文本处理，以 `=` 开头的正文不会被当成公式执行。
+- 追加行时遇到服务端 5xx 会重试，若那次请求其实已经生效，表里会多出同一个键的重复行。影响有限：下次推送会同时更新这两行，数据不会出错，手动删掉多出的一行即可。
+- **推送即交出了正文的可见性控制。** 谁能看到表里的正文由表格的共享设置决定，不受游客开关约束。游客在后台能看到推送状态，看不到目标位置与错误信息。
+
+**接入新平台**：实现 `backend/survey/destinations/base.py` 里的 `Destination`，在 `backend/survey/destinations/__init__.py` 注册即可。核心层已经算好每一行的内容与状态，插件只需把行按键写到平台上；`check` 是可选实现，用于后台的「测试连通性」按钮。评估一个平台能不能接，看三点：能否按键查找已有行、能否批量写入、限流有多严。
 
 ### codegraph（默认安装）
 

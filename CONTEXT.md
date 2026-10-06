@@ -72,6 +72,42 @@ Finding 的固定分类枚举。它不是描述性标签，而是**指纹的组�
 因此它必须是闭集：模型只能从枚举里选，不能自由发挥。
 _Avoid_: 标签、Tag、类型
 
+### 巡检输出
+
+**Destination / 输出目标**：
+一个已配置好凭据、可接收巡检结果的外部平台实例，例如"质量组那张 Google Sheet"。
+同一种平台（Destination 类型）可以有多个 Destination；一个 Survey 可以选用零个或多个 Destination。
+Destination 只服务 SurveyRun——ReviewRun 的产出落在 MR 上，不经过 Destination。
+推送到 Destination 即交出了 Finding 正文的可见性控制：谁能看到正文由该平台的共享设置决定，不受 Guest 可见范围约束。
+_Avoid_: Sink、Exporter、Channel、导出（专指 Markdown 下载）、投递（专指 Delivery）
+
+**Push / 推送**：
+把一次 SurveyRun 的结果同步到一个 Destination 的动作，每个"SurveyRun × Destination"一次。
+Push 发生在产出落库之后，它的失败不改变 SurveyRun 的状态，也不是 Degradation——分析产出本身没有受损。
+_Avoid_: 导出、同步任务、投递
+
+**Binding / 绑定**：
+一个 Survey 选用某个 Destination，并指明结果写到该平台的哪个位置（例如哪张表、哪个工作表）。
+凭据属于 Destination，位置属于 Binding：同一个 Destination 可以被多个 Survey 绑定到不同位置，也可以是同一个位置。
+_Avoid_: 订阅、关联
+
+**Ledger / 问题台账**：
+以 `Survey + 指纹` 为一行持续维护的问题清单，而不是逐轮追加的快照。
+Ledger 由系统持有，每个 SurveyRun 结束后更新；Destination 上的表格是它的镜像，同一 Survey 的所有 Destination 内容一致。
+Ledger 的寿命跟随 Survey 而非 SurveyRun——运行记录按次数清理不影响 Ledger 里的首次发现时间与状态。
+同一轮里共享指纹的多条 Finding 合并为一行。
+用户在镜像上删掉的行，只有状态仍为"存在"时才会被下次 Push 补回；从未成功推送过的 Binding，第一次 Push 写入完整 Ledger。
+行里的列分两类：系统列由 Push 覆盖写入；人工列（负责人、处理进度等）系统从不读取也从不改写。
+数据只从系统流向 Ledger，Ledger 上的任何操作都不会回流影响忽略清单或 Finding。
+_Avoid_: 快照、导出表、问题列表
+
+**LedgerState / 台账状态**：
+Ledger 一行的系统状态：存在、本轮未发现、已忽略。
+"本轮未发现"只说明这一轮没看到，不说明问题已修复——巡检只取证模型选中的关注点，没被选中的文件本来就不会被检查。
+因此只有当该行所在仓库本轮成功拉取并建好索引、且本轮分析未因预算耗尽而提前收工时，才会标为本轮未发现；否则保持原状态。
+画像因未启用 codegraph 而退化不在此列——那是部署常态而非偶发故障，算进去会让这类实例永远无法标记本轮未发现。
+_Avoid_: 已修复、已解决、已消失、Resolved
+
 ### 审查产出
 
 **Finding / 审查发现**：

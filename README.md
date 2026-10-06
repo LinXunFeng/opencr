@@ -68,7 +68,10 @@ opencr/
 │   │   ├── scheduler.py    # Scheduler thread (its own lease)
 │   │   ├── workspace.py    # Repository fetching and workspace management
 │   │   ├── profile.py      # Repository profiles (codegraph integration)
-│   │   └── crossrepo.py    # Cross-repository endpoint linking
+│   │   ├── crossrepo.py    # Cross-repository endpoint linking
+│   │   ├── ledger.py       # Issue ledger: state rules and mirrored rows
+│   │   ├── push.py         # Pushing to destinations
+│   │   └── destinations/   # Destination plugins (currently Google Sheet)
 │   ├── storage/            # Persistence (SQLAlchemy)
 │   ├── migrations/         # Alembic migration scripts
 │   ├── alembic.ini         # Migration config
@@ -456,6 +459,83 @@ Findings you do not want to see again can be marked as known issues; later runs 
 
 Reports can be exported as Markdown. The export renders the same data as the console, so a guest
 export contains no bodies either.
+
+### Pushing to external platforms (destinations)
+
+Survey results can be mirrored to external platforms so they can be assigned and tracked in a spreadsheet. **Google Sheet** is supported today; the plugin interface is designed around keyed upserts so platforms such as Feishu Bitable can be added the same way.
+
+**What is pushed is an issue ledger, not a per-run snapshot.** The ledger has one row per survey + fingerprint, and each run only updates state and last-seen time. Appending a snapshot every week would repeat the same problem dozens of times and make follow-up impossible. The service owns the ledger; the spreadsheet is a mirror of it. See [`docs/adr/0004-survey-ledger-mirrored-to-destinations.md`](docs/adr/0004-survey-ledger-mirrored-to-destinations.md).
+
+**1. Configure instances in `config.yaml`.** Credentials live only here, never in the database:
+
+```yaml
+server:
+  public_url: "https://opencr.company.com"   # optional; enables the run-details link column
+
+destinations:
+  quality-sheet:                              # instance name, picked when binding a survey
+    type: google_sheet
+    credentials_file: "/path/to/service-account.json"
+```
+
+Google Sheet supports two authentication modes, chosen by the instance's `auth`:
+
+- **Service account (`auth: service_account`, the default)**: enable the Google Sheets API in Google Cloud, create a service account, download its JSON key, and **share the spreadsheet with the service account's email as an Editor**. In Docker, mount the key file into the container (there is a commented example in `docker-compose.yml`) and point `credentials_file` at the in-container path.
+- **gogcli (`auth: gogcli`)**: reuse a user already signed in with [gogcli](https://github.com/openclaw/gogcli) and share the spreadsheet with that account. The service sends requests through `gog api call` and never holds user tokens itself; see [`docs/adr/0005-google-sheet-via-gogcli.md`](docs/adr/0005-google-sheet-via-gogcli.md).
+
+```yaml
+destinations:
+  team-sheet:
+    type: google_sheet
+    auth: gogcli
+    account: "someone@company.com"     # required; never relies on gogcli's default account
+    gogcli_bin: "/opt/homebrew/bin/gog" # absolute path for launchd
+```
+
+`account` must be explicit: anyone running `gog auth add` on the build machine could otherwise change gogcli's default account, and pushes would silently write as someone else.
+
+**launchd**: install gogcli yourself (for example `brew install openclaw/tap/gogcli`) and run `gog auth add <account> --services sheets` as the user the service runs as; tokens stay in the system keychain and the service reuses them. Set `gogcli_bin` to the absolute path from `command -v gog`, since launchd's PATH has neither Homebrew nor `~/.local/bin`. The first keychain read from a background service may be held by a permission prompt; the connectivity test says so, and running `gog auth list` once in a terminal and clicking "Always Allow" fixes it.
+
+**Docker**: the image ships a pinned gogcli by default (skip it with `--build-arg GOGCLI_VERSION=`). There is no keychain in the container, so tokens are stored as encrypted files in the `opencr-gogcli` volume:
+
+```bash
+# 1. Set the token encryption password in .env next to docker-compose.yml (do not change it after importing)
+echo 'GOG_KEYRING_PASSWORD=<a long random string>' >> .env
+docker compose up -d
+
+# 2. Import the OAuth client (the same JSON used with `gog auth credentials set` on the host)
+docker compose cp client_secret.json opencr:/tmp/client_secret.json
+docker compose exec opencr gog auth credentials set /tmp/client_secret.json
+
+# 3. Export the token on the host and import it into the container; delete both copies afterwards, it contains a refresh token
+gog auth tokens export someone@company.com --out tokens.json
+docker compose cp tokens.json opencr:/tmp/tokens.json
+docker compose exec opencr gog auth tokens import /tmp/tokens.json
+docker compose exec opencr rm -f /tmp/tokens.json /tmp/client_secret.json && rm -f tokens.json
+```
+
+Alternatively authorize inside the container with `docker compose exec -it opencr gog auth add someone@company.com --services sheets --manual`. Either way, **publish the OAuth app to production**: refresh tokens issued by an app in Testing status expire after 7 days, and pushes start failing silently one week.
+
+**2. Bind it in the survey configuration.** Edit survey → Destinations → pick an instance, then enter the spreadsheet link (or ID) and worksheet name. A missing worksheet is created automatically; an empty name defaults to the survey name. A survey can bind several destinations, and several surveys can share one worksheet (the "巡检" column tells them apart). Click "测试连通性" (test connectivity) to check, in order, that the service account key loads, the spreadsheet is readable, the worksheet and its existing system columns, and write access; the service account email is shown so you know whom to share the sheet with. The test never creates a worksheet or writes ledger rows.
+
+**3. When pushes happen.** After a run **succeeds** (with or without degradations) it is pushed automatically; failed runs are not pushed. The report of the latest successful run offers a manual re-push. A failed push is recorded on the push itself and **never changes the run's status or counts as a degradation**.
+
+Columns come in two kinds:
+
+- **System columns**: key, survey, repository, file, lines, category, severity, title, body, state, first seen, last seen, finding count, and optionally a run-details link. They are **located by header name**, so you may reorder them freely — but **do not rename system headers**: a renamed header makes the next push add a fresh column.
+- **Your own columns** (owner, progress, notes…) are never read or written.
+
+Rules worth knowing:
+
+- **"Not seen this run" does not mean fixed.** A survey only inspects the focus points the model selected; unselected files are simply not examined. The state is only set when the row's repository was fetched and indexed successfully and the run did not stop early on budget; otherwise the previous state is kept.
+- **Findings sharing a fingerprint in one run become one row**: highest severity, all line numbers, bodies concatenated and truncated at the 50,000-character cell limit.
+- **Deleted rows.** A row whose state is still "present" is restored if you delete it, otherwise a live problem would silently vanish; "not seen" and "ignored" rows stay deleted. The first push to a newly bound sheet writes the full ledger.
+- **Marking a finding as a known issue** flips its ledger row to "ignored" immediately; the next push updates the sheet without deleting the row.
+- Values are written as raw text, so a body starting with `=` is never evaluated as a formula.
+- Appending rows is retried on server 5xx errors; if the failed request had in fact been applied, the sheet gets a duplicate row with the same key. The impact is limited: the next push updates both rows, the data stays correct, and the extra row can be deleted by hand.
+- **Pushing hands over control of who can read finding bodies**: that is decided by the spreadsheet's sharing settings, not by the guest switches. Guests in the console see push status but not the target location or error messages.
+
+**Adding a platform**: implement `Destination` from `backend/survey/destinations/base.py` and register it in `backend/survey/destinations/__init__.py`. The core already computes each row's content and state; a plugin only writes rows by key. Implementing `check` is optional and powers the console's connectivity test. To judge whether a platform fits, ask three questions: can it look up existing rows by key, can it write in batches, and how strict are its rate limits.
 
 ### codegraph (installed by default)
 

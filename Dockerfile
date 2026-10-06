@@ -76,6 +76,41 @@ RUN if [ -n "$CODEGRAPH_VERSION" ]; then \
         echo "CODEGRAPH_VERSION is empty: skipping codegraph, surveys will use manifest-level profiles"; \
     fi
 
+# ---------------------------------------------------------------------------
+# gogcli：Google Sheet 输出目标的 `auth: gogcli` 鉴权方式靠它写表，**默认安装**。
+#
+# 宿主机上装好的 gogcli（多半是 macOS 版）在 Linux 容器里跑不了，只能打进镜像；
+# 默认不装的话，用户会在第一次推送失败时才发现镜像里没有它。代价是镜像多约 44MB（静态二进制，无运行时依赖）。
+# 版本钉死：退出码与 `gog api call` 的参数是 OpenCR 自己维护映射的约定（ADR-0005），升级前需要复核。
+#
+# 发布包里的文件布局不做假设，解包后按文件名找 gog；下载后按官方 checksums.txt 校验。
+# 不用 gogcli 时把版本置空即可：
+#     docker compose build --build-arg GOGCLI_VERSION=
+# ---------------------------------------------------------------------------
+ARG GOGCLI_VERSION=v0.40.0
+RUN if [ -n "$GOGCLI_VERSION" ]; then \
+        set -eux; \
+        version="${GOGCLI_VERSION#v}"; \
+        arch="$(case "${TARGETARCH:-amd64}" in arm64) echo arm64 ;; *) echo amd64 ;; esac)"; \
+        asset="gogcli_${version}_linux_${arch}.tar.gz"; \
+        base="https://github.com/openclaw/gogcli/releases/download/${GOGCLI_VERSION}"; \
+        apt-get update && apt-get install -y --no-install-recommends curl; \
+        mkdir -p /tmp/gogcli && cd /tmp/gogcli; \
+        curl -fL --http1.1 --retry 8 --retry-all-errors --retry-delay 3 -C - \
+            --connect-timeout 20 -o "$asset" "$base/$asset"; \
+        curl -fL --http1.1 --retry 8 --retry-all-errors --retry-delay 3 \
+            --connect-timeout 20 -o checksums.txt "$base/checksums.txt"; \
+        grep " ${asset}\$" checksums.txt | sha256sum -c -; \
+        tar -xzf "$asset"; \
+        install -m 0755 "$(find /tmp/gogcli -type f -name gog | head -n 1)" /usr/local/bin/gog; \
+        cd / && rm -rf /tmp/gogcli; \
+        apt-get purge -y curl && apt-get autoremove -y; \
+        rm -rf /var/lib/apt/lists/*; \
+        gog --version; \
+    else \
+        echo "GOGCLI_VERSION is empty: skipping gogcli, Google Sheet destinations must use auth: service_account"; \
+    fi
+
 # 依赖单独一层：改代码不必重装依赖
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt

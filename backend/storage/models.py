@@ -302,6 +302,21 @@ SURVEY_CATEGORIES = (
 FINDING_STATE_NEW = "new"
 FINDING_STATE_PERSISTED = "persisted"
 
+# --- SurveyLedgerEntry.state（LedgerState）--------------------------------
+# 刻意不叫 resolved / fixed：巡检只取证模型选中的关注点，
+# "本轮没看到"推不出"已经修好"，措辞一旦写成已修复就会有人照着关单。
+LEDGER_PRESENT = "present"
+LEDGER_UNSEEN = "unseen"
+LEDGER_IGNORED = "ignored"
+
+# --- SurveyPush.status / trigger -----------------------------------------
+PUSH_RUNNING = "running"
+PUSH_SUCCEEDED = "succeeded"
+PUSH_FAILED = "failed"
+
+PUSH_TRIGGER_AUTO = "auto"
+PUSH_TRIGGER_MANUAL = "manual"
+
 
 class Survey(Base):
     """一份定期巡检配置。它是配置，不是执行——执行实例是 SurveyRun。"""
@@ -351,6 +366,10 @@ class Survey(Base):
 
     sources: Mapped[list["SurveySource"]] = relationship(
         back_populates="survey",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+    bindings: Mapped[list["SurveyBinding"]] = relationship(
         cascade="all, delete-orphan",
         passive_deletes=True,
     )
@@ -525,4 +544,115 @@ class SurveyIgnore(Base):
 
     __table_args__ = (
         Index("ux_survey_ignore", "survey_id", "fingerprint", unique=True),
+    )
+
+
+class SurveyLedgerEntry(Base):
+    """
+    Ledger（问题台账）的一行：一个 Survey 下的一个指纹。
+
+    它是 Destination 上那张表的**唯一真相**，平台上的表格只是镜像（见 ADR-0004）。
+    寿命跟随 Survey 而非 SurveyRun —— 运行记录按次数清理后，首次发现时间与状态仍然可信，
+    后绑定的 Destination 第一次推送也能拿到完整台账。
+    """
+
+    __tablename__ = "survey_ledger"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    survey_id: Mapped[int] = mapped_column(
+        ForeignKey("survey.id", ondelete="CASCADE"), nullable=False
+    )
+    fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+
+    repo_slug: Mapped[str] = mapped_column(String(128), nullable=False, default="")
+    file_path: Mapped[Optional[str]] = mapped_column(String(1024))
+    category: Mapped[str] = mapped_column(String(24), nullable=False, default=CATEGORY_CORRECTNESS)
+
+    # 以下是"最近一次出现时"的聚合结果。同一轮里共享指纹的多条 Finding 合并成一行：
+    # 严重度取最高，行号全列，正文按条拼接。按"指纹 + 行号"分行的话，
+    # 行号每周漂移会制造大量假的新增与消失。
+    severity: Mapped[str] = mapped_column(String(16), nullable=False, default=SEVERITY_UNKNOWN)
+    title: Mapped[Optional[str]] = mapped_column(String(512))
+    body: Mapped[Optional[str]] = mapped_column(Text)
+    # JSON 数组
+    lines: Mapped[Optional[str]] = mapped_column(Text)
+    finding_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    state: Mapped[str] = mapped_column(String(16), nullable=False, default=LEDGER_PRESENT)
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=utcnow)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=utcnow)
+    # 最近一次出现在哪个运行里，用于生成运行详情链接。不做外键：运行会被按次数清理，
+    # 链接失效只是点进去 404，而台账行不能因此被连带删除。
+    last_run_uid: Mapped[Optional[str]] = mapped_column(String(36))
+
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=utcnow)
+
+    __table_args__ = (
+        Index("ux_survey_ledger", "survey_id", "fingerprint", unique=True),
+    )
+
+
+class SurveyBinding(Base):
+    """
+    Binding：一个 Survey 选用某个 Destination，并指明写到平台上的哪个位置。
+
+    Destination 本身（凭据、类型）在 config.yaml 里，这里只存它的名字 ——
+    密钥不入库，与 OpenAI / GitLab 凭据的做法一致。
+    """
+
+    __tablename__ = "survey_binding"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    survey_id: Mapped[int] = mapped_column(
+        ForeignKey("survey.id", ondelete="CASCADE"), nullable=False
+    )
+    destination: Mapped[str] = mapped_column(String(64), nullable=False)
+    # 目标位置，JSON 对象；字段由 Destination 类型声明（例如表格 ID + 工作表名）
+    target: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+
+    # 最近一次成功推送的时刻。它决定"镜像里缺失的非存在行要不要补回"：
+    # 从未成功推送过 = 这是一张新表，完整台账都要写进去；
+    # 推送过 = 缺失的行是用户删的，只有状态仍为存在的才补回（见 ADR-0004）。
+    last_succeeded_push_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=utcnow)
+
+    __table_args__ = (
+        Index("ix_survey_binding_survey", "survey_id"),
+    )
+
+
+class SurveyPush(Base):
+    """
+    Push：一次 SurveyRun 的结果同步到一个 Binding 的记录。
+
+    它与 SurveyRun 的状态完全解耦：推送发生在产出落库之后，失败不改写运行状态，也不算降级。
+    """
+
+    __tablename__ = "survey_push"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    run_id: Mapped[int] = mapped_column(
+        ForeignKey("survey_run.id", ondelete="CASCADE"), nullable=False
+    )
+    # 绑定被删除后记录仍保留（留痕），只是不能再从这条记录重推
+    binding_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("survey_binding.id", ondelete="SET NULL")
+    )
+    # 推送当时的快照：绑定之后可能被改掉或删掉，记录要能说清楚当时推到了哪里
+    destination: Mapped[str] = mapped_column(String(64), nullable=False)
+    target: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+
+    trigger: Mapped[str] = mapped_column(String(16), nullable=False, default=PUSH_TRIGGER_AUTO)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default=PUSH_RUNNING)
+    # JSON：{"updated": n, "inserted": m, "skipped": k}
+    stats: Mapped[Optional[str]] = mapped_column(Text)
+    error_message: Mapped[Optional[str]] = mapped_column(Text)
+
+    started_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=utcnow)
+    finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+
+    __table_args__ = (
+        Index("ix_survey_push_run", "run_id"),
+        Index("ix_survey_push_binding_status", "binding_id", "status"),
     )
