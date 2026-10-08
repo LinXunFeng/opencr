@@ -56,6 +56,9 @@ cd "$(dirname "$0")/.."
 [[ -f docker-compose.yml ]] || fail "未找到 docker-compose.yml，请在仓库根目录下保留本脚本的相对位置"
 [[ -f config.yaml ]] || fail "未找到 config.yaml，请先 cp config.example.yaml config.yaml 并配置 destinations"
 docker compose version >/dev/null 2>&1 || fail "需要 docker compose"
+# 在改动 .env 之前确认 Docker 可用：否则密码写进去了、后面每一步却都失败，
+# 用户会以为 .env 也要回滚
+docker info >/dev/null 2>&1 || fail "连不上 Docker daemon，请先启动 Docker（Docker Desktop / OrbStack 等）后重试"
 if [[ -n "$CLIENT_SECRET" && ! -f "$CLIENT_SECRET" ]]; then
     fail "找不到 OAuth 客户端文件: $CLIENT_SECRET"
 fi
@@ -74,9 +77,18 @@ in_container() {
 }
 
 # 1. 令牌加密密码。只在缺失时生成，已有的绝不改：改了之后卷里已存的令牌就解不开了
-if grep -Eq '^GOG_KEYRING_PASSWORD=.+' .env 2>/dev/null; then
+if [[ -n "${GOG_KEYRING_PASSWORD:-}" ]]; then
+    # compose 里 shell 环境变量的优先级高于 .env：这时生成新密码不会生效，
+    # 反而会在某次没带这个变量启动时换掉密码，让卷里的令牌解不开
+    warn "当前 shell 设置了 GOG_KEYRING_PASSWORD，compose 会优先使用它而不是 .env，本脚本不再生成"
+    warn "建议把它写进 .env 后从 shell 中去掉，否则换个终端启动容器就会用错密码"
+elif grep -Eq '^GOG_KEYRING_PASSWORD=.+' .env 2>/dev/null; then
     info ".env 已设置 GOG_KEYRING_PASSWORD，保持不变"
 else
+    # 卷里已有 gogcli 数据说明以前用某个密码存过令牌，生成新密码只会让它们全部解不开
+    if docker compose exec -T "$SERVICE" sh -c '[ -n "$(ls -A "${GOG_HOME:-/app/gogcli}" 2>/dev/null)" ]' >/dev/null 2>&1; then
+        fail ".env 中没有 GOG_KEYRING_PASSWORD，但 opencr-gogcli 卷里已有令牌。请把当初使用的密码写回 .env 再重试；找不回的话见 README 的「密码丢失或对不上」"
+    fi
     command -v openssl >/dev/null 2>&1 || fail "需要 openssl 来生成令牌加密密码"
     if [[ -f .env ]]; then
         # 去掉空值的那一行，避免同一变量出现两次时 compose 取到空串
@@ -96,6 +108,11 @@ for _ in $(seq 1 30); do
     sleep 1
 done
 in_container true >/dev/null 2>&1 || fail "容器没有就绪，请查看 docker compose logs $SERVICE"
+# 检查模块随本仓库的代码一起发布；`up -d` 不会重建镜像，容器里跑的可能还是旧版本代码。
+# 这里不能吞掉报错：模块不存在时输出为空，会被误读成"配置里没有 gogcli 实例"
+if ! CONFIG_ACCOUNTS="$(in_container python3 -m "$STATUS_MODULE" --accounts)"; then
+    fail "容器里的 OpenCR 不支持本脚本（镜像比当前代码旧），请先执行 docker compose up -d --build $SERVICE 再重试"
+fi
 in_container sh -c 'command -v gog' >/dev/null 2>&1 \
     || fail "镜像里没有 gogcli，构建时是否用 --build-arg GOGCLI_VERSION= 跳过了它？"
 in_container mkdir -p "$CONTAINER_TMP"
@@ -108,10 +125,19 @@ fi
 
 # 3. 账号授权
 if [[ ${#ACCOUNTS[@]} -eq 0 ]]; then
+    if [[ -z "$CONFIG_ACCOUNTS" ]]; then
+        warn "容器读到的 config.yaml 中没有 auth: gogcli 的 Google Sheet 实例，没有需要授权的账号"
+        warn "容器挂载的是 $(pwd)/config.yaml，请确认改的是这一份"
+        exit 0
+    fi
+    needs_auth="$(in_container python3 -m "$STATUS_MODULE" --needs-auth)" \
+        || fail "检查账号授权状态失败，见上方报错"
     while IFS= read -r account; do
         [[ -n "$account" ]] && ACCOUNTS+=("$account")
-    done < <(in_container python3 -m "$STATUS_MODULE" --needs-auth 2>/dev/null || true)
-    [[ ${#ACCOUNTS[@]} -gt 0 ]] || info "config.yaml 中没有需要授权的 gogcli 账号"
+    done <<< "$needs_auth"
+    # 为空不代表都授权好了：钥匙串密码不对、缺少 OAuth 客户端这类问题重新授权也解决不了，
+    # 不会被列进来，结论以下面的完整检查为准
+    [[ ${#ACCOUNTS[@]} -gt 0 ]] || info "没有需要重新授权的账号，下面做完整检查"
 fi
 
 host_gog="$(command -v gog 2>/dev/null || true)"
@@ -138,8 +164,8 @@ done
 
 # 4. 最终检查
 echo ""
-if [[ -z "$(in_container python3 -m "$STATUS_MODULE" --accounts 2>/dev/null || true)" ]]; then
-    warn "config.yaml 中没有 auth: gogcli 的 Google Sheet 实例，没有可检查的内容"
+if [[ -z "$CONFIG_ACCOUNTS" ]]; then
+    warn "容器读到的 config.yaml 中没有 auth: gogcli 的 Google Sheet 实例，账号已授权，但还没有实例会用到它"
     exit 0
 fi
 if in_container python3 -m "$STATUS_MODULE"; then

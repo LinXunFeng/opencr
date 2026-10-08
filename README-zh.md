@@ -478,6 +478,14 @@ destinations:
 - 若存在 `./secrets/gogcli-client-secret.json`（需在 `docker-compose.yml` 里启用 `./secrets` 挂载），自动导入 OAuth 客户端信息，这样执行脚本时可以省掉 `--client-secret`；
 - 把每个 gogcli 实例的授权状态打印到启动日志，缺什么就给出要执行的命令。这些检查失败不阻止启动。
 
+**密码丢失或对不上**（检查报 `aes.KeyUnwrap(): integrity check failed` 或 `file keyring password mismatch`）：卷里的令牌是用另一个 `GOG_KEYRING_PASSWORD` 加密的。注意 compose 里 shell 环境变量的优先级高于 `.env`，先确认两处没有各写一个。能找回原密码就把它写回 `.env`，执行 `docker compose up -d` 即可；找不回只能清空 gogcli 卷重新授权（只删令牌与客户端信息，不影响审查数据）：
+
+```bash
+docker compose down
+docker volume rm "$(basename "$PWD")_opencr-gogcli"   # 卷名前缀是 compose 项目名，可用 docker volume ls 确认
+./scripts/setup-gogcli.sh --client-secret ~/Downloads/client_secret.json
+```
+
 刻意不支持挂载令牌文件、每次启动自动导入：明文 refresh token 会一直留在宿主机上，而且每次重启都会用这份旧令牌覆盖在容器里重新授权过的令牌。
 
 无论哪种方式，**OAuth 应用都要发布为正式版本**：处于 Testing 状态的应用签发的 refresh token 7 天就会过期，推送会从某一周开始静默失败。

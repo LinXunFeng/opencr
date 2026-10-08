@@ -509,6 +509,14 @@ Tokens then live in the volume, so redeploys and image upgrades need nothing mor
 - imports `./secrets/gogcli-client-secret.json` if present (enable the `./secrets` mount in `docker-compose.yml`), so `--client-secret` can be skipped;
 - prints the authorization status of each gogcli instance to the log, with the command to run when something is missing. Problems never block startup.
 
+**Lost or mismatched password** (the check reports `aes.KeyUnwrap(): integrity check failed` or `file keyring password mismatch`): the tokens in the volume were encrypted with a different `GOG_KEYRING_PASSWORD`. Compose prefers a shell environment variable over `.env`, so make sure the two are not set to different values. If you can recover the original password, put it back into `.env` and run `docker compose up -d`; otherwise clear the gogcli volume and authorize again (this only removes tokens and the OAuth client, not review data):
+
+```bash
+docker compose down
+docker volume rm "$(basename "$PWD")_opencr-gogcli"   # the prefix is the compose project name; check with docker volume ls
+./scripts/setup-gogcli.sh --client-secret ~/Downloads/client_secret.json
+```
+
 Tokens are deliberately not auto-imported from a mounted file: the plaintext refresh token would stay on the host, and each restart would overwrite a token re-authorized inside the container.
 
 Either way, **publish the OAuth app to production**: refresh tokens issued by an app in Testing status expire after 7 days, and pushes start failing silently one week.
