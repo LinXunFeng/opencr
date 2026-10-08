@@ -2,6 +2,20 @@
 
 本文件记录项目的重要变更。
 
+## [0.7.1] - 2026-10-08
+
+### Added
+
+- 新增 `scripts/setup-gogcli.sh`，Docker 部署下一条命令完成 gogcli 授权：`.env` 缺少 `GOG_KEYRING_PASSWORD` 时自动生成（已有的不改动），启动容器并导入 OAuth 客户端信息，为 `config.yaml` 中尚未授权的 gogcli 账号逐个授权——宿主机已登录时导出令牌再导入容器，否则在容器内走 `--manual` 授权；令牌临时文件无论成败两边都会删除。重复执行是安全的。
+- 容器启动时若存在 `/app/secrets/gogcli-client-secret.json` 则自动导入 OAuth 客户端信息，并把每个 gogcli 实例的授权状态打印到启动日志；这些检查失败不阻止启动。
+- `install.sh` 在 `destinations` 中有 `auth: gogcli` 实例时新增 gogcli 授权步骤：把 gogcli 所在目录加进 launchd 的 PATH，对尚未授权的账号询问后执行 `gog auth add`，最后在终端里做一次授权检查，让 macOS 钥匙串弹窗在安装时出现。已授权的账号直接跳过，任何一步失败都不中断安装。
+- 新增 `python3 -m backend.survey.destinations.gogcli_status`，供部署脚本检查 gogcli 授权，检查项与后台「测试连通性」共用同一份实现。
+
+### Changed
+
+- launchd 部署下 `gogcli_bin` 不再需要写绝对路径，缺省使用服务 PATH 中的 `gog`。
+- `.gitignore` 与 `.dockerignore` 排除 `secrets/`，`.dockerignore` 同时排除 `.env`，凭据不会被提交或打进镜像。
+
 ## [0.7.0] - 2026-09-13
 
 ### Added

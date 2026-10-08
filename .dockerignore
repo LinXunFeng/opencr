@@ -11,6 +11,9 @@ logs/
 data/
 *.log
 config.yaml
+# 凭据只能运行时挂载，打进镜像等于随镜像分发
+secrets/
+.env
 .idea/
 .vscode/
 .DS_Store

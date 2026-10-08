@@ -1109,5 +1109,94 @@ class GogcliTests(unittest.TestCase):
         self.assertEqual(len(items), 2)
 
 
+
+# ---------------------------------------------------------------------------
+# 部署脚本用的 gogcli 授权检查（install.sh / docker-entrypoint.sh / setup-gogcli.sh）
+# ---------------------------------------------------------------------------
+
+class GogcliStatusTests(unittest.TestCase):
+    ACCOUNT = "someone@company.com"
+
+    def _transport(self, results):
+        from backend.survey.destinations.google_transport import GogcliTransport
+
+        return GogcliTransport(self.ACCOUNT, "/opt/bin/gog", runner=_FakeGogcli(results))
+
+    def test_only_fixable_problems_ask_for_auth_add(self):
+        """
+        只有"账号不在 / 没授权 Sheets"才引向 `gog auth add`；
+        钥匙串被拒、令牌读取失败重新授权也解决不了，部署脚本不该让人白走一遍浏览器授权。
+        """
+        cases = [
+            (_ok({"accounts": [{"email": "a@b.com"}]}), True),
+            (_ok({"accounts": [{"email": self.ACCOUNT, "services": ["gmail"]}]}), True),
+            (_ok({"accounts": [{"email": self.ACCOUNT, "services": ["sheets"]}]}), False),
+            (_ok({"accounts": [{"email": self.ACCOUNT, "error": "keychain locked"}]}), False),
+            ((1, "", "Keychain access denied"), False),
+        ]
+        for listed, expected in cases:
+            with self.subTest(listed=listed):
+                self.assertEqual(self._transport([listed]).check_account()[1], expected)
+
+    def _run(self, destinations, results, argv):
+        """以假的配置与假子进程跑一次命令行入口，返回 (退出码, 输出, 子进程调用次数)。"""
+        import contextlib
+        import io
+
+        from backend.survey.destinations import gogcli_status
+        from backend.survey.destinations.google_transport import GogcliTransport
+
+        runner = _FakeGogcli(results)
+
+        def transport(options):
+            return GogcliTransport(options.get("account", ""), options.get("gogcli_bin") or "gog", runner=runner)
+
+        out = io.StringIO()
+        with mock.patch.object(gogcli_status, "load_destinations", return_value=destinations), \
+                mock.patch.object(gogcli_status, "_transport", side_effect=transport), \
+                contextlib.redirect_stdout(out):
+            code = gogcli_status.main(argv)
+        return code, out.getvalue(), len(runner.calls)
+
+    def _info(self, name, options, type_name="google_sheet", error=""):
+        from backend.survey.destinations.base import DestinationInfo
+
+        return DestinationInfo(name=name, type_name=type_name, options=options, error=error)
+
+    def test_needs_auth_lists_each_account_once_and_ignores_other_instances(self):
+        destinations = {
+            "a": self._info("a", {"auth": "gogcli", "account": self.ACCOUNT}),
+            "b": self._info("b", {"auth": "gogcli", "account": self.ACCOUNT}),
+            "sa": self._info("sa", {"credentials_file": "/k.json"}),
+            "broken": self._info("broken", {"auth": "gogcli"}, error="缺少 account"),
+        }
+        code, out, calls = self._run(destinations, [_ok({"accounts": []})], ["--needs-auth"])
+        self.assertEqual((code, out, calls), (0, f"{self.ACCOUNT}\n", 1))
+
+    def test_no_gogcli_instance_prints_nothing(self):
+        """install.sh 靠空输出判断"没有 gogcli 实例"并跳过整步；输出一个空行会被当成空账号。"""
+        destinations = {"sa": self._info("sa", {"credentials_file": "/k.json"})}
+        for argv in (["--accounts"], ["--needs-auth"], []):
+            with self.subTest(argv=argv):
+                self.assertEqual(self._run(destinations, [], argv), (0, "", 0))
+
+    def test_report_fails_on_any_problem_and_checks_shared_account_once(self):
+        destinations = {
+            "a": self._info("a", {"auth": "gogcli", "account": self.ACCOUNT}),
+            "b": self._info("b", {"auth": "gogcli", "account": self.ACCOUNT}),
+            "broken": self._info("broken", {"auth": "gogcli"}, error="缺少 account"),
+        }
+        listed = _ok({"accounts": [{"email": self.ACCOUNT, "services": ["sheets"]}]})
+        code, out, calls = self._run(destinations, [(0, "v0.40.0", ""), listed], [])
+        self.assertEqual(code, 1)
+        self.assertEqual(calls, 2)
+        self.assertIn("✗ 配置有误：缺少 account", out)
+        self.assertEqual(out.count("✓ gogcli 账号授权"), 2)
+
+        del destinations["broken"]
+        code, _, _ = self._run(destinations, [(0, "v0.40.0", ""), listed], [])
+        self.assertEqual(code, 0)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -15,7 +15,8 @@ Google Sheet 输出目标最初只支持服务账号（见 0.7.0）。实际部�
 
 ## Consequences
 
-- 服务多了一个运行期外部依赖。launchd 部署由使用者自行安装并在 `gogcli_bin` 写绝对路径；Docker 镜像默认打入固定版本的 gogcli，可用 build-arg 跳过。
+- 服务多了一个运行期外部依赖。launchd 部署由使用者自行安装，`install.sh` 把它所在目录加进服务的 PATH；Docker 镜像默认打入固定版本的 gogcli，可用 build-arg 跳过。
+- 账号授权必须有人在浏览器里点同意，部署流程只能自动化它周围的步骤：launchd 由 `install.sh` 交互完成；Docker 由宿主机上的 `scripts/setup-gogcli.sh` 在首次部署时做一次，容器启动时只导入 OAuth 客户端信息并打印授权状态。不支持挂载令牌文件、每次启动自动导入——明文 refresh token 会长期留在宿主机上，且每次重启都会用旧令牌覆盖在容器里重新授权过的令牌。
 - 令牌存储随部署形态而异：launchd 沿用登录用户的钥匙串；容器内没有钥匙串，只能用 gogcli 的文件存储，`GOG_KEYRING_PASSWORD` 等变量属于运行环境而非某个 Destination 实例，不写进 `config.yaml`。
 - 请求体一律写进仅本用户可读的临时文件、以 `--body @文件` 传给 gogcli，用完即删：命令行参数既有长度上限，又会出现在进程列表里，而正文是 Guest 都看不到的内容。`gog api call` 的 `--body` 不支持从 stdin 读取，所以不是管道。
 - `account` 必填，不依赖 gogcli 的默认账号——别人在构建机上执行一次 `gog auth add` 就能悄悄换掉默认账号，推送随之以另一个人的身份写表。

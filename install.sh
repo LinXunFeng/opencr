@@ -15,6 +15,8 @@ NC='\033[0m' # No Color
 
 # 配置
 INSTALL_DIR="$HOME/opencr"
+# launchd 服务的 PATH。setup_gogcli 会把 gogcli 所在目录追加进来
+LAUNCHD_PATH="${HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin"
 SERVICE_NAME="com.opencr.server"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 CONFIG_SOURCE_FILE=""
@@ -472,6 +474,74 @@ setup_codegraph() {
     fi
 }
 
+# 配置 gogcli 授权（仅当 destinations 里有 auth: gogcli 的实例）
+#
+# 授权本身要在浏览器里点同意，只能交互完成，所以放在安装脚本里而不是服务启动时；
+# 已授权的账号直接通过，重跑本脚本不会重复授权。
+# 与 setup_codegraph 同一原则：任何一步失败都只警告，不中断安装——审查服务不依赖 gogcli。
+#
+# 检查走 backend.survey.destinations.gogcli_status，与后台「测试连通性」是同一份实现，
+# 不在这里解析 `gog auth list` 的输出。必须在 setup_venv 与 generate_config_file 之后调用。
+setup_gogcli() {
+    local python_bin="$INSTALL_DIR/venv/bin/python"
+    local status_module="backend.survey.destinations.gogcli_status"
+    local accounts
+
+    accounts="$(cd "$INSTALL_DIR" && OPENCR_CONFIG_PATH="$INSTALL_DIR/config.yaml" \
+        "$python_bin" -m "$status_module" --accounts 2>/dev/null)" || accounts=""
+    [[ -n "$accounts" ]] || return 0
+
+    print_step "配置 gogcli 授权（Google Sheet 输出目标）"
+
+    local gog_bin
+    gog_bin="$(command -v gog 2>/dev/null || true)"
+    if [[ -z "$gog_bin" ]]; then
+        print_warning "未找到 gogcli，已跳过（不影响审查服务，只是推送到 Google Sheet 会失败）"
+        print_info "安装: brew install openclaw/tap/gogcli，然后重跑 ./install.sh"
+        return 0
+    fi
+    print_success "gogcli: $gog_bin"
+
+    # 把 gog 所在目录补进 launchd 的 PATH，config.yaml 里的 gogcli_bin 就可以只写裸名。
+    # 不改写用户的 destinations 段：那一段是原样保留的，在 shell 里改 YAML 迟早会改坏。
+    local gog_dir
+    gog_dir="$(dirname "$gog_bin")"
+    case ":$LAUNCHD_PATH:" in
+        *":$gog_dir:"*) ;;
+        *) LAUNCHD_PATH="$LAUNCHD_PATH:$gog_dir" ;;
+    esac
+
+    local needs_auth
+    needs_auth="$(cd "$INSTALL_DIR" && OPENCR_CONFIG_PATH="$INSTALL_DIR/config.yaml" \
+        "$python_bin" -m "$status_module" --needs-auth 2>/dev/null)" || needs_auth=""
+
+    local account
+    while IFS= read -r account; do
+        [[ -n "$account" ]] || continue
+        # 非交互运行（例如被别的脚本调用）时没人能在浏览器里点同意，只提示命令
+        if [[ ! -t 0 ]]; then
+            print_warning "账号 $account 尚未授权 Sheets，请执行: gog auth add $account --services sheets"
+            continue
+        fi
+        read -r -p "账号 $account 尚未授权 Sheets，现在在浏览器中授权吗? [Y/n]: " do_auth </dev/tty
+        if [[ "$do_auth" =~ ^[Nn]$ ]]; then
+            print_info "稍后可执行: gog auth add $account --services sheets"
+            continue
+        fi
+        "$gog_bin" auth add "$account" --services sheets </dev/tty \
+            || print_warning "账号 $account 授权未完成，稍后可重跑 ./install.sh"
+    done <<< "$needs_auth"
+
+    # 最后完整检查一遍并打印结果。它在终端里读一次令牌，macOS 的钥匙串授权弹窗会在此时出现，
+    # 点「始终允许」后 launchd 启动的服务就不会再被弹窗挡住——服务在后台时没人能点它。
+    print_info "检查 gogcli 授权状态（如出现钥匙串弹窗，请点「始终允许」）"
+    if (cd "$INSTALL_DIR" && OPENCR_CONFIG_PATH="$INSTALL_DIR/config.yaml" "$python_bin" -m "$status_module"); then
+        print_success "gogcli 授权正常"
+    else
+        print_warning "gogcli 授权存在问题，见上方提示（不影响审查服务）"
+    fi
+}
+
 # 生成启动脚本
 generate_start_scripts() {
     print_step "生成启动脚本"
@@ -726,7 +796,7 @@ generate_launchd_plist() {
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>${HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin</string>
+        <string>${LAUNCHD_PATH}</string>
         <key>HOME</key>
         <string>${HOME}</string>
     </dict>
@@ -848,6 +918,7 @@ main() {
     setup_venv
     generate_start_scripts
     generate_config_file
+    setup_gogcli
     generate_launchd_plist
     start_service
     show_summary

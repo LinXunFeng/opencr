@@ -123,6 +123,7 @@ backend/                # 后端 Python 包
 └── alembic.ini         # 迁移配置（与 migrations 同级，两者不分居）
 
 web/                    # 后台前端源码，独立构建单元，详见 web/README.md
+scripts/                # 在宿主机上执行的部署辅助脚本（不进镜像）
 ```
 
 **不要**把审查逻辑写回 `review_server.py`。webhook 与手动触发曾经各自复制过一份投递逻辑，
@@ -150,7 +151,7 @@ web/                    # 后台前端源码，独立构建单元，详见 web/R
 ## 六、常用命令
 
 ```bash
-# 测试（201 个用例，无需外部依赖）
+# 测试（205 个用例，无需外部依赖）
 python3 -m unittest discover -s tests -t .
 
 # 数据库迁移（部署脚本走的就是这条）

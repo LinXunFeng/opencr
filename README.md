@@ -489,32 +489,29 @@ destinations:
     type: google_sheet
     auth: gogcli
     account: "someone@company.com"     # required; never relies on gogcli's default account
-    gogcli_bin: "/opt/homebrew/bin/gog" # absolute path for launchd
+    # gogcli_bin: "/opt/homebrew/bin/gog" # optional; defaults to `gog` on PATH
 ```
 
 `account` must be explicit: anyone running `gog auth add` on the build machine could otherwise change gogcli's default account, and pushes would silently write as someone else.
 
-**launchd**: install gogcli yourself (for example `brew install openclaw/tap/gogcli`) and run `gog auth add <account> --services sheets` as the user the service runs as; tokens stay in the system keychain and the service reuses them. Set `gogcli_bin` to the absolute path from `command -v gog`, since launchd's PATH has neither Homebrew nor `~/.local/bin`. The first keychain read from a background service may be held by a permission prompt; the connectivity test says so, and running `gog auth list` once in a terminal and clicking "Always Allow" fixes it.
+**launchd**: install gogcli (for example `brew install openclaw/tap/gogcli`), then run `./install.sh`. When `destinations` has an `auth: gogcli` instance, the installer adds gogcli's directory to the launchd PATH (so `gogcli_bin` can stay unset), offers to run `gog auth add <account> --services sheets` in your browser for every account that is not authorized yet, and finishes with the same check as the console's connectivity test. That check reads the keychain from your terminal, so the macOS keychain prompt shows up while you are there; click "Always Allow" and the background service will not be blocked by it later. Re-running `./install.sh` skips accounts that are already authorized.
 
-**Docker**: the image ships a pinned gogcli by default (skip it with `--build-arg GOGCLI_VERSION=`). There is no keychain in the container, so tokens are stored as encrypted files in the `opencr-gogcli` volume:
+**Docker**: the image ships a pinned gogcli by default (skip it with `--build-arg GOGCLI_VERSION=`). There is no keychain in the container, so tokens are stored as encrypted files in the `opencr-gogcli` volume. On first deployment, run once on the host:
 
 ```bash
-# 1. Set the token encryption password in .env next to docker-compose.yml (do not change it after importing)
-echo 'GOG_KEYRING_PASSWORD=<a long random string>' >> .env
-docker compose up -d
-
-# 2. Import the OAuth client (the same JSON used with `gog auth credentials set` on the host)
-docker compose cp client_secret.json opencr:/tmp/client_secret.json
-docker compose exec opencr gog auth credentials set /tmp/client_secret.json
-
-# 3. Export the token on the host and import it into the container; delete both copies afterwards, it contains a refresh token
-gog auth tokens export someone@company.com --out tokens.json
-docker compose cp tokens.json opencr:/tmp/tokens.json
-docker compose exec opencr gog auth tokens import /tmp/tokens.json
-docker compose exec opencr rm -f /tmp/tokens.json /tmp/client_secret.json && rm -f tokens.json
+./scripts/setup-gogcli.sh --client-secret ~/Downloads/client_secret.json
 ```
 
-Alternatively authorize inside the container with `docker compose exec -it opencr gog auth add someone@company.com --services sheets --manual`. Either way, **publish the OAuth app to production**: refresh tokens issued by an app in Testing status expire after 7 days, and pushes start failing silently one week.
+The script generates `GOG_KEYRING_PASSWORD` into `.env` if it is missing (an existing one is never changed, or stored tokens could no longer be decrypted), starts the container, imports the OAuth client, and authorizes every gogcli account in `config.yaml` that still needs it: if gogcli on the host is already signed in to that account, its token is exported and imported into the container (the OAuth client must be the same one); otherwise it falls back to the paste-the-redirect-URL flow inside the container (force it with `--manual`). Temporary token files are deleted on both sides even if the script fails. You can also pass accounts explicitly: `./scripts/setup-gogcli.sh someone@company.com`.
+
+Tokens then live in the volume, so redeploys and image upgrades need nothing more. On every start the container also:
+
+- imports `./secrets/gogcli-client-secret.json` if present (enable the `./secrets` mount in `docker-compose.yml`), so `--client-secret` can be skipped;
+- prints the authorization status of each gogcli instance to the log, with the command to run when something is missing. Problems never block startup.
+
+Tokens are deliberately not auto-imported from a mounted file: the plaintext refresh token would stay on the host, and each restart would overwrite a token re-authorized inside the container.
+
+Either way, **publish the OAuth app to production**: refresh tokens issued by an app in Testing status expire after 7 days, and pushes start failing silently one week.
 
 **2. Bind it in the survey configuration.** Edit survey → Destinations → pick an instance, then enter the spreadsheet link (or ID) and worksheet name. A missing worksheet is created automatically; an empty name defaults to the survey name. A survey can bind several destinations, and several surveys can share one worksheet (the "巡检" column tells them apart). Click "测试连通性" (test connectivity) to check, in order, that the service account key loads, the spreadsheet is readable, the worksheet and its existing system columns, and write access; the service account email is shown so you know whom to share the sheet with. The test never creates a worksheet or writes ledger rows.
 

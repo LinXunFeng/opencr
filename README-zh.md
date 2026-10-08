@@ -458,32 +458,29 @@ destinations:
     type: google_sheet
     auth: gogcli
     account: "someone@company.com"     # 必填，不依赖 gogcli 的默认账号
-    gogcli_bin: "/opt/homebrew/bin/gog" # launchd 部署写绝对路径
+    # gogcli_bin: "/opt/homebrew/bin/gog" # 可选，缺省用 PATH 里的 gog
 ```
 
 `account` 必须显式填写：别人在构建机上执行一次 `gog auth add` 就能换掉 gogcli 的默认账号，推送就会以另一个人的身份写表。
 
-**launchd 部署**：自行安装 gogcli（例如 `brew install openclaw/tap/gogcli`），以运行服务的用户执行 `gog auth add <account> --services sheets` 完成授权，令牌存在系统钥匙串里，服务直接复用。`gogcli_bin` 写 `command -v gog` 输出的绝对路径——launchd 的 PATH 里没有 Homebrew 与 `~/.local/bin`。后台服务第一次读钥匙串时可能被授权弹窗挡住，连通性测试会提示；在终端执行一次 `gog auth list` 并点「始终允许」即可。
+**launchd 部署**：先安装 gogcli（例如 `brew install openclaw/tap/gogcli`），再执行 `./install.sh`。`destinations` 里有 `auth: gogcli` 的实例时，安装脚本会把 gogcli 所在目录加进 launchd 的 PATH（`gogcli_bin` 因此可以不填），对尚未授权的账号逐个询问是否立即执行 `gog auth add <account> --services sheets` 在浏览器中授权，最后做一遍与后台「测试连通性」相同的检查。这次检查在终端里读取钥匙串，macOS 的授权弹窗会在你面前出现，点「始终允许」后，后台服务就不会再被它挡住。重跑 `./install.sh` 时已授权的账号直接跳过。
 
-**Docker 部署**：镜像默认内置固定版本的 gogcli（不需要时用 `--build-arg GOGCLI_VERSION=` 跳过）。容器里没有钥匙串，令牌以加密文件存放在 `opencr-gogcli` 卷里：
+**Docker 部署**：镜像默认内置固定版本的 gogcli（不需要时用 `--build-arg GOGCLI_VERSION=` 跳过）。容器里没有钥匙串，令牌以加密文件存放在 `opencr-gogcli` 卷里。首次部署时在宿主机执行一次：
 
 ```bash
-# 1. 在 docker-compose.yml 同目录的 .env 里设置令牌加密密码（导入后不要再改）
-echo 'GOG_KEYRING_PASSWORD=<一个足够长的随机串>' >> .env
-docker compose up -d
-
-# 2. 导入 OAuth 客户端信息（与宿主机上 `gog auth credentials set` 用的是同一个 JSON）
-docker compose cp client_secret.json opencr:/tmp/client_secret.json
-docker compose exec opencr gog auth credentials set /tmp/client_secret.json
-
-# 3. 在宿主机导出令牌，再导入容器；完成后删掉两边的令牌文件，它含有 refresh token
-gog auth tokens export someone@company.com --out tokens.json
-docker compose cp tokens.json opencr:/tmp/tokens.json
-docker compose exec opencr gog auth tokens import /tmp/tokens.json
-docker compose exec opencr rm -f /tmp/tokens.json /tmp/client_secret.json && rm -f tokens.json
+./scripts/setup-gogcli.sh --client-secret ~/Downloads/client_secret.json
 ```
 
-也可以不导出，直接在容器里用 `docker compose exec -it opencr gog auth add someone@company.com --services sheets --manual` 走粘贴回调地址的授权流程。无论哪种方式，**OAuth 应用都要发布为正式版本**：处于 Testing 状态的应用签发的 refresh token 7 天就会过期，推送会从某一周开始静默失败。
+脚本会在 `.env` 缺少 `GOG_KEYRING_PASSWORD` 时生成一个（已有的绝不改动，否则卷里已存的令牌就解不开了），启动容器、导入 OAuth 客户端信息，再为 `config.yaml` 里尚未授权的 gogcli 账号逐个授权：宿主机的 gogcli 已登录该账号时导出令牌再导入容器（两边的 OAuth 客户端必须是同一个），否则改为在容器里走粘贴回调地址的授权流程（`--manual` 可强制使用这种方式）。令牌临时文件无论成功失败，两边都会删掉。也可以显式指定账号：`./scripts/setup-gogcli.sh someone@company.com`。
+
+令牌导入后留在卷里，之后重新部署、升级镜像都不用再执行。容器每次启动时还会：
+
+- 若存在 `./secrets/gogcli-client-secret.json`（需在 `docker-compose.yml` 里启用 `./secrets` 挂载），自动导入 OAuth 客户端信息，这样执行脚本时可以省掉 `--client-secret`；
+- 把每个 gogcli 实例的授权状态打印到启动日志，缺什么就给出要执行的命令。这些检查失败不阻止启动。
+
+刻意不支持挂载令牌文件、每次启动自动导入：明文 refresh token 会一直留在宿主机上，而且每次重启都会用这份旧令牌覆盖在容器里重新授权过的令牌。
+
+无论哪种方式，**OAuth 应用都要发布为正式版本**：处于 Testing 状态的应用签发的 refresh token 7 天就会过期，推送会从某一周开始静默失败。
 
 **2. 在巡检配置里绑定。** 编辑巡检 → 输出目标 → 选择实例，填写表格链接（或 ID）与工作表名。工作表不存在时自动创建，留空则使用巡检名称。一个巡检可以绑定多个输出目标，多个巡检也可以共用同一张工作表（靠「巡检」列区分）。填好后点「测试连通性」，会依次检查服务账号凭据、能否读取表格、工作表与已有的系统列、能否写入，并给出服务账号邮箱方便去共享表格；测试不会创建工作表，也不会写入任何台账行。
 

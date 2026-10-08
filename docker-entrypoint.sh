@@ -25,6 +25,23 @@ fi
 # 多个进程同时执行 DDL 只会互相抢锁。
 python3 -m backend.storage.migrate
 
+# gogcli：启动时只做不需要人参与的部分——导入 OAuth 客户端信息、打印授权状态。
+# 账号授权要在浏览器里点同意，由 scripts/setup-gogcli.sh 在首次部署时做一次，令牌留在 opencr-gogcli 卷里。
+# 刻意不支持挂载令牌文件、每次启动自动导入：明文 refresh token 会一直留在宿主机上，
+# 而且每次重启都会用这份旧令牌覆盖卷里在容器内重新授权过的令牌。
+# 这一段任何失败都不阻止启动：审查服务不依赖 gogcli，问题留给日志与后台的连通性测试。
+GOGCLI_CLIENT_SECRET=/app/secrets/gogcli-client-secret.json
+if command -v gog >/dev/null 2>&1; then
+  if [ -f "$GOGCLI_CLIENT_SECRET" ]; then
+    # 每次启动都导入而不是"没有才导入"：客户端信息不含用户令牌，覆盖是幂等的，
+    # 而且宿主机上换了 JSON 之后重启一下就能生效
+    gog auth credentials set "$GOGCLI_CLIENT_SECRET" >/dev/null \
+      || echo "[opencr] gogcli 导入 OAuth 客户端信息失败：$GOGCLI_CLIENT_SECRET" >&2
+  fi
+  python3 -m backend.survey.destinations.gogcli_status \
+    || echo "[opencr] gogcli 授权存在问题（不影响审查服务），首次部署请在宿主机执行 ./scripts/setup-gogcli.sh <账号>" >&2
+fi
+
 SERVER_HOST="${REVIEW_SERVER_HOST:-0.0.0.0}"
 SERVER_PORT="${REVIEW_SERVER_PORT:-9034}"
 # 本服务是 IO bound 且几乎无 QPS，worker 多了只会放大 SQLite 锁竞争。

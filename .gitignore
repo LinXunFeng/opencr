@@ -34,3 +34,6 @@ web/node_modules/
 web/dist/
 web/.eslintcache
 backend/admin/static/
+
+# 挂载进容器的凭据（服务账号密钥、gogcli 的 OAuth 客户端信息）
+secrets/
