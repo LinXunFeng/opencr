@@ -148,16 +148,19 @@ destinations:
   #   # Google Sheet as a user already signed in with gogcli (https://github.com/openclaw/gogcli).
   #   # The service shells out to gogcli and never holds user tokens itself. `account` is
   #   # required: gogcli's default account can be changed by anyone running `gog auth add`.
-  #   # launchd: use an absolute gogcli_bin, its PATH has no Homebrew or ~/.local/bin.
-  #   # Docker: gogcli is baked into the image; tokens live in the opencr-gogcli volume.
+  #   # launchd: ./install.sh puts gogcli on the service PATH and walks you through authorization.
+  #   # Docker: gogcli is baked into the image; run ./scripts/setup-gogcli.sh once on first deploy,
+  #   # tokens then live in the opencr-gogcli volume.
+  #   # gogcli_bin is optional and defaults to `gog` on PATH.
   #   # 以 gogcli 中已登录的用户身份写入 Google Sheet。服务调用 gogcli，自己不持有任何用户令牌。
   #   # account 必填：别人执行一次 `gog auth add` 就能换掉 gogcli 的默认账号。
-  #   # launchd 部署时 gogcli_bin 写绝对路径（其 PATH 里没有 Homebrew 与 ~/.local/bin）；
-  #   # Docker 镜像已内置 gogcli，令牌存放在 opencr-gogcli 卷里，准备方式见 README。
+  #   # launchd 部署：./install.sh 会把 gogcli 加进服务的 PATH，并引导完成授权。
+  #   # Docker 部署：镜像已内置 gogcli，首次部署执行一次 ./scripts/setup-gogcli.sh，令牌随后存放在 opencr-gogcli 卷里。
+  #   # gogcli_bin 可选，缺省使用 PATH 里的 gog。
   #   type: google_sheet
   #   auth: gogcli
   #   account: "someone@company.com"
-  #   gogcli_bin: "/opt/homebrew/bin/gog"
+  #   # gogcli_bin: "/opt/homebrew/bin/gog"
 
 # Admin console settings. Disabled by default.
 # 后台管理配置。默认关闭 —— 从旧版本升级上来的实例不会平白多出一个管理面板。

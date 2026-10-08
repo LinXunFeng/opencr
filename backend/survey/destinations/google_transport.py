@@ -20,7 +20,7 @@ import threading
 import time
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import quote
 
 from .base import CHECK_ERROR, CHECK_OK, CHECK_WARN, CheckItem, DestinationError
@@ -297,8 +297,8 @@ class GogcliTransport(SheetsTransport):
         if Path("/.dockerenv").exists():
             return message + "。服务运行在容器内：镜像构建时是否用 --build-arg GOGCLI_VERSION= 跳过了 gogcli？"
         return message + (
-            "。launchd 启动的服务 PATH 里没有 Homebrew 与 ~/.local/bin，"
-            "请在 gogcli_bin 填写绝对路径（在终端执行 `command -v gog` 查看）"
+            "。launchd 启动的服务只认 install.sh 写进 plist 的 PATH：安装 gogcli 后请重跑 ./install.sh，"
+            "或在 gogcli_bin 填写绝对路径（在终端执行 `command -v gog` 查看）"
         )
 
     def _exec(self, args: List[str], timeout: int) -> subprocess.CompletedProcess:
@@ -360,15 +360,22 @@ class GogcliTransport(SheetsTransport):
         if version.returncode != 0:
             return [CheckItem("gogcli 可执行文件", CHECK_ERROR, str(self._describe_failure(version.returncode, version.stderr)))]
         items = [CheckItem("gogcli 可执行文件", CHECK_OK, f"{(version.stdout or '').strip() or 'gogcli'}（{self.binary}）")]
+        items.append(self.check_account()[0])
+        return items
 
+    def check_account(self) -> Tuple[CheckItem, bool]:
+        """
+        账号授权这一项的结论，以及问题能否靠 `gog auth add` 解决。
+
+        后者供部署脚本决定要不要提示授权：钥匙串被拒、令牌读取失败这类问题重新授权也解决不了，
+        把它们也引向 `gog auth add` 只会让人白走一遍浏览器授权。
+        """
         try:
             listed = self._exec(["auth", "list", "--json", "--no-input"], GOGCLI_CHECK_TIMEOUT_SECONDS)
         except DestinationError as e:
-            items.append(CheckItem(self.auth_title, CHECK_ERROR, str(e)))
-            return items
+            return CheckItem(self.auth_title, CHECK_ERROR, str(e)), False
         if listed.returncode != 0:
-            items.append(CheckItem(self.auth_title, CHECK_ERROR, str(self._describe_failure(listed.returncode, listed.stderr))))
-            return items
+            return CheckItem(self.auth_title, CHECK_ERROR, str(self._describe_failure(listed.returncode, listed.stderr))), False
         try:
             accounts = json.loads(listed.stdout or "{}").get("accounts") or []
         except (ValueError, AttributeError):
@@ -379,25 +386,21 @@ class GogcliTransport(SheetsTransport):
         add_hint = f"请在运行服务的机器上执行 `gog auth add {self.account} --services sheets`"
         if entry is None:
             known = "、".join(str(a.get("email")) for a in accounts if a.get("email")) or "（没有任何账号）"
-            items.append(CheckItem(self.auth_title, CHECK_ERROR, f"gogcli 中没有账号 {self.account} 的授权，现有：{known}。{add_hint}"))
-            return items
+            return CheckItem(self.auth_title, CHECK_ERROR, f"gogcli 中没有账号 {self.account} 的授权，现有：{known}。{add_hint}"), True
         if entry.get("error"):
             hint = f"；{entry['hint']}" if entry.get("hint") else ""
-            items.append(CheckItem(self.auth_title, CHECK_ERROR, f"账号 {self.account} 的令牌读取失败：{entry['error']}{hint}"))
-            return items
+            return CheckItem(self.auth_title, CHECK_ERROR, f"账号 {self.account} 的令牌读取失败：{entry['error']}{hint}"), False
         services = [str(s) for s in entry.get("services") or []]
         if services and "sheets" not in services:
-            items.append(CheckItem(
+            return CheckItem(
                 self.auth_title, CHECK_ERROR,
                 f"账号 {self.account} 授权时没有包含 Sheets（现有：{'、'.join(services)}）。{add_hint}",
-            ))
-            return items
+            ), True
         level = CHECK_OK if services else CHECK_WARN
         note = "" if services else "（gogcli 没有记录授权范围，以下面的实际请求为准）"
-        items.append(CheckItem(
+        return CheckItem(
             self.auth_title, level, f"已使用账号 {self.account}{note}，表格需要以「编辑者」身份共享给该账号",
-        ))
-        return items
+        ), False
 
     def call(self, method: str, params: Dict[str, Any], body: Optional[dict] = None, quick: bool = False) -> dict:
         """
