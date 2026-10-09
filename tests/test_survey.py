@@ -547,6 +547,18 @@ class SurveyReportTests(SurveyStorageTestCase):
         # 与界面的页签一致，没有条目时也出这一节
         self.assertIn("## 本轮未复查", markdown)
 
+    def test_markdown_report_shows_times_in_survey_timezone(self):
+        from backend.survey.report import render_run_markdown
+
+        # 库里是 naive UTC，导出时不换算就会比东八区少 8 小时
+        markdown = render_run_markdown({
+            "survey_timezone": "Asia/Shanghai",
+            "started_at": "2026-10-09T02:00:00.123456",
+            "finished_at": "",
+        })
+        self.assertIn("开始时间：2026-10-09 10:00:00 (Asia/Shanghai)", markdown)
+        self.assertIn("结束时间：（未结束）", markdown)
+
     def test_markdown_report_lists_unchecked_separately(self):
         from backend.survey.report import render_run_markdown
 

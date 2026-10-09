@@ -11,7 +11,7 @@ import {
   runSurveyApi,
   updateSurveyApi
 } from "@@/apis/opencr"
-import { SCHEDULE_KIND_LABEL, SURVEY_NOTES, WEEKDAY_OPTIONS } from "@@/constants/opencr"
+import { formatTime, SCHEDULE_KIND_LABEL, SURVEY_NOTES, WEEKDAY_OPTIONS } from "@@/constants/opencr"
 import { useUserStore } from "@/pinia/stores/user"
 
 const userStore = useUserStore()
@@ -68,10 +68,6 @@ function formatBytes(bytes?: number) {
     i++
   }
   return `${value.toFixed(value >= 10 || i === 0 ? 0 : 1)} ${units[i]}`
-}
-
-function formatTime(value: string) {
-  return value ? new Date(value).toLocaleString() : "—"
 }
 
 async function load() {

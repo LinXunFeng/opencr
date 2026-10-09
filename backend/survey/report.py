@@ -7,7 +7,8 @@
 从两篇 Markdown 里算不出可靠的差集。
 """
 
-from typing import Dict, List
+from datetime import datetime, timezone
+from typing import Dict, List, Optional
 
 from ..storage.models import (
     CATEGORY_ARCHITECTURE,
@@ -33,6 +34,7 @@ from ..storage.models import (
     SEVERITY_UNKNOWN,
     SEVERITY_WARNING,
 )
+from .schedule import resolve_timezone
 
 CATEGORY_LABELS: Dict[str, str] = {
     CATEGORY_CORRECTNESS: "正确性",
@@ -213,18 +215,34 @@ def _render_codegraph(detail: dict) -> List[str]:
     return lines
 
 
+def _format_time(iso: Optional[str], zone_name: str) -> str:
+    """把库里的 naive UTC 时间串换算成巡检时区，带上时区名；空值返回空串。"""
+    if not iso:
+        return ""
+    try:
+        moment = datetime.fromisoformat(iso)
+    except ValueError:
+        # 解析不了就原样输出，宁可让人看到原值，也不要让整篇报告导出失败
+        return iso
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    zone = resolve_timezone(zone_name)
+    return f"{moment.astimezone(zone):%Y-%m-%d %H:%M:%S} ({zone.key})"
+
+
 def render_run_markdown(detail: dict) -> str:
     """把 get_survey_run_detail 的结果渲染成一篇完整报告。"""
     include_body = bool(detail.get("body_included", True))
     counts = detail.get("counts") or {}
+    zone_name = detail.get("survey_timezone") or "UTC"
     lines: List[str] = [
         f"# 巡检报告：{detail.get('survey_name') or '未命名'}",
         "",
         f"- 运行编号：`{detail.get('run_uid','')}`",
         f"- 触发方式：{'手动' if detail.get('trigger') == 'manual' else '定时'}",
         f"- 状态：{detail.get('status','')}",
-        f"- 开始时间：{detail.get('started_at','')}",
-        f"- 结束时间：{detail.get('finished_at','') or '（未结束）'}",
+        f"- 开始时间：{_format_time(detail.get('started_at'), zone_name)}",
+        f"- 结束时间：{_format_time(detail.get('finished_at'), zone_name) or '（未结束）'}",
         f"- 命中技能：{', '.join(detail.get('matched_skills') or []) or '（无）'}",
         "",
         f"本次共 **{counts.get('total', 0)}** 条发现："

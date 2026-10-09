@@ -1688,6 +1688,8 @@ def get_survey_run_detail(
         detail = _survey_run_to_dict(run, stale_after_seconds)
         detail["survey_uid"] = survey.survey_uid if survey else ""
         detail["survey_name"] = survey.name if survey else ""
+        # 时间字段是 naive UTC，导出报告要按巡检自己的时区换算后才给人看
+        detail["survey_timezone"] = (survey.timezone if survey else "") or "UTC"
         # 整合叙述也是模型对私有代码的描述，与正文同一档待遇
         detail["summary"] = (run.summary or "") if include_body else ""
         detail["body_included"] = include_body
