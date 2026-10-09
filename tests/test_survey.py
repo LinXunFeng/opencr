@@ -7,6 +7,7 @@
 """
 
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -563,6 +564,193 @@ class SurveyReportTests(SurveyStorageTestCase):
         markdown = render_run_markdown(self.repo.get_survey_run_detail(run_uid, include_body=False))
         self.assertNotIn("详情", markdown)
         self.assertIn("不含发现正文", markdown)
+
+
+class ReachTests(unittest.TestCase):
+    """Reach：L1 能点名的文件只限画像里带完整路径的那些，与目录深度无关。"""
+
+    PROFILE = {
+        "repo_slug": "app",
+        "kind": "codegraph",
+        "tree": ["main.go", "internal/ (order, user)"],
+        "manifests": {"go.mod": "module app"},
+        "routes": [{"method": "POST", "path": "/api/order", "handler": "Create", "file": "internal/order/handler.go"}],
+        "types": [{"kind": "struct", "name": "Order", "file": "internal/order/deep/x/model.go"}],
+        "api_calls": [],
+        "languages": {},
+    }
+    SOURCES = [
+        "main.go",
+        "internal/order/handler.go",
+        "internal/order/deep/x/model.go",
+        "internal/order/service.go",
+        "internal/user/service.go",
+    ]
+
+    def test_only_paths_in_profile_are_reachable_regardless_of_depth(self):
+        """可达与否取决于文件有没有以完整路径出现在画像里，与目录深度无关。"""
+        from backend.survey.reach import measure_reach
+
+        reach = measure_reach(self.PROFILE, self.SOURCES, 100000, 0, {"internal/order/service.go": 30})
+        self.assertEqual((reach["source_files"], reach["reachable_files"]), (5, 3))
+        # 深层文件只要定义了类型就可达；只有函数的 service.go 不管多浅都不可达
+        self.assertIn({"depth": 4, "reachable": 1, "total": 1}, reach["by_depth"])
+        self.assertEqual(reach["by_source"]["types"], 1)
+        self.assertEqual(reach["heavy_hidden_files"], [{"path": "internal/order/service.go", "symbols": 30}])
+        self.assertEqual(reach["heavy_hidden_count"], 1)
+        self.assertFalse(reach["truncated"])
+
+    def test_truncation_removes_reach(self):
+        """画像超出 L1 预算被截断时，截掉部分里的文件同样看不到。"""
+        from backend.survey.reach import measure_reach
+
+        reach = measure_reach(self.PROFILE, self.SOURCES, 120, 0)
+        self.assertTrue(reach["truncated"])
+        self.assertLess(reach["reachable_files"], reach["listed_files"])
+        # 没有 codegraph 符号数时与"一个都没有"区分开
+        self.assertIsNone(reach["heavy_hidden_count"])
+
+    def test_rendered_paths_follows_render_profile(self):
+        """反查与渲染格式必须一致，否则统计会悄悄算错。"""
+        from backend.survey.profile import render_profile, rendered_paths
+
+        text = render_profile(self.PROFILE, 0)
+        self.assertEqual(
+            rendered_paths(self.PROFILE, text),
+            {"main.go", "go.mod", "internal/order/handler.go", "internal/order/deep/x/model.go"},
+        )
+
+    def test_scan_limit_ignores_files_the_scanner_skips(self):
+        """调用侧扫描跳过的大文件不计入上限，按扩展名数会把"全扫了"误报成"只扫了一部分"。"""
+        from backend.survey import reach
+
+        root = Path(tempfile.mkdtemp(prefix="opencr-reach-scan-"))
+        self.addCleanup(shutil.rmtree, root, True)
+        (root / "small.py").write_text("x", encoding="utf-8")
+        (root / "huge.py").write_text("x" * (reach.MAX_SCANNED_FILE_BYTES + 1), encoding="utf-8")
+        (root / "notes.sql").write_text("x", encoding="utf-8")
+        sources = reach.walk_sources(root)
+        self.assertEqual(len(sources), 3)
+        # 只有 small.py 会被调用侧扫描计数：huge.py 超过大小上限，.sql 不在调用侧扩展名里
+        self.assertEqual(reach._scan_candidates(root, sources), 1)
+
+        many = [f"f{i}.py" for i in range(3001)]
+        self.assertTrue(reach.measure_reach(self.PROFILE, many, 100000, 3001)["scan_limited"])
+        self.assertFalse(reach.measure_reach(self.PROFILE, many, 100000, 2999)["scan_limited"])
+
+    def test_backslash_paths_in_profile_still_match(self):
+        """画像里的路径来自 str(Path)，在 Windows 上是反斜杠，统计时要与遍历结果对得上。"""
+        from backend.survey.reach import measure_reach
+
+        profile = {**self.PROFILE, "types": [{"kind": "struct", "name": "Order", "file": "internal\\order\\deep\\x\\model.go"}]}
+        reach = measure_reach(profile, self.SOURCES, 100000, 0)
+        self.assertEqual(reach["by_source"]["types"], 1)
+        self.assertEqual(reach["reachable_files"], 3)
+
+    def test_absolute_and_dotted_paths_in_profile_still_match(self):
+        """codegraph 可能存绝对路径或带 "./"，不统一的话对应来源的可达数会被悄悄算成 0。"""
+        from backend.survey.reach import measure_reach
+
+        root = os.path.realpath(tempfile.mkdtemp(prefix="opencr-reach-root-"))
+        self.addCleanup(shutil.rmtree, root, True)
+        profile = {
+            **self.PROFILE,
+            "routes": [{"method": "POST", "path": "/api/order", "handler": "Create",
+                        "file": os.path.join(root, "internal/order/handler.go")}],
+            "types": [{"kind": "struct", "name": "Order", "file": "./internal/order/deep/x/model.go"}],
+        }
+        reach = measure_reach(profile, self.SOURCES, 100000, 0, repo_root=root)
+        self.assertEqual((reach["by_source"]["routes"], reach["by_source"]["types"]), (1, 1))
+        self.assertEqual(reach["reachable_files"], 3)
+
+    def test_api_call_cap_is_judged_before_dropping_registrations(self):
+        """剔除路由注册后条数会低于上限，事后再数会把撞了上限报成没撞。"""
+        from unittest import mock
+
+        from backend.survey import profile as profile_mod
+        from backend.survey.reach import measure_reach
+
+        calls = [{"path": f"/api/x/{i}", "method": "GET", "file": "srv.go", "line": i}
+                 for i in range(profile_mod.MAX_API_CALLS)]
+        # 第一条调用其实是路由注册那一行，codegraph 模式下会被剔除
+        routes = [{"method": "GET", "path": "/api/x/0", "handler": "", "file": "srv.go"}]
+        root = Path(tempfile.mkdtemp(prefix="opencr-reach-cap-"))
+        self.addCleanup(shutil.rmtree, root, True)
+        with mock.patch.object(profile_mod, "extract_api_calls", return_value=calls), \
+                mock.patch.object(profile_mod, "codegraph_available", return_value=True), \
+                mock.patch.object(profile_mod, "build_index", return_value=root / "codegraph.db"), \
+                mock.patch.object(profile_mod, "_extract_routes", return_value=routes), \
+                mock.patch.object(profile_mod, "_extract_types", return_value=[]), \
+                mock.patch.object(profile_mod, "_extract_languages", return_value={}):
+            built = profile_mod.build_profile("app", root)
+        self.assertLess(len(built["api_calls"]), profile_mod.MAX_API_CALLS)
+        self.assertTrue(built["api_calls_capped"])
+        self.assertIn("api_calls", measure_reach(built, ["srv.go"], 100000, 0)["caps"])
+
+    def test_walk_skips_dependency_dirs(self):
+        """依赖与产物目录不算仓库的源码，算进去会把可达比例压得失真。"""
+        from backend.survey.reach import walk_sources
+
+        root = Path(tempfile.mkdtemp(prefix="opencr-reach-"))
+        self.addCleanup(shutil.rmtree, root, True)
+        for rel in ("a.py", "pkg/b.py", "node_modules/x.js", ".git/hooks/y.sh", "README.md"):
+            path = root / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("x", encoding="utf-8")
+        self.assertEqual(sorted(walk_sources(root)), ["a.py", "pkg/b.py"])
+
+
+class ReachStorageTests(SurveyStorageTestCase):
+    """Reach 的落库、游客剔除与报告展示。"""
+
+    def test_reach_round_trips_and_guest_gets_counts_only(self):
+        """具体目录与文件描述的是代码库结构，与正文同一档待遇。"""
+        run_uid = self.repo.start_survey_run(self.survey["survey_uid"], "manual")
+        self.repo.record_survey_repo(run_uid, "app", "https://g.com/a/app.git")
+        self.repo.record_survey_repo_reach(run_uid, "app", {
+            "source_files": 10, "reachable_files": 4,
+            "hidden_dirs": [{"dir": "lib", "hidden": 6, "total": 8}],
+            "heavy_hidden_files": [{"path": "lib/core.dart", "symbols": 40}],
+        })
+        admin = self.repo.get_survey_run_detail(run_uid)["repos"][0]["reach"]
+        self.assertEqual(admin["hidden_dirs"][0]["dir"], "lib")
+        guest = self.repo.get_survey_run_detail(run_uid, include_body=False)["repos"][0]["reach"]
+        self.assertEqual(guest["reachable_files"], 4)
+        self.assertNotIn("hidden_dirs", guest)
+        self.assertNotIn("heavy_hidden_files", guest)
+
+    def test_missing_reach_is_none(self):
+        """没有统计记录时返回 None，界面显示为无记录。"""
+        run_uid = self.repo.start_survey_run(self.survey["survey_uid"], "manual")
+        self.repo.record_survey_repo(run_uid, "app", "https://g.com/a/app.git")
+        self.assertIsNone(self.repo.get_survey_run_detail(run_uid)["repos"][0]["reach"])
+
+    def test_report_shows_reach_cell(self):
+        """Markdown 报告的仓库表带上可达比例，画像被截断时注明。"""
+        from backend.survey.report import render_run_markdown
+
+        run_uid = self.repo.start_survey_run(self.survey["survey_uid"], "manual")
+        self.repo.record_survey_repo(run_uid, "app", "https://g.com/a/app.git")
+        self.repo.record_survey_repo_reach(run_uid, "app", {"source_files": 8, "reachable_files": 2, "truncated": True})
+        markdown = render_run_markdown(self.repo.get_survey_run_detail(run_uid))
+        self.assertIn("2/8（25%），画像被截断", markdown)
+
+    def test_reach_failure_does_not_break_the_run(self):
+        """统计只是排查辅助，失败只记日志。"""
+        from unittest import mock
+
+        from backend.survey import runner
+        from backend.survey.analysis import Budget
+
+        run_uid = self.repo.start_survey_run(self.survey["survey_uid"], "manual")
+        self.repo.record_survey_repo(run_uid, "app", "https://g.com/a/app.git")
+        prepared = [{"slug": "app", "dir": Path("/nonexistent"), "profile": ReachTests.PROFILE}]
+        with mock.patch.object(runner, "collect_reach", side_effect=RuntimeError("boom")):
+            runner._record_reach(run_uid, prepared, {"links": []}, Budget(10, 10000, 5, 10000))
+        with mock.patch.object(runner, "render_cross_repo_map", side_effect=RuntimeError("boom")):
+            runner._record_reach(run_uid, prepared, {"links": []}, Budget(10, 10000, 5, 10000))
+        # 没抛出就是巡检没被拖垮；统计失败的仓库落成"无记录"
+        self.assertIsNone(self.repo.get_survey_run_detail(run_uid)["repos"][0]["reach"])
 
 
 if __name__ == "__main__":

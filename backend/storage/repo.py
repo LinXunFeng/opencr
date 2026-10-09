@@ -1455,6 +1455,42 @@ def _parse_inspected_files(raw: Optional[str], conclusive_only: bool = True) -> 
     }
 
 
+def record_survey_repo_reach(run_uid: str, repo_slug: str, reach: dict) -> None:
+    """把一个仓库的 Reach 统计写到本轮的仓库记录上。仓库记录不存在时什么也不做。"""
+    from .models import SurveyRun, SurveyRunRepo
+
+    with session_scope() as session:
+        run_id = session.scalar(select(SurveyRun.id).where(SurveyRun.run_uid == run_uid))
+        if run_id is None:
+            return
+        session.execute(
+            update(SurveyRunRepo)
+            .where(SurveyRunRepo.run_id == run_id, SurveyRunRepo.repo_slug == repo_slug)
+            .values(reach=json.dumps(reach, ensure_ascii=False))
+        )
+
+
+# Reach 里列出具体文件与目录的字段。它们描述的是代码库的结构，与发现正文同一档待遇，
+# Guest 只拿得到计数（见 docs/adr/0002-guest-read-scope.md）
+_REACH_DETAIL_KEYS = ("hidden_dirs", "heavy_hidden_files")
+
+
+def _reach_to_dict(raw: Optional[str], include_body: bool) -> Optional[dict]:
+    """解析 Reach 统计；为空或损坏时返回 None，界面显示为"无记录"而不是让详情页打不开。"""
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    if not include_body:
+        for key in _REACH_DETAIL_KEYS:
+            data.pop(key, None)
+    return data
+
+
 def finish_survey_run(
     run_uid: str,
     status: str,
@@ -1600,6 +1636,7 @@ def get_survey_run_detail(
                 "profile_kind": r.profile_kind or "",
                 "file_count": r.file_count,
                 "error_message": r.error_message or "",
+                "reach": _reach_to_dict(r.reach, include_body),
             }
             for r in repos
         ]

@@ -110,6 +110,7 @@ backend/                # 后端 Python 包
 │   ├── workspace.py    # 仓库拉取与工作区管理（唯一调 git 的地方）
 │   ├── sources.py      # 来源展开（组织在每次执行时实时展开）
 │   ├── profile.py      # L0 仓库画像；codegraph 集成
+│   ├── reach.py        # Reach 统计：L1 能点名的源码文件范围；判定逻辑是纯函数
 │   ├── crossrepo.py    # 跨仓库接口连接；确定性匹配，不含模型判断
 │   ├── analysis.py     # L1 整合 / L2 取证 / L3 汇总的模型调用
 │   ├── report.py       # Markdown 报告渲染（渲染产物，不是存储真相）

@@ -548,6 +548,8 @@ measured at 5.69M characters of source for three medium repositories versus roug
 combined profile. [codegraph](https://github.com/colbymchenry/codegraph) provides the routes and
 type-skeleton layer of that digest, and the language breakdown that skill matching relies on.
 
+The integration step can only pick files whose full path appears in a profile (routes, type skeleton, API calls, manifests, root-level files); files holding only functions, configs and scripts are invisible at any directory depth. Every run measures each repository's **L1 reach** and shows it in the "Repositories" table of the run details; expanding a row shows the breakdown by source and by directory depth, plus the directories with the most unreachable files and the unreachable files with the most symbols (the last two require login). Without codegraph the reach shrinks sharply.
+
 **Both deployment paths install it by default**, pinned to `v1.6.0`:
 
 - `install.sh` downloads it into `~/.codegraph` and writes the **absolute path** into

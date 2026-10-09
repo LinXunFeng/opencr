@@ -491,6 +491,9 @@ class SurveyRunRepo(Base):
     profile_kind: Mapped[Optional[str]] = mapped_column(String(24))
     file_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     error_message: Mapped[Optional[str]] = mapped_column(Text)
+    # Reach 统计（survey/reach.py 的 measure_reach），JSON。拉取失败的仓库、早于该字段的运行、
+    # 以及统计本身失败时为 NULL —— 统计是排查辅助，失败不影响巡检
+    reach: Mapped[Optional[str]] = mapped_column(Text)
 
     run: Mapped["SurveyRun"] = relationship(back_populates="repos")
 

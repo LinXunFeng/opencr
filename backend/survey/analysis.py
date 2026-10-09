@@ -198,10 +198,20 @@ def _build_l1_context(profiles: List[dict], cross_map: dict, max_chars: int) -> 
     后面的仓库在"整合分析"里根本不在场，那就不叫整合了。
     """
     cross_text = render_cross_repo_map(cross_map)
-    remaining = max(max_chars - len(cross_text), 1000)
-    per_repo = max(remaining // max(len(profiles), 1), 500)
+    per_repo = l1_repo_budget(len(profiles), len(cross_text), max_chars)
     blocks = [render_profile(p, per_repo) for p in profiles]
     return cross_text + "\n\n" + "\n\n".join(blocks)
+
+
+def l1_repo_budget(repo_count: int, cross_chars: int, max_chars: int) -> int:
+    """
+    L1 输入里每个仓库的画像分到的字符数：扣掉跨仓库连接后按仓库均分。
+
+    单独成函数是为了让 Reach 统计（reach.py）与 L1 实际拿到的输入用同一套分配，
+    两边各算一遍迟早会算出不一样的截断位置。
+    """
+    remaining = max(max_chars - cross_chars, 1000)
+    return max(remaining // max(repo_count, 1), 500)
 
 
 def plan_focus(
