@@ -47,6 +47,7 @@ DEGRADATION_LABELS: Dict[str, str] = {
     "index_failed": "代码索引失败（该仓库的画像退化为依赖清单级）",
     "budget_exhausted": "预算耗尽，提前收工（部分关注点未取证）",
     "profile_fallback": "codegraph 不可用，全部画像退化为依赖清单级",
+    "repos_truncated": "仓库数超过单次巡检上限，超出的仓库未参与本次分析",
 }
 
 _SEVERITY_ORDER = [SEVERITY_CRITICAL, SEVERITY_WARNING, SEVERITY_ADVICE, SEVERITY_UNKNOWN]

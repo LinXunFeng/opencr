@@ -10,6 +10,7 @@ const data = ref<SettingsData | null>(null)
 const guestRead = ref(true)
 const guestRetry = ref(false)
 const surveyGuestRead = ref(true)
+const surveyMaxRepos = ref<number | null>(200)
 
 /** 读取当前设置。 */
 async function load() {
@@ -19,6 +20,7 @@ async function load() {
     guestRead.value = data.value.writable.guest_read
     guestRetry.value = data.value.writable.guest_retry
     surveyGuestRead.value = data.value.writable.survey_guest_read
+    surveyMaxRepos.value = data.value.writable.survey_max_repos
   } catch (error) {
     ElMessage.error((error as Error).message)
   } finally {
@@ -99,6 +101,30 @@ async function toggleSurveyGuest(value: string | number | boolean) {
   }
 }
 
+/**
+ * 保存单次巡检的仓库上限。
+ *
+ * 数字输入不像开关那样即改即存：逐个按键保存会在输入过程中写进 1、12 这类中间值。
+ */
+async function saveSurveyMaxRepos() {
+  // 输入框被清空时 v-model 是 null，发出去只会换来 400 并留下一个空框；回填当前生效值
+  if (surveyMaxRepos.value == null) {
+    surveyMaxRepos.value = data.value?.writable.survey_max_repos ?? 200
+    return
+  }
+  saving.value = true
+  try {
+    const res = await updateSettingsApi({ survey_max_repos: surveyMaxRepos.value })
+    surveyMaxRepos.value = res.writable.survey_max_repos
+    if (data.value) data.value.writable.survey_max_repos = res.writable.survey_max_repos
+    ElMessage.success(`单次巡检仓库上限已设为 ${surveyMaxRepos.value}，下一次巡检生效`)
+  } catch (error) {
+    ElMessage.error((error as Error).message)
+  } finally {
+    saving.value = false
+  }
+}
+
 onMounted(load)
 </script>
 
@@ -134,6 +160,22 @@ onMounted(load)
             控制未登录访问者能否看到<b>定期巡检</b>模块。开启后他们能看到巡检的运行状态与聚合统计，
             但同样<b>看不到发现正文与整体结论</b>——巡检正文描述的是整个代码库的架构与弱点。
             该开关嵌套在「游客浏览」之下：上面关掉时它不起作用。
+          </div>
+        </el-form-item>
+
+        <!-- 1~1000 与后端 MAX_REPOS_LOWER_BOUND / MAX_REPOS_UPPER_BOUND 对应，越界会被接口拒绝 -->
+        <el-form-item label="巡检仓库上限">
+          <el-input-number
+            v-model="surveyMaxRepos" :min="1" :max="1000" :step="50" :precision="0"
+            :disabled="saving"
+          />
+          <el-button class="ml" type="primary" :loading="saving" @click="saveSurveyMaxRepos">
+            保存
+          </el-button>
+          <div class="hint">
+            单次巡检最多处理多少个仓库（组织展开、去重之后），默认 200。超出的仓库不参与本轮，
+            运行详情里会记一条「仓库数超过单次巡检上限」降级。调大前留意：仓库越多，拉取、建索引与模型调用越久，
+            可能需要同时调大巡检的耗时预算，否则会以「预算耗尽」提前收工。
           </div>
         </el-form-item>
       </el-form>
@@ -231,6 +273,10 @@ onMounted(load)
 <style lang="scss" scoped>
 .mb {
   margin-bottom: 16px;
+}
+
+.ml {
+  margin-left: 8px;
 }
 
 .hint {

@@ -91,6 +91,26 @@ class RetryTests(StorageTestCase):
         self.assertEqual(self.client.patch("/api/admin/settings", json={"guest_retry": "false"}).status_code, 400)
         self.assertTrue(guest_retry_enabled())
 
+    def test_settings_survey_max_repos_validates_range_and_type(self):
+        """仓库上限只接受范围内的整数；true 是 int 子类，不能被当成 1 放过去。"""
+        self.admin()
+        self.assertEqual(self.client.get("/api/admin/settings").json["writable"]["survey_max_repos"], 200)
+        response = self.client.patch("/api/admin/settings", json={"survey_max_repos": 300})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json["writable"]["survey_max_repos"], 300)
+        for bad in (0, 1001, True, "300", 12.5, None):
+            self.assertEqual(
+                self.client.patch("/api/admin/settings", json={"survey_max_repos": bad}).status_code, 400, bad
+            )
+        # 一批里有非法项时整批拒绝，前面合法的开关也不写入
+        response = self.client.patch(
+            "/api/admin/settings", json={"guest_retry": True, "survey_max_repos": 0}
+        )
+        self.assertEqual(response.status_code, 400)
+        from backend.admin.auth import guest_retry_enabled
+        self.assertFalse(guest_retry_enabled())
+        self.assertEqual(self.client.get("/api/admin/settings").json["writable"]["survey_max_repos"], 300)
+
     def test_original_preserves_inputs_and_source(self):
         """原范围保存关联与模式参数，历史记录不被重置。"""
         self.admin()

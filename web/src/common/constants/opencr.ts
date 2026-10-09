@@ -205,7 +205,8 @@ export const SURVEY_DEGRADATION_LABEL: Record<string, string> = {
   repo_fetch_failed: "仓库拉取失败（该仓库未参与本次分析）",
   index_failed: "代码索引失败（该仓库画像退化为依赖清单级）",
   budget_exhausted: "预算耗尽提前收工（部分关注点未取证）",
-  profile_fallback: "codegraph 不可用（全部画像退化为依赖清单级）"
+  profile_fallback: "codegraph 不可用（全部画像退化为依赖清单级）",
+  repos_truncated: "仓库数超过单次巡检上限（超出的仓库未参与本次分析）"
 }
 
 export const PUSH_STATUS_LABEL: Record<string, string> = {
