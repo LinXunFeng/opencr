@@ -8,14 +8,18 @@
 
 L2 按符号/行号精确取，而不是整文件读：实测符号平均 13-16 行、文件平均 71-244 行，
 按行号取比按文件取省 5-18 倍的上下文。
+
+L2 的取证对象除了 L1 点名的位置，还有台账里仍为"存在"的问题所在的文件（复核）。
+L1 每轮点名的文件都不一样，不复核的话，上一轮的问题下一轮只是没被看到，看起来却像消失了。
 """
 
 import json
 import logging
+import posixpath
 import re
 import time
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, NamedTuple, Optional, Tuple
 
 import openai
 
@@ -243,7 +247,7 @@ def plan_focus(
         if not isinstance(item, dict):
             continue
         repo_slug = str(item.get("repo_slug") or "").strip()
-        file_path = str(item.get("file_path") or "").strip()
+        file_path = normalize_file_path(item.get("file_path"))
         if repo_slug not in known_repos or not file_path:
             # 模型偶尔会编出不存在的仓库或路径，这类条目直接丢掉而不是去猜它想说谁
             logger.info("Focus dropped (unknown repo or empty path): %s", item)
@@ -263,20 +267,184 @@ def plan_focus(
     return focuses
 
 
-def _read_focus_source(repo_dir: Path, file_path: str, max_chars: int) -> str:
-    """读取关注点对应的源码；路径不存在或越界时返回空串。"""
+class FocusSource(NamedTuple):
+    """关注点要交给 L2 的源码，以及这份源码能否支撑"没看到就是不存在"的结论。"""
+
+    text: str
+    # True：整份文件都在 text 里。只有这时"模型没报"才算本轮看过、没发现。
+    # 按行号截取的摘录也不算：上方插进几十行代码，问题就被挤出了窗口，
+    # 模型看不到它自然不会报 —— 那正是"没去看却判成没有"的老问题。
+    # 代价是超长文件里已经修好的问题会一直停在"存在"，这比把没修的问题报成消失更可接受
+    complete: bool
+    # 摘录模式下每行带了"行号| "前缀，提示词要告诉模型按前缀报行号
+    numbered: bool = False
+    # 文件已经不在仓库里：问题随文件一起没了，本身就是确定的结论
+    missing: bool = False
+
+
+def _excerpt_around(lines: List[str], anchors: List[int], max_chars: int) -> str:
+    """
+    按锚点行截取上下文窗口，返回带行号前缀的摘录；一个窗口都放不下时返回空串。
+
+    窗口按锚点顺序加入，放不下就停：只放进一半的窗口会让模型看到一个断掉的函数。
+    """
+    windows: List[List[int]] = []
+    for anchor in sorted(set(anchors)):
+        if anchor > len(lines):
+            # 文件变短了，原来的行号已经不存在，交给模型看文件尾部也无从比对
+            continue
+        start = max(anchor - FOCUS_CONTEXT_LINES, 1)
+        end = min(anchor + FOCUS_CONTEXT_LINES, len(lines))
+        if windows and start <= windows[-1][1] + 1:
+            windows[-1][1] = max(windows[-1][1], end)
+        else:
+            windows.append([start, end])
+
+    parts: List[str] = []
+    used = 0
+    for start, end in windows:
+        block = "\n".join(f"{n:>6}| {lines[n - 1]}" for n in range(start, end + 1))
+        if used + len(block) > max_chars:
+            break
+        parts.append(block)
+        used += len(block)
+    return "\n   ...\n".join(parts)
+
+
+def normalize_file_path(raw) -> str:
+    """
+    把模型给出的文件路径规范成仓库内的相对 POSIX 路径；规范不出来时返回空串。
+
+    指纹与复核都按路径字面比对：同一个文件写成 "./src/a.py" 与 "src/a.py"，
+    会被取证两次，产出的指纹也对不上台账里原有的那一行，一个问题就变成了两行。
+    """
+    text = str(raw or "").strip().replace("\\", "/")
+    if not text:
+        return ""
+    path = posixpath.normpath(text).lstrip("/")
+    return "" if path in ("", ".") else path
+
+
+def _read_focus_source(
+    repo_dir: Path, file_path: str, max_chars: int, anchor_lines: Optional[List[int]] = None
+) -> Optional[FocusSource]:
+    """
+    读取关注点对应的源码。
+
+    路径越界或读取出错时返回 None —— 这一轮对这个文件没有结论。
+    文件放得下就整份给；放不下且有锚点行（纯复核）就按行号截取上下文，让模型有机会再次报出旧问题，
+    否则退回取开头 max_chars 个字符。放不下的两种情况都不算完整结论。
+    """
     try:
+        root = repo_dir.resolve()
         target = (repo_dir / file_path).resolve()
         # 模型给出的路径是不可信输入，必须确认它没跳出工作区
-        if not str(target).startswith(str(repo_dir.resolve())):
+        if target != root and root not in target.parents:
             logger.warning("Focus path escapes workspace, dropped: %s", file_path)
-            return ""
+            return None
+        if not target.exists():
+            return FocusSource(text="", complete=True, missing=True)
         if not target.is_file():
-            return ""
+            return None
         text = target.read_text(encoding="utf-8", errors="ignore")
     except OSError:
+        return None
+
+    if len(text) <= max_chars:
+        return FocusSource(text=text, complete=True)
+    if anchor_lines:
+        excerpt = _excerpt_around(text.splitlines(), list(anchor_lines), max_chars)
+        if excerpt:
+            return FocusSource(text=excerpt, complete=False, numbered=True)
+    return FocusSource(text=text[:max_chars], complete=False)
+
+
+def merge_focuses(rechecks: List[dict], planned: List[dict], pending: Dict[Tuple[str, str], dict]) -> List[dict]:
+    """
+    把复核清单与 L1 点名的关注点合成本轮的取证顺序。
+
+    - 同一个文件只取证一次：L1 点名了复核清单里的文件时合并成一条，怀疑理由一起带上；
+    - L1 点名了仍有"存在"问题、但没进复核清单的文件时，把那些问题挂上去（见 plan_rechecks）；
+    - 只有纯复核才按旧问题的行号截取源码：L1 怀疑的位置可能在别处，截取会把它截掉，
+      这类关注点按原来的方式从文件开头读，读不全就不算有结论；
+    - 文件身份按规范化后的路径比对（台账里可能存着旧版本没规范化的写法），取证用台账里的原文，
+      产出的指纹才对得上原来那一行；
+    - 两边交替排列：预算按墙钟计，撞顶时排在后面的整批落空，
+      全放前面会让台账大的巡检永远发现不了新问题，全放后面则复核形同虚设。
+    """
+    def file_key(item: dict) -> Tuple[str, str]:
+        """比对用的文件身份。"""
+        return (item["repo_slug"], normalize_file_path(item["file_path"]))
+
+    planned_by_file: Dict[Tuple[str, str], dict] = {}
+    for focus in planned:
+        key = file_key(focus)
+        current = planned_by_file.get(key)
+        if current is None:
+            planned_by_file[key] = {**focus, "reason": _tagged_reason(focus)}
+        else:
+            # L1 常对同一文件按不同类别点名多次，只取第一条会让其余怀疑永远进不了 L2，
+            # 文件却被判成有结论，漏查的那几类看起来就像"看过、没有问题"
+            current["reason"] = f"{current['reason']}\n{_tagged_reason(focus)}"
+    pending_by_file = {file_key(item): item for item in pending.values()}
+
+    recheck_items: List[dict] = []
+    recheck_keys = set()
+    for item in rechecks:
+        key = file_key(item)
+        recheck_keys.add(key)
+        twin = planned_by_file.get(key) or {}
+        fallback_category = item["previous"][0]["category"] if item["previous"] else ""
+        recheck_items.append({
+            "repo_slug": item["repo_slug"],
+            "file_path": item["file_path"],
+            "category": twin.get("category") or fallback_category,
+            "reason": twin.get("reason") or "",
+            "previous": item["previous"],
+            "anchor_lines": [] if twin else item["anchor_lines"],
+        })
+
+    planned_items: List[dict] = []
+    for key, focus in planned_by_file.items():
+        if key in recheck_keys:
+            continue
+        extra = pending_by_file.get(key)
+        planned_items.append({
+            **focus,
+            # 沿用台账里的路径原文，理由同上
+            "file_path": extra["file_path"] if extra else focus["file_path"],
+            "previous": extra["previous"] if extra else [],
+            "anchor_lines": [],
+        })
+
+    merged: List[dict] = []
+    for index in range(max(len(recheck_items), len(planned_items))):
+        if index < len(recheck_items):
+            merged.append(recheck_items[index])
+        if index < len(planned_items):
+            merged.append(planned_items[index])
+    return merged
+
+
+def _tagged_reason(focus: dict) -> str:
+    """带类别前缀的怀疑理由，合并同一文件的多条点名时用来区分。"""
+    return f"[{focus.get('category') or '未分类'}] {focus.get('reason') or ''}".strip()
+
+
+def _previous_block(previous: List[dict]) -> str:
+    """复核时交给 L2 的"上一轮报过的问题"清单。"""
+    if not previous:
         return ""
-    return text[:max_chars]
+    rows = []
+    for item in previous:
+        lines = ", ".join(str(n) for n in item.get("lines") or []) or "未定位到行"
+        rows.append(f"- [{item.get('category')}/{item.get('severity')}] 第 {lines} 行：{item.get('title')}")
+    return (
+        "\n\n此前的巡检在这个文件里报告过下面这些问题，请逐条复核：\n"
+        + "\n".join(rows)
+        + "\n仍然存在的照常输出，category 必须沿用上面的原值（同一个问题换了类别会被当成另一个问题）；"
+        "已经不存在的不要输出。其他新发现的问题照常输出。\n"
+    )
 
 
 def inspect_focus(
@@ -284,24 +452,36 @@ def inspect_focus(
     repo_dir: Path,
     skill_prompt: str,
     budget: Budget,
-) -> List[dict]:
+) -> Tuple[List[dict], bool]:
     """
-    L2 取证层：读真实代码，产出结构化 Finding。
+    L2 取证层：读真实代码，产出结构化 Finding。返回 (Finding 列表, 本轮对该文件是否有可信结论)。
 
     这一层是唯一被允许下结论的地方 —— 它看得到源码。
+    "有可信结论"要求源码完整（见 FocusSource.complete）且模型给出了可解析的输出；
+    模型输出解析失败时同样返回空列表，但不能算作"看过、没有问题"。
     """
-    source = _read_focus_source(repo_dir, focus["file_path"], budget.l2_max_chars_per_focus)
-    if not source.strip():
+    source = _read_focus_source(
+        repo_dir, focus["file_path"], budget.l2_max_chars_per_focus, focus.get("anchor_lines") or None
+    )
+    if source is None:
         logger.info("Focus skipped (source unavailable): %s/%s", focus["repo_slug"], focus["file_path"])
-        return []
+        return [], False
+    if source.missing or not source.text.strip():
+        # 文件已删除或是空文件：上面不可能有问题，不必花一次模型调用
+        return [], True
 
+    reason = focus.get("reason") or "复核此前巡检报告过的问题"
+    numbered_note = (
+        "\n注意：文件过长，下面只给出相关片段，每行开头的数字是它在文件里的行号，line 请按这个行号填写。\n"
+        if source.numbered else ""
+    )
     skill_block = f"\n\n参考以下审查技能：\n{skill_prompt}\n" if skill_prompt.strip() else ""
     prompt = f"""你是资深代码审查者。上一步的架构分析怀疑下面这个位置有问题，请读代码确认。
 
-怀疑理由：{focus['reason']}
+怀疑理由：{reason}
 仓库：{focus['repo_slug']}
 文件：{focus['file_path']}
-
+{_previous_block(focus.get("previous") or [])}
 要求：
 1. **确认不了就返回空数组**。上一步只是怀疑，代码里没有实际问题时不要为了交差编一条。
 2. category 只能从这个闭集里选：{", ".join(SURVEY_CATEGORIES)}
@@ -309,16 +489,17 @@ def inspect_focus(
 4. line 填问题所在行号（从 1 开始）；只能定位到文件时填 0。
 5. 只输出 JSON 数组，每项形如：
    {{"line":12,"category":"...","severity":"...","title":"一句话标题","body":"问题描述与修复方案"}}
-{skill_block}
+{skill_block}{numbered_note}
 以下是源码：
 
 ```
-{source}
+{source.text}
 ```
 """
     payload = _parse_json_payload(_call_model(prompt, max_tokens=3000))
     if not isinstance(payload, list):
-        return []
+        logger.info("Focus produced unparseable output: %s/%s", focus["repo_slug"], focus["file_path"])
+        return [], False
 
     findings: List[dict] = []
     for item in payload:
@@ -341,7 +522,7 @@ def inspect_focus(
                 "body": str(item.get("body") or "").strip()[:8000],
             }
         )
-    return findings
+    return findings, source.complete
 
 
 def summarize(findings: List[dict], cross_map: dict, budget: Budget) -> str:

@@ -595,7 +595,7 @@ onMounted(load)
             />
           </div>
           <div class="sub">
-            留空表示跟随 config.yaml 的全局默认。
+            留空表示跟随 config.yaml 的全局默认。{{ SURVEY_NOTES.focusCapIncludesRecheck }}
           </div>
         </el-form-item>
 

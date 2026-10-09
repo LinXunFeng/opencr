@@ -555,7 +555,10 @@ class GoogleSheetDestination(Destination):
             self._transport.call(
                 "spreadsheets.batchUpdate", {"spreadsheetId": spreadsheet_id},
                 body={"requests": [{"appendCells": {
-                    "tableId": self._table.get("tableId"), "rows": batch, "fields": "userEnteredValue",
+                    # 文档说 tableId 优先于 sheetId，但接口仍会校验 sheetId：省略时按 0 处理，
+                    # 目标工作表不是 gid=0 的那张（新建的、或默认工作表被删过）就报 "No grid with id: 0"
+                    "sheetId": self._sheet_id, "tableId": self._table.get("tableId"),
+                    "rows": batch, "fields": "userEnteredValue",
                 }}]},
             )
 

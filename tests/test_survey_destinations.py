@@ -1,7 +1,7 @@
 """巡检输出（Ledger / Binding / Push / Google Sheet）测试。
 
 重点覆盖几类"坏掉了也不会报错"的约束：
-1. LedgerState 判定 —— 本轮没出现不等于已修复，结论不可信时必须保持原状态；
+1. LedgerState 判定 —— 本轮没出现不等于已修复，所在文件本轮没被取证过时必须保持原状态；
 2. 镜像的补回规则 —— 用户删掉的已不出现的行不能被写回，新表却必须拿到完整台账；
 3. 人工列不被触碰 —— 系统列按表头定位、按连续列段写入，写入必须是 RAW；
 4. 推送与运行解耦 —— 推送失败不改写 SurveyRun，Guest 看不到目标位置与错误信息。
@@ -61,33 +61,25 @@ class AggregateFindingsTests(unittest.TestCase):
         self.assertEqual(single["body"], "正文")
         self.assertEqual(single["finding_count"], 1)
 
-    def test_conclusive_repos(self):
-        """拉取/索引失败的仓库不可信；预算耗尽整轮不可信；codegraph 未启用不影响。"""
-        from backend.survey.ledger import conclusive_repos
-
-        repos = [
-            {"repo_slug": "ok", "status": "ok"},
-            {"repo_slug": "fetch", "status": "fetch_failed"},
-            {"repo_slug": "index", "status": "index_failed"},
-        ]
-        self.assertEqual(conclusive_repos(repos, [{"kind": "profile_fallback", "count": 1}]), {"ok"})
-        self.assertEqual(conclusive_repos(repos, [{"kind": "budget_exhausted", "count": 1}]), set())
 
 
 class PlanLedgerUpdateTests(unittest.TestCase):
     NOW = datetime(2026, 9, 21, 1, 0)
     EARLIER = datetime(2026, 9, 14, 1, 0)
 
-    def _entry(self, fingerprint, state="present", repo="app"):
-        return {"fingerprint": fingerprint, "repo_slug": repo, "state": state, "first_seen_at": self.EARLIER}
+    def _entry(self, fingerprint, state="present", repo="app", path="lib/x.dart"):
+        return {
+            "fingerprint": fingerprint, "repo_slug": repo, "file_path": path,
+            "state": state, "first_seen_at": self.EARLIER,
+        }
 
-    def _plan(self, existing, aggregated=None, reliable=("app",), ignored=(), lookup=None):
+    def _plan(self, existing, aggregated=None, inspected=(("app", "lib/x.dart"),), ignored=(), lookup=None):
         from backend.survey.ledger import plan_ledger_update
 
         changes = plan_ledger_update(
             existing={e["fingerprint"]: e for e in existing},
             aggregated=aggregated or {},
-            reliable_repos=set(reliable),
+            inspected=set(inspected),
             ignored=set(ignored),
             first_seen_lookup=lookup or {},
             run_uid="run-2",
@@ -113,25 +105,300 @@ class PlanLedgerUpdateTests(unittest.TestCase):
         changes = self._plan([], aggregate_findings([item]), lookup={item["fingerprint"]: self.EARLIER})
         self.assertEqual(changes[item["fingerprint"]]["first_seen_at"], self.EARLIER)
 
-    def test_absent_rows_are_marked_unseen_only_when_conclusive(self):
-        """本轮没看到 ≠ 已修复。仓库不可信时保持原状态，否则一次拉取失败就会把整个仓库的问题清空。"""
-        changes = self._plan([self._entry("fp-app"), self._entry("fp-broken", repo="broken")])
-        self.assertEqual(changes["fp-app"]["state"], "unseen")
-        self.assertNotIn("fp-broken", changes)
+    def test_absent_rows_are_marked_unseen_only_when_their_file_was_inspected(self):
+        """
+        本轮没看到 ≠ 已修复。仓库拉取成功也不够：L1 每轮点名的文件都不一样，
+        没被取证的文件本来就不可能出现，按仓库判定会把"没去看"说成"看了没有"。
+        """
+        changes = self._plan([
+            self._entry("fp-inspected"),
+            self._entry("fp-same-repo-other-file", path="lib/y.dart"),
+            self._entry("fp-other-repo-same-path", repo="other"),
+        ])
+        self.assertEqual(changes["fp-inspected"]["state"], "unseen")
+        self.assertNotIn("fp-same-repo-other-file", changes)
+        self.assertNotIn("fp-other-repo-same-path", changes)
 
-    def test_unchanged_state_produces_no_change(self):
-        self.assertEqual(self._plan([self._entry("fp", state="unseen")]), {})
+    def test_unchanged_state_only_refreshes_check_time(self):
+        changes = self._plan([self._entry("fp", state="unseen")])
+        self.assertEqual(changes, {"fp": {"fingerprint": "fp", "last_checked_at": self.NOW}})
+        self.assertEqual(self._plan([self._entry("fp", state="unseen")], inspected=()), {})
 
-    def test_ignored_rows_are_marked_regardless_of_conclusiveness(self):
-        changes = self._plan([self._entry("fp", repo="broken")], ignored={"fp"})
+    def test_inconclusive_file_refreshes_check_time_but_keeps_state(self):
+        """没结论的复核不改状态，但要刷新复核时间，否则下一轮它还排在队首。"""
+        from backend.survey.ledger import plan_ledger_update
+
+        changes = plan_ledger_update(
+            existing={"fp": self._entry("fp")}, aggregated={}, inspected=set(), ignored=set(),
+            first_seen_lookup={}, run_uid="run-2", now=self.NOW, attempted={("app", "lib/x.dart")},
+        )
+        self.assertEqual(changes, [{"fingerprint": "fp", "last_checked_at": self.NOW}])
+
+    def test_ignored_rows_are_marked_regardless_of_inspection(self):
+        changes = self._plan([self._entry("fp")], inspected=(), ignored={"fp"})
         self.assertEqual(changes["fp"]["state"], "ignored")
 
     def test_unignored_row_waits_for_evidence(self):
-        """取消忽略后没有证据就停在已忽略，结论可信的一轮没出现才变为本轮未发现。"""
-        inconclusive = self._plan([self._entry("fp", state="ignored")], reliable=())
-        self.assertEqual(inconclusive, {})
-        conclusive = self._plan([self._entry("fp", state="ignored")])
-        self.assertEqual(conclusive["fp"]["state"], "unseen")
+        """取消忽略后没有证据就停在已忽略，取证过所在文件的一轮没出现才变为本轮未发现。"""
+        uninspected = self._plan([self._entry("fp", state="ignored")], inspected=())
+        self.assertEqual(uninspected, {})
+        inspected = self._plan([self._entry("fp", state="ignored")])
+        self.assertEqual(inspected["fp"]["state"], "unseen")
+
+
+class PlanRechecksTests(unittest.TestCase):
+    def _entry(self, path, category="security", state="present", seen_day=14, lines=(3,), repo="app"):
+        return {
+            "fingerprint": f"{repo}:{path}:{category}", "repo_slug": repo, "file_path": path,
+            "category": category, "severity": "warning", "title": f"{path} {category}",
+            "lines": list(lines), "state": state, "last_seen_at": datetime(2026, 9, seen_day, 1, 0),
+        }
+
+    def test_only_present_rows_are_rechecked_grouped_by_file(self):
+        """本轮未发现的行已经取证过一次，已忽略的行用户说过不想再看，反复复核只是烧预算。"""
+        from backend.survey.ledger import plan_rechecks
+
+        rechecks, index = plan_rechecks([
+            self._entry("lib/a.dart", "security", lines=(3,)),
+            self._entry("lib/a.dart", "performance", lines=(40, 3)),
+            self._entry("lib/b.dart", state="unseen"),
+            self._entry("lib/c.dart", state="ignored"),
+        ], max_files=10, ignored={"app:lib/c.dart:security"})
+        self.assertEqual([r["file_path"] for r in rechecks], ["lib/a.dart"])
+        self.assertEqual(rechecks[0]["anchor_lines"], [3, 40])
+        self.assertEqual({p["category"] for p in rechecks[0]["previous"]}, {"security", "performance"})
+        self.assertEqual(set(index), {("app", "lib/a.dart")})
+
+    def test_least_recently_seen_files_go_first_and_overflow_stays_in_index(self):
+        """超出名额的文件下一轮轮到；但 L1 点名了它们时仍要能把旧问题带上，所以索引里要有。"""
+        from backend.survey.ledger import plan_rechecks
+
+        rechecks, index = plan_rechecks([
+            self._entry("lib/new.dart", seen_day=20),
+            self._entry("lib/old.dart", seen_day=7),
+            self._entry("lib/mid.dart", seen_day=14),
+        ], max_files=2)
+        self.assertEqual([r["file_path"] for r in rechecks], ["lib/old.dart", "lib/mid.dart"])
+        self.assertIn(("app", "lib/new.dart"), index)
+
+    def test_recently_checked_files_yield_even_if_never_seen_again(self):
+        """复核总是没结论的文件不会刷新最近发现时间，按它排序会永远占着名额。"""
+        from backend.survey.ledger import plan_rechecks
+
+        stuck = {**self._entry("lib/stuck.dart", seen_day=1), "last_checked_at": datetime(2026, 9, 21)}
+        rechecks, _ = plan_rechecks([stuck, self._entry("lib/waiting.dart", seen_day=14)], max_files=1)
+        self.assertEqual([r["file_path"] for r in rechecks], ["lib/waiting.dart"])
+
+    def test_unignored_rows_are_rechecked_but_still_ignored_rows_are_not(self):
+        """取消忽略后停在已忽略的行，所在文件一被取证就会被判定，不交给 L2 就是没看就判。"""
+        from backend.survey.ledger import plan_rechecks
+
+        unignored = self._entry("lib/a.dart", state="ignored")
+        still = self._entry("lib/b.dart", state="ignored")
+        rechecks, _ = plan_rechecks([unignored, still], max_files=10, ignored={still["fingerprint"]})
+        self.assertEqual([r["file_path"] for r in rechecks], ["lib/a.dart"])
+
+    def test_dirty_line_numbers_are_skipped(self):
+        from backend.survey.ledger import plan_rechecks
+
+        rechecks, _ = plan_rechecks([self._entry("lib/a.dart", lines=(3, "x", None, -1))], max_files=1)
+        self.assertEqual(rechecks[0]["anchor_lines"], [3])
+
+
+class MergeFocusesTests(unittest.TestCase):
+    def _recheck(self, path):
+        return {"repo_slug": "app", "file_path": path, "previous": [{"category": "security", "severity": "warning",
+                "title": "t", "lines": [3]}], "anchor_lines": [3]}
+
+    def _planned(self, path, reason="L1 怀疑"):
+        return {"repo_slug": "app", "file_path": path, "category": "performance", "reason": reason}
+
+    def test_same_file_is_inspected_once_and_lists_alternate(self):
+        from backend.survey.analysis import merge_focuses
+
+        merged = merge_focuses(
+            [self._recheck("lib/a.dart"), self._recheck("lib/b.dart"), self._recheck("lib/c.dart")],
+            [self._planned("lib/b.dart"), self._planned("lib/x.dart")],
+            {},
+        )
+        self.assertEqual([m["file_path"] for m in merged], ["lib/a.dart", "lib/x.dart", "lib/b.dart", "lib/c.dart"])
+        twin = merged[2]
+        self.assertEqual(twin["reason"], "[performance] L1 怀疑")
+        # L1 怀疑的位置可能在旧问题行号之外，按行号截取会把它截掉
+        self.assertEqual(twin["anchor_lines"], [])
+        self.assertEqual(merged[0]["anchor_lines"], [3])
+
+    def test_several_l1_picks_on_one_file_keep_every_reason(self):
+        """只留第一条的话，其余几类怀疑进不了 L2，文件却被判成有结论。"""
+        from backend.survey.analysis import merge_focuses
+
+        second = {**self._planned("lib/a.dart", reason="接口字段不一致"), "category": "cross_repo"}
+        merged = merge_focuses([], [self._planned("lib/a.dart"), second], {})
+        self.assertEqual(len(merged), 1)
+        self.assertIn("[performance] L1 怀疑", merged[0]["reason"])
+        self.assertIn("[cross_repo] 接口字段不一致", merged[0]["reason"])
+
+    def test_planned_file_with_pending_issues_carries_them(self):
+        """L1 点名了没进复核名额的文件：不带上旧问题的话，这一轮取证会在模型不知情时把它们判成本轮未发现。"""
+        from backend.survey.analysis import merge_focuses
+
+        merged = merge_focuses([], [self._planned("lib/z.dart")], {("app", "lib/z.dart"): self._recheck("lib/z.dart")})
+        self.assertEqual(merged[0]["previous"][0]["category"], "security")
+        self.assertEqual(merged[0]["anchor_lines"], [])
+
+    def test_legacy_unnormalized_ledger_path_still_merges(self):
+        """台账里存着旧版本没规范化的路径：按原文比对会取证两次，产出的指纹也对不上原来那一行。"""
+        from backend.survey.analysis import merge_focuses
+
+        legacy = self._recheck("./lib/a.dart")
+        merged = merge_focuses([legacy], [self._planned("lib/a.dart")], {("app", "./lib/a.dart"): legacy})
+        self.assertEqual([m["file_path"] for m in merged], ["./lib/a.dart"])
+
+        merged = merge_focuses([], [self._planned("lib/a.dart")], {("app", "./lib/a.dart"): legacy})
+        self.assertEqual(merged[0]["file_path"], "./lib/a.dart")
+        self.assertEqual(len(merged[0]["previous"]), 1)
+
+
+class NormalizeFilePathTests(unittest.TestCase):
+    def test_equivalent_spellings_collapse(self):
+        """同一个文件的不同写法会被取证两次，指纹也对不上台账里原有的那一行。"""
+        from backend.survey.analysis import normalize_file_path
+
+        for raw in ("src/a.py", "./src/a.py", "src//a.py", "/src/a.py", "src\\a.py", " src/./a.py "):
+            self.assertEqual(normalize_file_path(raw), "src/a.py", raw)
+        self.assertEqual(normalize_file_path("."), "")
+        self.assertEqual(normalize_file_path(""), "")
+
+
+class FocusSourceTests(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+
+        self.repo_dir = Path(tempfile.mkdtemp(prefix="opencr-focus-"))
+        (self.repo_dir / "lib").mkdir()
+        self.long_file = self.repo_dir / "lib" / "long.dart"
+        self.long_file.write_text("\n".join(f"line {n}" for n in range(1, 2001)), encoding="utf-8")
+
+    def _read(self, path, max_chars=1000, anchors=None):
+        from backend.survey.analysis import _read_focus_source
+
+        return _read_focus_source(self.repo_dir, path, max_chars, anchors)
+
+    def test_short_file_is_complete(self):
+        (self.repo_dir / "lib" / "short.dart").write_text("x", encoding="utf-8")
+        source = self._read("lib/short.dart")
+        self.assertTrue(source.complete)
+        self.assertFalse(source.numbered)
+
+    def test_truncated_file_without_anchors_is_not_conclusive(self):
+        """只读了开头：问题可能恰好在被截掉的部分，模型没报不能算没有。"""
+        self.assertFalse(self._read("lib/long.dart").complete)
+
+    def test_anchor_windows_carry_line_numbers_but_are_not_conclusive(self):
+        """
+        摘录只用来让模型有机会再次报出旧问题。上方插进几十行代码，问题就被挤出窗口，
+        据此判本轮未发现正是"没去看却判成没有"的老问题。
+        """
+        source = self._read("lib/long.dart", max_chars=3000, anchors=[1500])
+        self.assertTrue(source.numbered)
+        self.assertIn("  1500| line 1500", source.text)
+        self.assertNotIn("| line 1\n", source.text)
+        self.assertFalse(source.complete)
+
+    def test_windows_that_do_not_fit_are_dropped_whole(self):
+        source = self._read("lib/long.dart", max_chars=3000, anchors=[100, 1500])
+        self.assertIn("   100| line 100", source.text)
+        self.assertNotIn("1500| line 1500", source.text)
+
+    def test_missing_file_is_conclusive_and_escape_is_not(self):
+        missing = self._read("lib/deleted.dart")
+        self.assertTrue(missing.missing)
+        self.assertTrue(missing.complete)
+        self.assertIsNone(self._read("../outside.dart"))
+        sibling = Path(str(self.repo_dir) + "-evil")
+        sibling.mkdir()
+        (sibling / "a.dart").write_text("x", encoding="utf-8")
+        # 前缀相同的兄弟目录也算越界
+        self.assertIsNone(self._read(f"../{sibling.name}/a.dart"))
+
+
+class InspectFocusTests(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+
+        self.repo_dir = Path(tempfile.mkdtemp(prefix="opencr-inspect-"))
+        (self.repo_dir / "a.dart").write_text("void main() {}\n", encoding="utf-8")
+
+    def _inspect(self, reply, focus=None):
+        from backend.survey import analysis
+
+        budget = analysis.Budget(10, 10000, 5, 10000)
+        focus = focus or {"repo_slug": "app", "file_path": "a.dart", "category": "security", "reason": "怀疑"}
+        with mock.patch.object(analysis, "_call_model", return_value=reply) as call:
+            result = analysis.inspect_focus(focus, self.repo_dir, "", budget)
+        return result, call
+
+    def test_unparseable_output_is_not_conclusive(self):
+        """模型输出解析不了时同样是零条，但不能当成"看过、没有问题"。"""
+        (findings, conclusive), _ = self._inspect("抱歉，我无法确定")
+        self.assertEqual(findings, [])
+        self.assertFalse(conclusive)
+
+    def test_empty_array_is_conclusive(self):
+        (findings, conclusive), _ = self._inspect("[]")
+        self.assertEqual(findings, [])
+        self.assertTrue(conclusive)
+
+    def test_previous_issues_are_listed_in_prompt(self):
+        focus = {"repo_slug": "app", "file_path": "a.dart", "category": "security", "reason": "",
+                 "previous": [{"category": "security", "severity": "warning", "title": "硬编码密钥", "lines": [1]}],
+                 "anchor_lines": [1]}
+        _, call = self._inspect("[]", focus)
+        prompt = call.call_args[0][0]
+        self.assertIn("硬编码密钥", prompt)
+        self.assertIn("沿用", prompt)
+
+    def test_deleted_file_needs_no_model_call(self):
+        focus = {"repo_slug": "app", "file_path": "gone.dart", "category": "security", "reason": ""}
+        (findings, conclusive), call = self._inspect("[]", focus)
+        self.assertEqual((findings, conclusive), ([], True))
+        call.assert_not_called()
+
+
+class CollectFindingsTests(unittest.TestCase):
+    def test_only_conclusive_focuses_count_as_inspected(self):
+        """模型调用失败、结论不完整的文件都不进已取证集合，名下的台账行因此保持原状态。"""
+        from backend.survey import runner
+        from backend.survey.analysis import Budget
+        from backend.survey.common import SurveyError
+
+        focuses = [{"repo_slug": "app", "file_path": p, "category": "security", "reason": ""}
+                   for p in ("ok.dart", "partial.dart", "boom.dart", "unknown-repo.dart")]
+        focuses[3]["repo_slug"] = "ghost"
+        replies = {
+            "ok.dart": ([{"file_path": "ok.dart"}], True),
+            "partial.dart": ([], False),
+            "boom.dart": SurveyError("模型调用失败"),
+        }
+
+        def fake_inspect(focus, *_args):
+            reply = replies[focus["file_path"]]
+            if isinstance(reply, Exception):
+                raise reply
+            return reply
+
+        with mock.patch.object(runner, "inspect_focus", side_effect=fake_inspect), \
+                mock.patch.object(runner.repo, "survey_heartbeat"):
+            findings, inspected = runner._collect_findings(
+                focuses, [{"slug": "app", "dir": Path(".")}], "", Budget(10, 10000, 5, 10000), "run-1"
+            )
+        self.assertEqual(findings, [{"file_path": "ok.dart"}])
+        # 没结论的也要记下来：复核按"上次交给 L2 的时刻"轮转，否则它们永远排在队首
+        self.assertEqual(inspected, [
+            {"repo_slug": "app", "file_path": "ok.dart", "conclusive": True},
+            {"repo_slug": "app", "file_path": "partial.dart", "conclusive": False},
+            {"repo_slug": "app", "file_path": "boom.dart", "conclusive": False},
+        ])
 
 
 class LedgerRowsTests(unittest.TestCase):
@@ -190,14 +457,23 @@ class LedgerRowsTests(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class LedgerStorageTestCase(SurveyStorageTestCase):
-    def _complete_run(self, findings, repos=(("app", "ok"),), degradations=(), status="succeeded"):
-        """跑一轮完整的运行：登记仓库、落库发现、收尾并更新 Ledger。"""
+    def _complete_run(self, findings, repos=(("app", "ok"),), degradations=(), status="succeeded", inspected=()):
+        """
+        跑一轮完整的运行：登记仓库、落库发现、记录已取证文件、收尾并更新 Ledger。
+
+        产出所在的文件自动算作取证过；inspected 额外列出取证过但没有产出的文件路径（仓库为 app）。
+        """
         run_uid = self.repo.start_survey_run(self.survey["survey_uid"], "schedule")
         for slug, repo_status in repos:
             self.repo.record_survey_repo(run_uid, slug, f"https://g.com/a/{slug}.git", status=repo_status)
         for kind in degradations:
             self.repo.add_survey_degradation(run_uid, kind)
         self.repo.record_survey_findings(run_uid, list(findings))
+        self.repo.record_survey_inspected_files(
+            run_uid,
+            [{"repo_slug": f["repo_slug"], "file_path": f["file_path"], "conclusive": True} for f in findings]
+            + [{"repo_slug": "app", "file_path": path, "conclusive": True} for path in inspected],
+        )
         self.repo.finish_survey_run(run_uid, status)
 
         from backend.survey.ledger import update_ledger_for_run
@@ -225,7 +501,7 @@ class LedgerStorageTests(LedgerStorageTestCase):
         self.assertEqual(ledger["lib/a.dart"]["finding_count"], 2)
         self.assertEqual(ledger["lib/a.dart"]["lines"], [1, 7])
 
-        self._complete_run([_finding("lib/a.dart")])
+        self._complete_run([_finding("lib/a.dart")], inspected=["lib/b.dart"])
         ledger = self._ledger()
         self.assertEqual(ledger["lib/a.dart"]["state"], "present")
         self.assertEqual(ledger["lib/b.dart"]["state"], "unseen")
@@ -233,15 +509,19 @@ class LedgerStorageTests(LedgerStorageTestCase):
         self._complete_run([_finding("lib/b.dart")])
         self.assertEqual(self._ledger()["lib/b.dart"]["state"], "present")
 
-    def test_budget_exhausted_run_marks_nothing_unseen(self):
+    def test_uninspected_file_keeps_its_state(self):
+        """这正是用户撞到的那次：仓库好好的，只是第二轮 L1 没再点名这个文件。"""
         self._complete_run([_finding("lib/a.dart")])
-        self._complete_run([], degradations=["budget_exhausted"])
+        self._complete_run([_finding("lib/other.dart")])
         self.assertEqual(self._ledger()["lib/a.dart"]["state"], "present")
 
-    def test_index_failed_repo_marks_nothing_unseen(self):
-        self._complete_run([_finding("lib/a.dart")])
-        self._complete_run([], repos=[("app", "index_failed")])
-        self.assertEqual(self._ledger()["lib/a.dart"]["state"], "present")
+    def test_budget_exhausted_run_still_judges_files_it_finished(self):
+        """预算耗尽只影响没轮到的文件；已经取证完的文件结论照样可信。"""
+        self._complete_run([_finding("lib/a.dart"), _finding("lib/b.dart")])
+        self._complete_run([], degradations=["budget_exhausted"], inspected=["lib/a.dart"])
+        ledger = self._ledger()
+        self.assertEqual(ledger["lib/a.dart"]["state"], "unseen")
+        self.assertEqual(ledger["lib/b.dart"]["state"], "present")
 
     def test_failed_run_never_touches_ledger(self):
         """失败的运行产出不完整，拿它更新台账会把一大批问题错标成本轮未发现。"""
@@ -364,7 +644,7 @@ class PushTestCase(LedgerStorageTestCase):
 class PushFlowTests(PushTestCase):
     def test_first_push_writes_full_ledger_then_only_restores_present(self):
         self._complete_run([_finding("lib/a.dart"), _finding("lib/b.dart")])
-        run2 = self._complete_run([_finding("lib/a.dart")])
+        run2 = self._complete_run([_finding("lib/a.dart")], inspected=["lib/b.dart"])
 
         self._push(run2)
         first = {r.values["file"]: r.restore_if_missing for r in _FakeDestination.calls[-1]["rows"]}
@@ -793,6 +1073,8 @@ class GoogleSheetTests(unittest.TestCase):
         self.assertTrue(append["url"].endswith(":batchUpdate"))
         request = append["json"]["requests"][0]["appendCells"]
         self.assertEqual(request["tableId"], "t1")
+        # 省略 sheetId 时接口按 0 校验，非 gid=0 的工作表会被拒绝
+        self.assertEqual(request["sheetId"], 7)
         self.assertEqual(request["fields"], "userEnteredValue")
         # 人工列写空 CellData；以 "=" 开头的标题写成 stringValue，不会被当成公式
         self.assertEqual(request["rows"], [{"values": [

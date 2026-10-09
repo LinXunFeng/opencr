@@ -1208,6 +1208,9 @@ def start_survey_run(survey_uid: str, trigger: str) -> Optional[str]:
                 phase=SURVEY_PHASE_FETCHING,
                 started_at=now,
                 heartbeat_at=now,
+                # 一开始就写空数组：在取证之前失败或仍在进行中的运行，报告不能被当成
+                # 早于该字段的旧运行去走朴素差集，把上一轮的发现全列进"已消失"
+                inspected_files="[]",
             )
         )
     return run_uid
@@ -1335,13 +1338,19 @@ def record_survey_findings(run_uid: str, findings: List[dict]) -> Dict[str, int]
 
     命中忽略清单的直接丢弃、不入库 —— 入库再在查询时过滤的话，
     "本次发现 80 条"这个数字会一直包含用户明确说过不想再看的条目。
+    上一次运行里有、或台账里仍为"存在"的记为仍存在：复核按名额轮转，一个文件可能隔几轮才被看一次，
+    只比对上一次的话，中间没轮到的那几轮会让老问题在再次被看到时变成"新增"。
+    台账里是本轮未发现的仍算新增，与 previous_survey_fingerprints 的口径一致。
+    必须在本轮更新台账之前调用，读到的才是上一轮结束时的台账。
     返回 {"new": n, "persisted": m, "ignored": k}。
     """
     from .models import (
         FINDING_STATE_NEW,
         FINDING_STATE_PERSISTED,
+        LEDGER_PRESENT,
         SurveyFinding,
         SurveyIgnore,
+        SurveyLedgerEntry,
         SurveyRun,
     )
 
@@ -1359,9 +1368,16 @@ def record_survey_findings(run_uid: str, findings: List[dict]) -> Dict[str, int]
                 select(SurveyIgnore.fingerprint).where(SurveyIgnore.survey_id == survey_id)
             ).all()
         )
+        still_present = set(
+            session.scalars(
+                select(SurveyLedgerEntry.fingerprint).where(
+                    SurveyLedgerEntry.survey_id == survey_id, SurveyLedgerEntry.state == LEDGER_PRESENT
+                )
+            ).all()
+        )
         run_id = run.id
 
-    previous = previous_survey_fingerprints(survey_id, run_id)
+    previous = previous_survey_fingerprints(survey_id, run_id) | still_present
 
     with session_scope() as session:
         for item in findings:
@@ -1387,6 +1403,56 @@ def record_survey_findings(run_uid: str, findings: List[dict]) -> Dict[str, int]
                 )
             )
     return counters
+
+
+def _file_key(item: dict) -> tuple:
+    """取证记录里的文件身份 (repo_slug, file_path)。"""
+    return (str(item.get("repo_slug") or ""), str(item.get("file_path") or ""))
+
+
+def record_survey_inspected_files(run_uid: str, files: List[dict]) -> None:
+    """
+    记下本轮交给 L2 取证过的文件（每项 {"repo_slug", "file_path", "conclusive"}），整体覆盖写入。
+
+    同一文件出现多次时合并，有一次得出结论即算有结论。
+    """
+    from .models import SurveyRun
+
+    merged: Dict[tuple, bool] = {}
+    for item in files or []:
+        key = _file_key(item)
+        if not all(key):
+            continue
+        merged[key] = merged.get(key, False) or bool(item.get("conclusive"))
+    items = [{"repo_slug": k[0], "file_path": k[1], "conclusive": v} for k, v in merged.items()]
+
+    with session_scope() as session:
+        session.execute(
+            update(SurveyRun)
+            .where(SurveyRun.run_uid == run_uid)
+            .values(inspected_files=json.dumps(items, ensure_ascii=False), heartbeat_at=utcnow())
+        )
+
+
+def _parse_inspected_files(raw: Optional[str], conclusive_only: bool = True) -> Optional[set]:
+    """
+    把 inspected_files 解析成 {(repo_slug, file_path)}；conclusive_only 为 False 时包含没得出结论的文件。
+
+    NULL 返回 None（早于该字段的运行），与"一个文件都没看"的空集区分开。
+    内容损坏时返回空集：宁可这一轮什么都不判，也不要按旧口径把没看过的文件判成没出现。
+    """
+    if raw is None:
+        return None
+    try:
+        items = json.loads(raw)
+    except (ValueError, TypeError):
+        return set()
+    if not isinstance(items, list):
+        return set()
+    return {
+        _file_key(i) for i in items
+        if isinstance(i, dict) and (i.get("conclusive") or not conclusive_only)
+    }
 
 
 def finish_survey_run(
@@ -1501,7 +1567,8 @@ def get_survey_run_detail(
     单次 SurveyRun 的完整报告：仓库清单、逐条发现、以及与上一次相比的差异。
 
     "已消失"不从库里读 —— 它没有对应的行（见 models 里 FINDING_STATE 的注释），
-    是拿上一次的指纹集减去本次算出来的。
+    是拿上一次的指纹集减去本次算出来的。差集里落在本轮没取证过的文件上的，
+    单独列为"本轮未复查"（unchecked_findings），不算已消失。
     """
     from .models import Survey, SurveyFinding, SurveyRun, SurveyRunRepo
 
@@ -1546,19 +1613,29 @@ def get_survey_run_detail(
             .order_by(SurveyRun.id.desc())
             .limit(1)
         )
+        # None 是早于该字段的运行：没有取证记录可查，只能沿用朴素差集
+        inspected = _parse_inspected_files(run.inspected_files)
         resolved = []
+        unchecked = []
         if prev_run_id is not None:
             prev_findings = session.scalars(
                 select(SurveyFinding).where(SurveyFinding.run_id == prev_run_id)
             ).all()
             for f in prev_findings:
-                if f.fingerprint not in current_fps:
-                    resolved.append(_survey_finding_to_dict(f, include_body))
+                if f.fingerprint in current_fps:
+                    continue
+                item = _survey_finding_to_dict(f, include_body)
+                if inspected is None or (f.repo_slug, f.file_path or "") in inspected:
+                    resolved.append(item)
+                else:
+                    unchecked.append(item)
         detail["resolved_findings"] = resolved
+        detail["unchecked_findings"] = unchecked
         detail["counts"] = {
             "new": sum(1 for f in findings if f.state == "new"),
             "persisted": sum(1 for f in findings if f.state == "persisted"),
             "resolved": len(resolved),
+            "unchecked": len(unchecked),
             "total": len(findings),
         }
         return detail
@@ -1742,7 +1819,8 @@ PUSH_STALE_SECONDS = 900
 
 def get_survey_run_ledger_inputs(run_uid: str) -> Optional[dict]:
     """
-    更新 Ledger 所需的一次运行的全部输入：运行状态、逐条发现（含正文）、仓库处理结果、降级与忽略清单。
+    更新 Ledger 所需的一次运行的全部输入：运行状态、逐条发现（含正文）、仓库处理结果、降级、
+    忽略清单，以及本轮得出结论的文件 inspected 与交给过 L2 的文件 attempted（都是 {(repo_slug, file_path)}）。
 
     运行不存在时返回 None。
     """
@@ -1778,6 +1856,9 @@ def get_survey_run_ledger_inputs(run_uid: str) -> Optional[dict]:
             ],
             "repos": [{"repo_slug": r.repo_slug, "status": r.status} for r in repos],
             "ignored": ignored,
+            # 台账只为运行结束时更新一次，不会碰到早于该字段的运行；真遇到 NULL 也按"一个都没看"处理
+            "inspected": _parse_inspected_files(run.inspected_files) or set(),
+            "attempted": _parse_inspected_files(run.inspected_files, conclusive_only=False) or set(),
         }
 
 
@@ -1801,6 +1882,7 @@ def _ledger_entry_to_dict(entry: "SurveyLedgerEntry") -> dict:
         "first_seen_at": entry.first_seen_at,
         "last_seen_at": entry.last_seen_at,
         "last_run_uid": entry.last_run_uid or "",
+        "last_checked_at": entry.last_checked_at,
     }
 
 
@@ -1819,6 +1901,17 @@ def list_survey_ledger(survey_id: int) -> List[dict]:
     """某个 Survey 的全部 Ledger 条目，按首次发现时间排序 —— 新表里的行序就是问题出现的先后。"""
     entries = list(get_survey_ledger_map(survey_id).values())
     return sorted(entries, key=lambda e: (e["first_seen_at"], e["fingerprint"]))
+
+
+def list_survey_ledger_by_uid(survey_uid: str) -> List[dict]:
+    """按 survey_uid 取 Ledger 条目（执行链路手里只有 uid）；巡检不存在时返回空列表。"""
+    from .models import Survey
+
+    with session_scope() as session:
+        survey_id = session.scalar(select(Survey.id).where(Survey.survey_uid == survey_uid))
+    if survey_id is None:
+        return []
+    return list_survey_ledger(survey_id)
 
 
 def earliest_survey_finding_times(survey_id: int, fingerprints: List[str]) -> Dict[str, datetime]:

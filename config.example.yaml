@@ -107,7 +107,11 @@ survey:
     # 三个中等仓库的组合画像约 43 万字符。
     l1_max_chars: 400000
     # Max number of focus points the integration step may hand to the inspection step.
+    # The same number also caps how many files with still-present ledger issues are
+    # re-inspected per run, so one run makes up to twice this many inspection calls.
     # 整合分析最多产出多少个关注点交给取证步骤。
+    # 同一个数也是每轮复核台账中仍「存在」的问题所在文件的上限（另算，不挤占关注点名额），
+    # 因此一轮最多发起两倍于此的取证调用。
     l2_max_focus: 20
     # Max characters of source read per focus point.
     # 每个关注点最多读取多少字符的源码。

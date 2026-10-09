@@ -272,8 +272,12 @@ class SurveyStorageTestCase(unittest.TestCase):
         db.reset_engine_for_tests()
         os.environ.pop("OPENCR_DATABASE_URL", None)
 
-    def _run(self, entries, trigger="schedule"):
-        """跑一轮并落库；entries 是 (file_path, category) 列表。"""
+    def _run(self, entries, trigger="schedule", inspected=None):
+        """
+        跑一轮并落库；entries 是 (file_path, category) 列表。
+
+        inspected 为 None 时不额外记录已取证文件（运行开始时写入的是空数组）。
+        """
         from backend.storage.models import RUN_SUCCEEDED
         from backend.survey.common import finding_fingerprint
 
@@ -287,6 +291,10 @@ class SurveyStorageTestCase(unittest.TestCase):
             for path, category in entries
         ]
         counters = self.repo.record_survey_findings(run_uid, findings)
+        if inspected is not None:
+            self.repo.record_survey_inspected_files(
+                run_uid, [{"repo_slug": "app", "file_path": path, "conclusive": True} for path in inspected]
+            )
         self.repo.finish_survey_run(run_uid, RUN_SUCCEEDED, summary="整体结论")
         return run_uid, counters
 
@@ -353,20 +361,97 @@ class SurveyFindingDiffTests(SurveyStorageTestCase):
         _, first = self._run([("lib/a.dart", "security"), ("lib/b.dart", "performance")])
         self.assertEqual(first, {"new": 2, "persisted": 0, "ignored": 0})
 
-        run2, second = self._run([("lib/a.dart", "security"), ("lib/c.dart", "architecture")])
+        run2, second = self._run(
+            [("lib/a.dart", "security"), ("lib/c.dart", "architecture")],
+            inspected=["lib/a.dart", "lib/b.dart", "lib/c.dart"],
+        )
         self.assertEqual(second, {"new": 1, "persisted": 1, "ignored": 0})
 
         detail = self.repo.get_survey_run_detail(run2)
-        self.assertEqual(detail["counts"], {"new": 1, "persisted": 1, "resolved": 1, "total": 2})
+        self.assertEqual(detail["counts"], {"new": 1, "persisted": 1, "resolved": 1, "unchecked": 0, "total": 2})
         self.assertEqual([f["file_path"] for f in detail["resolved_findings"]], ["lib/b.dart"])
+
+    def test_run_that_failed_before_inspection_resolves_nothing(self):
+        """取证前就失败的运行不能被当成早于该字段的旧运行，否则上一轮的发现会全部列进已消失。"""
+        from backend.storage.models import RUN_FAILED
+
+        self._run([("lib/a.dart", "security")], inspected=["lib/a.dart"])
+        run_uid = self.repo.start_survey_run(self.survey["survey_uid"], "manual")
+        self.repo.finish_survey_run(run_uid, RUN_FAILED, error_message="模型调用失败")
+        detail = self.repo.get_survey_run_detail(run_uid)
+        self.assertEqual(detail["resolved_findings"], [])
+        self.assertEqual([f["file_path"] for f in detail["unchecked_findings"]], ["lib/a.dart"])
+
+    def test_inconclusive_files_are_unchecked(self):
+        self._run([("lib/a.dart", "security")], inspected=["lib/a.dart"])
+        run_uid = self.repo.start_survey_run(self.survey["survey_uid"], "manual")
+        self.repo.record_survey_inspected_files(
+            run_uid, [{"repo_slug": "app", "file_path": "lib/a.dart", "conclusive": False}]
+        )
+        from backend.storage.models import RUN_SUCCEEDED
+
+        self.repo.finish_survey_run(run_uid, RUN_SUCCEEDED)
+        self.assertEqual(self.repo.get_survey_run_detail(run_uid)["counts"]["unchecked"], 1)
+
+    def test_uninspected_files_are_unchecked_not_resolved(self):
+        """上一轮的问题这一轮没再出现：所在文件取证过才算已消失，没取证过的只能说没复查。"""
+        self._run([("lib/a.dart", "security"), ("lib/b.dart", "performance")], inspected=["lib/a.dart", "lib/b.dart"])
+        run2, _ = self._run([], inspected=["lib/a.dart"])
+        detail = self.repo.get_survey_run_detail(run2)
+        self.assertEqual([f["file_path"] for f in detail["resolved_findings"]], ["lib/a.dart"])
+        self.assertEqual([f["file_path"] for f in detail["unchecked_findings"]], ["lib/b.dart"])
+        self.assertEqual((detail["counts"]["resolved"], detail["counts"]["unchecked"]), (1, 1))
 
     def test_resolved_findings_have_no_rows_of_their_own(self):
         """"已消失"是比对算出来的，凭空造行会让列表出现没有对应代码的幽灵条目。"""
         self._run([("lib/a.dart", "security")])
-        run2 = self._run([])[0]
+        run2 = self._run([], inspected=["lib/a.dart"])[0]
         detail = self.repo.get_survey_run_detail(run2)
         self.assertEqual(detail["findings"], [])
         self.assertEqual(len(detail["resolved_findings"]), 1)
+
+    def test_legacy_runs_keep_the_naive_diff(self):
+        """升级前的运行没有取证记录，全部归为未复查会让历史报告的已消失一夜清零。"""
+        from sqlalchemy import update
+
+        from backend.storage.db import session_scope
+        from backend.storage.models import SurveyRun
+
+        self._run([("lib/a.dart", "security")])
+        run2 = self._run([])[0]
+        with session_scope() as session:
+            session.execute(update(SurveyRun).where(SurveyRun.run_uid == run2).values(inspected_files=None))
+        detail = self.repo.get_survey_run_detail(run2)
+        self.assertEqual(len(detail["resolved_findings"]), 1)
+        self.assertEqual(detail["unchecked_findings"], [])
+
+    def test_still_present_ledger_rows_are_persisted_not_new(self):
+        """复核按名额轮转，隔几轮才被看到的老问题不能因为上一次没轮到它就变成"新增"。"""
+        from backend.survey.common import finding_fingerprint
+
+        fingerprint = finding_fingerprint("app", "lib/a.dart", "security")
+        self.repo.upsert_survey_ledger(self._survey_id(), [{
+            "fingerprint": fingerprint, "repo_slug": "app", "file_path": "lib/a.dart", "category": "security",
+            "state": "present",
+        }])
+        self._run([])
+        _, counters = self._run([("lib/a.dart", "security")])
+        self.assertEqual(counters, {"new": 0, "persisted": 1, "ignored": 0})
+
+        self.repo.upsert_survey_ledger(self._survey_id(), [{"fingerprint": fingerprint, "state": "unseen"}])
+        self._run([])
+        _, counters = self._run([("lib/a.dart", "security")])
+        # 本轮未发现之后又出现，对读报告的人来说就是新问题
+        self.assertEqual(counters["new"], 1)
+
+    def _survey_id(self):
+        from sqlalchemy import select
+
+        from backend.storage.db import session_scope
+        from backend.storage.models import Survey
+
+        with session_scope() as session:
+            return session.scalar(select(Survey.id).where(Survey.survey_uid == self.survey["survey_uid"]))
 
     def test_ignored_findings_are_never_stored(self):
         """入库再过滤的话，"本次 80 条"会一直包含用户说过不想再看的条目。"""
@@ -447,13 +532,28 @@ class SurveyReportTests(SurveyStorageTestCase):
         from backend.survey.report import render_run_markdown
 
         self._run([("lib/a.dart", "security"), ("lib/b.dart", "performance")])
-        run2, _ = self._run([("lib/a.dart", "security"), ("lib/c.dart", "architecture")])
+        run2, _ = self._run(
+            [("lib/a.dart", "security"), ("lib/c.dart", "architecture")],
+            inspected=["lib/a.dart", "lib/b.dart", "lib/c.dart"],
+        )
         markdown = render_run_markdown(self.repo.get_survey_run_detail(run2))
 
         self.assertIn("## 新增", markdown)
         self.assertIn("## 仍存在", markdown)
         self.assertIn("## 较上次已消失", markdown)
         self.assertIn("lib/c.dart", markdown)
+        # 与界面的页签一致，没有条目时也出这一节
+        self.assertIn("## 本轮未复查", markdown)
+
+    def test_markdown_report_lists_unchecked_separately(self):
+        from backend.survey.report import render_run_markdown
+
+        self._run([("lib/b.dart", "performance")], inspected=["lib/b.dart"])
+        run2, _ = self._run([], inspected=[])
+        markdown = render_run_markdown(self.repo.get_survey_run_detail(run2))
+        section = markdown.split("## 本轮未复查", 1)[1]
+        self.assertIn("lib/b.dart", section)
+        self.assertNotIn("lib/b.dart", markdown.split("## 较上次已消失", 1)[1].split("## 本轮未复查", 1)[0])
 
     def test_guest_export_contains_no_body(self):
         """导出与界面同源，否则导出就成了绕过可见范围的后门。"""

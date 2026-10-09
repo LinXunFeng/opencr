@@ -306,8 +306,8 @@ FINDING_STATE_NEW = "new"
 FINDING_STATE_PERSISTED = "persisted"
 
 # --- SurveyLedgerEntry.state（LedgerState）--------------------------------
-# 刻意不叫 resolved / fixed：巡检只取证模型选中的关注点，
-# "本轮没看到"推不出"已经修好"，措辞一旦写成已修复就会有人照着关单。
+# 刻意不叫 resolved / fixed：即使文件被取证过，"模型这一轮没再报"也推不出"已经修好"，
+# 措辞一旦写成已修复就会有人照着关单。
 LEDGER_PRESENT = "present"
 LEDGER_UNSEEN = "unseen"
 LEDGER_IGNORED = "ignored"
@@ -443,6 +443,12 @@ class SurveyRun(Base):
     degradations: Mapped[Optional[str]] = mapped_column(Text)
     error_kind: Mapped[Optional[str]] = mapped_column(String(32))
     error_message: Mapped[Optional[str]] = mapped_column(Text)
+
+    # 本轮交给 L2 取证过的文件，JSON 数组，每项 {"repo_slug", "file_path", "conclusive"}。
+    # "本轮没出现"只有落在 conclusive 的文件上才算数：没被取证、或取证没得出结论的文件
+    # 本来就不可能出现，拿它判本轮未发现 / 已消失就是把"没去看"说成"看了没有"。
+    # 运行开始时即写入 "[]"，NULL 只会出现在早于这个字段的运行上，读取方据此按旧口径处理。
+    inspected_files: Mapped[Optional[str]] = mapped_column(Text)
 
     started_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=utcnow)
     heartbeat_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=utcnow)
@@ -587,6 +593,10 @@ class SurveyLedgerEntry(Base):
     # 最近一次出现在哪个运行里，用于生成运行详情链接。不做外键：运行会被按次数清理，
     # 链接失效只是点进去 404，而台账行不能因此被连带删除。
     last_run_uid: Mapped[Optional[str]] = mapped_column(String(36))
+    # 最近一次把它所在的文件交给 L2 的时刻，不论有没有得出结论。复核按它轮转：
+    # 按最近发现时间轮转的话，复核总是没结论的文件（超长、模型输出坏掉）永远不刷新，
+    # 会一直排在队首把名额吃光，其余问题永远轮不到
+    last_checked_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
 
     updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=utcnow)
 

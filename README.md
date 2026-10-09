@@ -137,8 +137,8 @@ Time-driven (scheduled survey)
    changes are reset and the repository is updated incrementally afterwards).
 3. A structural profile is built per repository (manifests, routes, type skeleton).
 4. All profiles enter a single integration step together, producing focus points.
-5. Real source code is read for each focus point to produce findings.
-6. Results are compared with the previous run and reported as new / persisting / resolved.
+5. Real source code is read for each focus point to produce findings; files holding still-present ledger issues are re-inspected as well.
+6. Results are compared with the previous run and reported as new / persisting / resolved / not re-checked.
 
 ---
 
@@ -443,13 +443,12 @@ A pure Dart repository will not be reviewed by the `ts` skill — that only prod
 
 ### Reading a report
 
-A survey analyses the **whole codebase** every time, so consecutive runs overlap heavily: 80
-findings the first week, the same 80 plus a few new ones the next. Reports are therefore split
-into three sections, opening on "new":
+Each run's scope is the **whole codebase**, but not every file has its source read: the integration step picks a batch of files from the structural profiles of all repositories (up to the focus-point limit) for source inspection, and every run also re-inspects the files holding still-present ledger issues (capped separately at the same number, least recently re-checked first). Because old issues are re-checked every run, consecutive runs overlap heavily: 80 findings the first week, the same 80 plus a few new ones the next. Reports are therefore split into four sections, opening on "new":
 
 - **New** — absent last time, present now
-- **Persisting** — present in both runs
-- **Resolved since last run** — present last time, not detected now
+- **Persisting** — present last time, or still "present" in the ledger
+- **Resolved since last run** — present last time, file inspected this run, not detected again (not the same as fixed)
+- **Not re-checked** — present last time and not reported again, but the file got no conclusive inspection this run (not reached, longer than the read limit so only an excerpt was read, source unreadable or model output unparseable)
 
 Matching is done on a fingerprint of `repository + file path + category`, and deliberately
 **excludes the body text**: the model never words the same problem identically twice, so including
@@ -532,7 +531,7 @@ Columns come in two kinds:
 
 Rules worth knowing:
 
-- **"Not seen this run" does not mean fixed.** A survey only inspects the focus points the model selected; unselected files are simply not examined. The state is only set when the row's repository was fetched and indexed successfully and the run did not stop early on budget; otherwise the previous state is kept.
+- **"Not seen this run" does not mean fixed.** It only says the file was inspected this run and the model did not report the issue again. Besides the focus points the model selects, every run re-inspects the files holding still-present ledger issues (least recently re-checked first, capped at the focus-point limit, counted separately). Files that were not re-inspected — cap reached, budget exhausted, repository fetch failed, file longer than the per-focus read limit, source unreadable or model output unparseable — keep their previous state.
 - **Findings sharing a fingerprint in one run become one row**: highest severity, all line numbers, bodies concatenated and truncated at the 50,000-character cell limit.
 - **Deleted rows.** A row whose state is still "present" is restored if you delete it, otherwise a live problem would silently vanish; "not seen" and "ignored" rows stay deleted. The first push to a newly bound sheet writes the full ledger.
 - **Marking a finding as a known issue** flips its ledger row to "ignored" immediately; the next push updates the sheet without deleting the row.
@@ -586,7 +585,7 @@ evidence is in [`docs/adr/0003-per-repo-codegraph-index.md`](docs/adr/0003-per-r
   workspace loses no data, it only forces a full clone next time.
 - **Deleting a survey does not delete its workspace.** Removing tens of GB of code as a side effect
   of a mis-click is not reversible, so workspace cleanup is a separate action in the console.
-- **Every run has a hard budget** (wall clock, integration input size, number of focus points).
+- **Every run has a hard budget** (wall clock, integration input size, number of focus points; re-inspected ledger files are capped separately at the same number).
   Hitting it is a degradation, not a failure — whatever was produced is kept, and the report says
   the budget ran out.
 

@@ -7,7 +7,7 @@ SurveyRun 的唯一执行入口。
 """
 
 import logging
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from ..review.skills import load_available_review_skills
 from ..storage import repo
@@ -33,11 +33,13 @@ from ..storage.models import (
     SURVEY_PHASE_PROFILING,
     SURVEY_PHASE_SUMMARIZING,
 )
-from .analysis import Budget, inspect_focus, load_skill_prompt, match_skills, plan_focus, summarize
+from .analysis import (
+    Budget, inspect_focus, load_skill_prompt, match_skills, merge_focuses, plan_focus, summarize,
+)
 from .common import SurveyError, finding_fingerprint
 from .config import load_max_repos, load_survey_config, resolve_budget
 from .crossrepo import build_cross_repo_map
-from .ledger import update_ledger_for_run
+from .ledger import plan_rechecks, update_ledger_for_run
 from .profile import build_profile, codegraph_available, save_profile
 from .push import PushRejected, begin_pushes, execute_pushes
 from .sources import resolve_sources
@@ -108,8 +110,8 @@ def _prepare_workspaces(
         status = REPO_OK
         if codegraph_ok and profile["kind"] == PROFILE_MANIFEST:
             # codegraph 装着但这个仓库没建成索引，是单仓库级别的问题。
-            # 状态单独记成 index_failed 而不是 ok：Ledger 靠它判断这个仓库本轮的结论是否可信，
-            # 偶发的索引失败会让关注点选偏，不能据此把该仓库的问题标成本轮未发现。
+            # 状态单独记成 index_failed 而不是 ok：它不影响台账判定（那只看文件是否被取证过），
+            # 但运行详情里要能看出这个仓库的画像退化了、L1 的点名可能选偏。
             repo.add_survey_degradation(run_uid, DEGRADE_INDEX_FAILED)
             status = REPO_INDEX_FAILED
         save_profile(artifacts, profile)
@@ -129,10 +131,17 @@ def _collect_findings(
     skill_prompt: str,
     budget: Budget,
     run_uid: str,
-) -> List[dict]:
-    """L2：逐个关注点取证。撞到预算上限就停下并记降级，已产出的照常保留。"""
+) -> Tuple[List[dict], List[dict]]:
+    """
+    L2：逐个关注点取证，返回 (Finding 列表, 交给过 L2 的文件)。
+
+    第二个列表每项 {"repo_slug", "file_path", "conclusive"}，conclusive 为 False 的文件
+    名下的台账行保持原状态。撞到预算上限就停下并记降级，已产出的照常保留；
+    没轮到的文件不进第二个列表，下一轮复核时排在前面。
+    """
     dirs = {item["slug"]: item["dir"] for item in prepared}
     findings: List[dict] = []
+    inspected: List[dict] = []
 
     for focus in focuses:
         if not budget.check():
@@ -143,13 +152,19 @@ def _collect_findings(
         if repo_dir is None:
             continue
         repo.survey_heartbeat(run_uid)
+        record = {"repo_slug": focus["repo_slug"], "file_path": focus["file_path"], "conclusive": False}
+        inspected.append(record)
         try:
-            findings.extend(inspect_focus(focus, repo_dir, skill_prompt, budget))
+            items, conclusive = inspect_focus(focus, repo_dir, skill_prompt, budget)
         except SurveyError as e:
-            # 单个关注点取证失败不该让整轮失败：其余关注点还有价值
+            # 单个关注点取证失败不该让整轮失败：其余关注点还有价值。
+            # 它记为没有结论，名下的台账行保持原状态，不会被错标成本轮未发现
             logger.warning("Focus inspection failed (%s/%s): %s", focus["repo_slug"], focus["file_path"], e)
+            continue
+        findings.extend(items)
+        record["conclusive"] = conclusive
 
-    return findings
+    return findings, inspected
 
 
 def execute_survey_run(survey_uid: str, trigger: str) -> Optional[str]:
@@ -209,10 +224,22 @@ def execute_survey_run(survey_uid: str, trigger: str) -> Optional[str]:
 
         repo.update_survey_progress(run_uid, phase=SURVEY_PHASE_INTEGRATING)
         repo.survey_heartbeat(run_uid)
-        focuses = plan_focus(profiles, cross_map, skill_prompt, budget)
+        planned = plan_focus(profiles, cross_map, skill_prompt, budget)
+        # 复核名额与 L1 的关注点上限相同、另算，不挤占 L1 的名额：
+        # 共用一个上限的话，台账一大，新问题就再也进不了取证。
+        # 不单独开配置项，是因为它和 l2_max_focus 控制的是同一种成本（L2 调用次数）
+        prepared_slugs = {item["slug"] for item in prepared}
+        # 本轮没拉到的仓库复核不了，先剔除再截名额，否则它们会白占名额
+        rechecks, pending = plan_rechecks(
+            [e for e in repo.list_survey_ledger_by_uid(survey_uid) if e["repo_slug"] in prepared_slugs],
+            budget.l2_max_focus,
+            ignored={item["fingerprint"] for item in repo.list_survey_ignores(survey_uid)},
+        )
+        focuses = merge_focuses(rechecks, planned, pending)
 
         repo.update_survey_progress(run_uid, phase=SURVEY_PHASE_INSPECTING)
-        raw_findings = _collect_findings(focuses, prepared, skill_prompt, budget, run_uid)
+        raw_findings, inspected = _collect_findings(focuses, prepared, skill_prompt, budget, run_uid)
+        repo.record_survey_inspected_files(run_uid, inspected)
 
         for item in raw_findings:
             item["fingerprint"] = finding_fingerprint(
