@@ -2,6 +2,26 @@
 
 本文件记录项目的重要变更。
 
+## [0.8.0] - 2026-10-09
+
+### Added
+
+- 巡检报告新增「codegraph 执行情况与收益」卡片：每个仓库本轮的建索引方式（增量更新 / 全量重建 / 失败）、耗时、抽出的接口与类型数，建索引失败的原因直接显示在页面上；索引建成但没抽出任何接口与类型的仓库单独提示。
+- 新增**线索来源**：每个关注点按其位置是 codegraph 指出的、基础画像就能看到的、还是画像外推断的分为三类，Finding 继承所属关注点的来源。报告页展示关注点与发现的来源分布，发现列表新增「线索来源」列并可按来源筛选。术语见 `CONTEXT.md`。线索来源是出处而非因果归因，两边都能看到的位置记为基础画像，宁可低估 codegraph 的收益。
+- 报告页同时展示 codegraph 带来的跨仓库事实（接口连接、HTTP 方法不一致、范围内无人调用的接口）与被剔除的误报调用数；巡检记录列表新增 codegraph 列（线索来自 codegraph 的发现数 / 全部、接口连接数），便于对比开关 codegraph 前后的运行。
+- 报告页区分 codegraph「配置关闭」与「已启用但找不到可执行文件」：前者可用于对照实验，后者是部署故障，以错误样式提示不要拿这一轮做对照。
+- 导出的 Markdown 报告新增 codegraph 一节，内容与页面一致。
+- 运行详情接口新增 `codegraph_stats` 与 `clue_counts`，仓库条目新增 `index_mode`、`index_ms`、`route_count`、`type_count`，发现条目新增 `clue_source`；运行列表接口新增 `codegraph_stats` 与 `clue_counts`。这些都是计数与标签，游客同样可见。
+
+### Fixed
+
+- 环境变量 `OPENCR_SURVEY_ENABLED`、`OPENCR_SURVEY_CODEGRAPH_ENABLED`、`OPENCR_SURVEY_SCHEDULER_INTERVAL_SECONDS` 此前从未生效（被误当成配置文件路径读取），现在与其余配置项一致，非空时覆盖 `config.yaml`。已有部署不受影响：部署脚本只把它们用于生成 `config.yaml`，不会传给服务进程。
+
+### Changed
+
+- 巡检报告里各仓库的错误信息（拉取失败、建索引失败的原始输出）不再返回给游客，与推送记录的错误信息一致：git 与 codegraph 的输出可能带出路径与代码片段。游客仍能看到仓库状态。
+- 数据库迁移：`survey_run` 新增 `codegraph_stats`，`survey_run_repo` 新增 `index_mode`、`index_ms`、`route_count`、`type_count`，`survey_finding` 新增 `clue_source`。升级前的运行这些字段为空，页面显示「无记录」而不是 0。
+
 ## [0.7.5] - 2026-10-09
 
 ### Added
