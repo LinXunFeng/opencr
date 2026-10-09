@@ -570,6 +570,8 @@ can skip it explicitly with `--build-arg CODEGRAPH_VERSION=`. Surveys then still
 degrade to manifest level and a degradation is recorded — the analysis knows which files exist but
 not which endpoints or types do.
 
+**To see whether it actually helped in a run, open the "codegraph" card on the survey report.** It lists, per repository, how the index was obtained (incremental sync / full rebuild / failed), how long it took and how many endpoints and types were extracted, plus the cross-repo links, method mismatches and dropped false-positive calls it made possible. Focus items and findings are split by *clue source* — codegraph, baseline profile, or outside the profile. Clue source records provenance, not causation: to quantify the gain, run the same commits with codegraph on and off a few times each and compare the codegraph column in the run list.
+
 `survey.codegraph_bin` holds an absolute path rather than the bare name because **launchd's PATH does
 not include `~/.local/bin`**: a bare name would leave the service unable to find it, showing up as
 every survey silently degrading. Adjust this entry if you install it elsewhere.

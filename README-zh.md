@@ -529,6 +529,8 @@ docker volume rm "$(basename "$PWD")_opencr-gogcli"   # 卷名前缀是 compose 
 
 **装不上不会中断安装。** `install.sh` 会警告并继续，Docker 可以用 `--build-arg CODEGRAPH_VERSION=` 显式跳过。此时巡检照常执行，画像退化为依赖清单级并记录一条降级，代价是分析时只知道有哪些文件、不知道有哪些接口与类型。
 
+**它这一轮起没起作用，看巡检报告里的「codegraph 执行情况与收益」卡片。** 卡片列出每个仓库的建索引方式（增量更新 / 全量重建 / 失败）、耗时和抽出的接口与类型数，以及它带来的跨仓库接口连接、方法不一致和被剔除的误报调用。关注点与发现按「线索来源」分为 codegraph / 基础画像 / 画像外三类。注意线索来源是出处而不是因果，要量化收益，请对同一批提交分别开关 codegraph 各跑几轮，在巡检记录的 codegraph 列里对比。
+
 `survey.codegraph_bin` 写的是绝对路径不是 `codegraph` 三个字母，原因是 **launchd 的 PATH 里没有 `~/.local/bin`** ——写裸名会让服务运行时找不到它，表现为每次巡检都静默降级。手动装到别处时记得同步改这一项。
 
 **每个仓库单独建索引，不要把多个仓库放进同一张图。** 这不是风格偏好：codegraph 不索引外部依赖，未解析的符号会被按名字连到工作区内任意同名节点上，跨语言也连。实测三个毫无关联的仓库放在一起产生了 824 条跨仓库边，**全部是假的**。完整证据见 [`docs/adr/0003-per-repo-codegraph-index.md`](docs/adr/0003-per-repo-codegraph-index.md)。

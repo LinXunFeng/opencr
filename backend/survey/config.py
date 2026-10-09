@@ -44,22 +44,34 @@ def _resolve_default_workspace_dir() -> Path:
     return Path(__file__).resolve().parent.parent.parent / "workspaces"
 
 
+def _pick_with_env(config_data: dict, path: str, env_name: str) -> str:
+    """
+    先取 config.yaml，再用非空的环境变量覆盖，与 review/config.py 各项的顺序一致。
+
+    不能把环境变量名作为第二个参数传给 _pick_config_value —— 它的参数全是配置文件路径，
+    那样写环境变量永远不会被读到。巡检的几个开关曾经就是这么静默失效的。
+    """
+    env_value = os.getenv(env_name, "").strip()
+    return env_value or _pick_config_value(config_data, path)
+
+
 def load_survey_config() -> dict:
     """读取巡检配置。"""
     config_data = load_file_config()
 
-    enabled_raw = _pick_config_value(config_data, "survey.enabled", "OPENCR_SURVEY_ENABLED")
-    workspace_dir = _pick_config_value(config_data, "survey.workspace_dir", "OPENCR_SURVEY_WORKSPACE_DIR")
-    scheduler_interval = _pick_config_int(
-        config_data,
-        DEFAULT_SCHEDULER_INTERVAL_SECONDS,
-        "survey.scheduler_interval_seconds",
-        "OPENCR_SURVEY_SCHEDULER_INTERVAL_SECONDS",
+    enabled_raw = _pick_with_env(config_data, "survey.enabled", "OPENCR_SURVEY_ENABLED")
+    workspace_dir = _pick_with_env(config_data, "survey.workspace_dir", "OPENCR_SURVEY_WORKSPACE_DIR")
+    scheduler_interval_raw = _pick_with_env(
+        config_data, "survey.scheduler_interval_seconds", "OPENCR_SURVEY_SCHEDULER_INTERVAL_SECONDS"
     )
-    codegraph_enabled_raw = _pick_config_value(
+    try:
+        scheduler_interval = int(scheduler_interval_raw) if scheduler_interval_raw else DEFAULT_SCHEDULER_INTERVAL_SECONDS
+    except ValueError:
+        scheduler_interval = DEFAULT_SCHEDULER_INTERVAL_SECONDS
+    codegraph_enabled_raw = _pick_with_env(
         config_data, "survey.codegraph_enabled", "OPENCR_SURVEY_CODEGRAPH_ENABLED"
     )
-    codegraph_bin = _pick_config_value(config_data, "survey.codegraph_bin", "OPENCR_SURVEY_CODEGRAPH_BIN")
+    codegraph_bin = _pick_with_env(config_data, "survey.codegraph_bin", "OPENCR_SURVEY_CODEGRAPH_BIN")
 
     wall_clock_minutes = _pick_config_int(
         config_data, DEFAULT_WALL_CLOCK_MINUTES, "survey.budget.wall_clock_minutes"
@@ -75,13 +87,6 @@ def load_survey_config() -> dict:
     fetch_timeout = _pick_config_int(
         config_data, DEFAULT_FETCH_TIMEOUT_SECONDS, "survey.budget.fetch_timeout_seconds"
     )
-
-    env_workspace_dir = os.getenv("OPENCR_SURVEY_WORKSPACE_DIR", "").strip()
-    if env_workspace_dir:
-        workspace_dir = env_workspace_dir
-    env_codegraph_bin = os.getenv("OPENCR_SURVEY_CODEGRAPH_BIN", "").strip()
-    if env_codegraph_bin:
-        codegraph_bin = env_codegraph_bin
 
     resolved = {
         "enabled": _truthy(enabled_raw, True),

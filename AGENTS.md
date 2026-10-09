@@ -113,6 +113,7 @@ backend/                # 后端 Python 包
 │   ├── reach.py        # Reach 统计：L1 能点名的源码文件范围；判定逻辑是纯函数
 │   ├── crossrepo.py    # 跨仓库接口连接；确定性匹配，不含模型判断
 │   ├── analysis.py     # L1 整合 / L2 取证 / L3 汇总的模型调用
+│   ├── clues.py        # 线索来源判定与 codegraph 本轮快照；纯函数，不碰数据库
 │   ├── report.py       # Markdown 报告渲染（渲染产物，不是存储真相）
 │   ├── ledger.py       # Ledger 状态判定与镜像行生成；判定逻辑是纯函数
 │   ├── push.py         # Push 的唯一执行入口（自动推送与手动重推都走这里）
@@ -152,7 +153,7 @@ scripts/                # 在宿主机上执行的部署辅助脚本（不进镜
 ## 六、常用命令
 
 ```bash
-# 测试（210 个用例，无需外部依赖）
+# 测试（236 个用例，无需外部依赖）
 python3 -m unittest discover -s tests -t .
 
 # 数据库迁移（部署脚本走的就是这条）

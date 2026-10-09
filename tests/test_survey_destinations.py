@@ -392,7 +392,8 @@ class CollectFindingsTests(unittest.TestCase):
             findings, inspected = runner._collect_findings(
                 focuses, [{"slug": "app", "dir": Path(".")}], "", Budget(10, 10000, 5, 10000), "run-1"
             )
-        self.assertEqual(findings, [{"file_path": "ok.dart"}])
+        # clue_source 继承自关注点，这里的关注点没有标注，所以是空串
+        self.assertEqual(findings, [{"file_path": "ok.dart", "clue_source": ""}])
         # 没结论的也要记下来：复核按"上次交给 L2 的时刻"轮转，否则它们永远排在队首
         self.assertEqual(inspected, [
             {"repo_slug": "app", "file_path": "ok.dart", "conclusive": True},

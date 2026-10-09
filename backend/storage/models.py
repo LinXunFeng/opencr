@@ -267,6 +267,26 @@ REPO_INDEX_FAILED = "index_failed"
 PROFILE_CODEGRAPH = "codegraph"
 PROFILE_MANIFEST = "manifest"
 
+# --- SurveyRunRepo.index_mode --------------------------------------------
+# 未启用 codegraph 时为 NULL，而不是第四个取值：那时根本没有"建索引"这件事。
+INDEX_MODE_SYNC = "sync"
+INDEX_MODE_INIT = "init"
+INDEX_MODE_FAILED = "failed"
+
+# --- 线索来源（关注点与 SurveyFinding.clue_source）-----------------------
+# 判定见 backend/survey/clues.py。它回答"这个位置是谁指给模型的"，不是因果归因。
+CLUE_CODEGRAPH = "codegraph"
+CLUE_BASELINE = "baseline"
+CLUE_UNLISTED = "unlisted"
+CLUE_SOURCES = (CLUE_CODEGRAPH, CLUE_BASELINE, CLUE_UNLISTED)
+# 只出现在统计里，不落库：功能上线前产出的 Finding 没有线索来源，单列而不并进任何一类
+CLUE_UNKNOWN = "unknown"
+
+# --- codegraph 在一次运行里的状态（codegraph_stats.status）---------------
+CODEGRAPH_ENABLED = "enabled"
+CODEGRAPH_DISABLED = "disabled"
+CODEGRAPH_MISSING = "missing"
+
 # --- Degradation.kind（巡检侧）-------------------------------------------
 DEGRADE_REPO_FETCH_FAILED = "repo_fetch_failed"
 DEGRADE_INDEX_FAILED = "index_failed"
@@ -450,6 +470,11 @@ class SurveyRun(Base):
     # 运行开始时即写入 "[]"，NULL 只会出现在早于这个字段的运行上，读取方据此按旧口径处理。
     inspected_files: Mapped[Optional[str]] = mapped_column(Text)
 
+    # codegraph 本轮的产出与去向（跨仓库事实、关注点的线索来源分布），JSON 对象字符串。
+    # 存快照而不是查询时重算：画像只落在工作区的产物目录里，会随工作区一起被清理。
+    # Finding 的线索分布不在这里 —— 它要扣掉被忽略的条目，查询时按 clue_source 现算。
+    codegraph_stats: Mapped[Optional[str]] = mapped_column(Text)
+
     started_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=utcnow)
     heartbeat_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=utcnow)
     finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
@@ -490,6 +515,12 @@ class SurveyRunRepo(Base):
     # codegraph 装不上时退化成 manifest 级画像，巡检照常完成但 L1 是结构盲的
     profile_kind: Mapped[Optional[str]] = mapped_column(String(24))
     file_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # 以下四列在未启用 codegraph、或功能上线前的旧运行里为 NULL，界面据此显示"无记录"而不是 0 ——
+    # 0 是"建了索引但什么都没抽出来"，两者含义完全不同。
+    index_mode: Mapped[Optional[str]] = mapped_column(String(16))
+    index_ms: Mapped[Optional[int]] = mapped_column(Integer)
+    route_count: Mapped[Optional[int]] = mapped_column(Integer)
+    type_count: Mapped[Optional[int]] = mapped_column(Integer)
     error_message: Mapped[Optional[str]] = mapped_column(Text)
     # Reach 统计（survey/reach.py 的 measure_reach），JSON。拉取失败的仓库、早于该字段的运行、
     # 以及统计本身失败时为 NULL —— 统计是排查辅助，失败不影响巡检
@@ -528,6 +559,8 @@ class SurveyFinding(Base):
     # 模型两次的措辞不会一样，对正文做哈希等于每轮全是"新增"。
     fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
     state: Mapped[str] = mapped_column(String(16), nullable=False, default=FINDING_STATE_NEW)
+    # 继承自产出它的关注点；旧数据为 NULL。不进指纹 —— 同一位置换了线索来源仍是同一个问题。
+    clue_source: Mapped[Optional[str]] = mapped_column(String(16))
 
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=utcnow)
 

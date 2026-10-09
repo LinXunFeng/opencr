@@ -677,8 +677,9 @@ class ReachTests(unittest.TestCase):
         root = Path(tempfile.mkdtemp(prefix="opencr-reach-cap-"))
         self.addCleanup(shutil.rmtree, root, True)
         with mock.patch.object(profile_mod, "extract_api_calls", return_value=calls), \
-                mock.patch.object(profile_mod, "codegraph_available", return_value=True), \
-                mock.patch.object(profile_mod, "build_index", return_value=root / "codegraph.db"), \
+                mock.patch.object(profile_mod, "codegraph_status", return_value="enabled"), \
+                mock.patch.object(profile_mod, "build_index",
+                                  return_value=profile_mod.IndexOutcome(root / "codegraph.db", "init", 0)), \
                 mock.patch.object(profile_mod, "_extract_routes", return_value=routes), \
                 mock.patch.object(profile_mod, "_extract_types", return_value=[]), \
                 mock.patch.object(profile_mod, "_extract_languages", return_value={}):

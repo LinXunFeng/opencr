@@ -18,6 +18,15 @@ from ..storage.models import (
     CATEGORY_MAINTAINABILITY,
     CATEGORY_PERFORMANCE,
     CATEGORY_SECURITY,
+    CLUE_BASELINE,
+    CLUE_CODEGRAPH,
+    CLUE_UNKNOWN,
+    CLUE_UNLISTED,
+    CODEGRAPH_DISABLED,
+    CODEGRAPH_MISSING,
+    INDEX_MODE_FAILED,
+    INDEX_MODE_INIT,
+    INDEX_MODE_SYNC,
     SEVERITY_ADVICE,
     SEVERITY_CRITICAL,
     SEVERITY_UNKNOWN,
@@ -48,6 +57,25 @@ DEGRADATION_LABELS: Dict[str, str] = {
     "budget_exhausted": "预算耗尽，提前收工（部分关注点未取证）",
     "profile_fallback": "codegraph 不可用，全部画像退化为依赖清单级",
     "repos_truncated": "仓库数超过单次巡检上限，超出的仓库未参与本次分析",
+}
+
+# 以下文案与 web/src/common/constants/opencr.ts 的同名映射是两份拷贝（跨语言无法共用），改一边要同步另一边
+INDEX_MODE_LABELS: Dict[str, str] = {
+    INDEX_MODE_SYNC: "增量更新",
+    INDEX_MODE_INIT: "全量重建",
+    INDEX_MODE_FAILED: "失败",
+}
+
+CLUE_LABELS: Dict[str, str] = {
+    CLUE_CODEGRAPH: "codegraph",
+    CLUE_BASELINE: "基础画像",
+    CLUE_UNLISTED: "画像外",
+    CLUE_UNKNOWN: "无记录",
+}
+
+CODEGRAPH_UNAVAILABLE_LABELS: Dict[str, str] = {
+    CODEGRAPH_DISABLED: "本次运行未启用 codegraph（配置关闭），画像均为依赖清单级。",
+    CODEGRAPH_MISSING: "codegraph 已启用但找不到可执行文件，画像均退化为依赖清单级——这是部署故障，不是有意关闭。",
 }
 
 _SEVERITY_ORDER = [SEVERITY_CRITICAL, SEVERITY_WARNING, SEVERITY_ADVICE, SEVERITY_UNKNOWN]
@@ -95,6 +123,67 @@ def _reach_cell(reach) -> str:
     reachable = reach.get("reachable_files", 0)
     cell = f"{reachable}/{total}（{reachable / total * 100:.0f}%）"
     return cell + "，画像被截断" if reach.get("truncated") else cell
+
+
+def _format_counts(counts: dict) -> str:
+    """把线索来源计数渲染成一行；值为 0 的类别省略，全为 0 时显示（无）。"""
+    parts = [f"{CLUE_LABELS.get(k, k)} {v}" for k, v in (counts or {}).items() if v]
+    return "、".join(parts) or "（无）"
+
+
+def _repo_note(repo: dict) -> str:
+    """建索引情况表里的「说明」列：失败原因（Guest 视角下已被剔除）或抽取为空的提示。"""
+    if repo.get("index_mode") == INDEX_MODE_FAILED:
+        return repo.get("error_message") or "建索引失败"
+    if repo.get("route_count") == 0 and repo.get("type_count") == 0:
+        return "没有抽出任何接口与类型"
+    return "-"
+
+
+def _render_codegraph(detail: dict) -> List[str]:
+    """
+    codegraph 一节：每个仓库的建索引情况，以及它的产出流向了哪里。内容与报告页的 codegraph 卡片一致。
+
+    功能上线前的旧运行没有快照，整节省略而不是渲染一排 0 —— 0 会被读成"codegraph 没起作用"。
+    """
+    stats = detail.get("codegraph_stats")
+    if not stats:
+        return []
+    lines: List[str] = ["## codegraph", ""]
+    if not stats.get("available"):
+        lines.extend([CODEGRAPH_UNAVAILABLE_LABELS.get(stats.get("status"), CODEGRAPH_UNAVAILABLE_LABELS[CODEGRAPH_DISABLED]), ""])
+
+    lines.append(
+        f"- 产出：结构图画像的仓库 {stats.get('repos_structured', 0)} / {stats.get('repos_total', 0)}，"
+        f"接口 {stats.get('routes', 0)} 个，类型 {stats.get('types', 0)} 个；"
+        f"剔除被误认为调用的路由注册 {stats.get('dropped_registrations', 0)} 条。"
+    )
+    cross = stats.get("cross_repo") or {}
+    lines.append(
+        f"- 跨仓库事实：接口连接 {cross.get('links', 0)} 处，HTTP 方法不一致 {cross.get('method_mismatch', 0)} 处，"
+        f"范围内无人调用的接口 {cross.get('unused_routes', 0)} 个，"
+        f"范围内无人提供的调用 {cross.get('orphan_calls', 0)} 处。"
+    )
+    if stats.get("focus") is not None:
+        lines.append(f"- 关注点线索来源：{_format_counts(stats['focus'])}")
+    lines.append(f"- 发现线索来源：{_format_counts(detail.get('clue_counts') or {})}")
+    lines.extend(["", "_线索来源只说明这个位置是画像的哪一部分指给模型的，不是因果归因。_", ""])
+
+    indexed = [r for r in detail.get("repos") or [] if r.get("index_mode")]
+    if indexed:
+        lines.append("| 仓库 | 索引 | 耗时 | 接口 | 类型 | 说明 |")
+        lines.append("| --- | --- | --- | --- | --- | --- |")
+        for r in indexed:
+            elapsed = r.get("index_ms")
+            lines.append(
+                f"| {r.get('repo_slug','')} | {INDEX_MODE_LABELS.get(r['index_mode'], r['index_mode'])} | "
+                f"{f'{elapsed / 1000:.1f}s' if elapsed is not None else '-'} | "
+                f"{r.get('route_count') if r.get('route_count') is not None else '-'} | "
+                f"{r.get('type_count') if r.get('type_count') is not None else '-'} | "
+                f"{_repo_note(r).replace('|', '/')} |"
+            )
+        lines.append("")
+    return lines
 
 
 def render_run_markdown(detail: dict) -> str:
@@ -149,6 +238,8 @@ def render_run_markdown(detail: dict) -> str:
             "（路由、类型骨架、接口调用、依赖清单、根目录文件）才可能被点名。_"
         )
         lines.append("")
+
+    lines.extend(_render_codegraph(detail))
 
     summary = (detail.get("summary") or "").strip()
     if summary:

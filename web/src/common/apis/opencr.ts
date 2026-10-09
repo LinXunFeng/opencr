@@ -223,6 +223,34 @@ export interface Survey {
   workspace_bytes?: number
 }
 
+/** Finding 的线索来源计数。unknown 是功能上线前的旧数据，不并进任何一类 */
+export interface ClueCounts {
+  codegraph: number
+  baseline: number
+  unlisted: number
+  unknown?: number
+}
+
+/** codegraph 本轮的产出与去向，运行级快照 */
+export interface CodegraphStats {
+  /** enabled / disabled（配置关闭）/ missing（开着但找不到可执行文件）；早期快照没有这个字段 */
+  status?: "enabled" | "disabled" | "missing"
+  /** 本轮建画像时 codegraph 是否可用 */
+  available: boolean
+  repos_total: number
+  /** 画像来自 codegraph 的仓库数 */
+  repos_structured: number
+  /** 建成了索引但一条接口、一个类型都没抽出来的仓库数 */
+  repos_empty: number
+  routes: number
+  types: number
+  /** 被识别为路由注册而从调用侧剔除的条数 */
+  dropped_registrations: number
+  cross_repo: { links: number, method_mismatch: number, orphan_calls: number, unused_routes: number }
+  /** L1 还没跑完时为 null，与"没有关注点"区分 */
+  focus: ClueCounts | null
+}
+
 export interface SurveyRun {
   run_uid: string
   survey_name?: string
@@ -240,6 +268,10 @@ export interface SurveyRun {
   heartbeat_at: string
   finished_at: string
   is_stale: boolean
+  /** 功能上线前的旧运行为 null */
+  codegraph_stats: CodegraphStats | null
+  /** 已落库 Finding 的线索来源分布（扣除了被忽略的条目） */
+  clue_counts?: ClueCounts
 }
 
 export interface SurveyFinding {
@@ -252,6 +284,8 @@ export interface SurveyFinding {
   /** new = 本次新增；persisted = 上次也有。"已消失"不在这里，见 resolved_findings */
   state: "new" | "persisted"
   fingerprint: string
+  /** codegraph / baseline / unlisted；旧数据为空串 */
+  clue_source: string
   created_at: string
   /** Guest 拿不到标题与正文，字段直接不存在（服务端剔除，不是前端隐藏） */
   title?: string
@@ -266,7 +300,14 @@ export interface SurveyRunRepo {
   status: string
   profile_kind: string
   file_count: number
+  /** Guest 拿到的是空串：git / codegraph 的原始输出可能带出路径与代码片段 */
   error_message: string
+  /** sync / init / failed；未启用 codegraph 时为空串 */
+  index_mode: string
+  /** 以下三项为 null 表示没有记录，0 表示抽出了 0 条，两者不要混为一谈 */
+  index_ms: number | null
+  route_count: number | null
+  type_count: number | null
   /** 拉取失败的仓库、早于该功能的运行、统计本身失败时为 null */
   reach: SurveyReach | null
 }

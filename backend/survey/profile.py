@@ -18,10 +18,21 @@ import re
 import shutil
 import sqlite3
 import subprocess
+import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from ..storage.models import PROFILE_CODEGRAPH, PROFILE_MANIFEST
+from ..storage.models import (
+    CODEGRAPH_DISABLED,
+    CODEGRAPH_ENABLED,
+    CODEGRAPH_MISSING,
+    INDEX_MODE_FAILED,
+    INDEX_MODE_INIT,
+    INDEX_MODE_SYNC,
+    PROFILE_CODEGRAPH,
+    PROFILE_MANIFEST,
+)
 from .common import CODEGRAPH_INDEX_DIRNAME, SurveyError
 from .config import load_survey_config
 
@@ -65,12 +76,24 @@ _PATH_LITERAL_RE = re.compile(r"""['"`](/[A-Za-z0-9_\-./{}:$%]*?/[A-Za-z0-9_\-./
 _HTTP_METHOD_RE = re.compile(r"\b(get|post|put|patch|delete|head|options)\b", re.IGNORECASE)
 
 
-def codegraph_available() -> bool:
-    """codegraph 是否可用。不可用不是错误 —— 它是可选依赖，缺了就退化。"""
+def codegraph_status() -> str:
+    """
+    codegraph 的部署状态：enabled（可用）、disabled（配置关闭）、missing（开着但找不到可执行文件）。
+
+    后两者都会让画像退化，但含义不同：disabled 是有意为之（比如做对照实验），
+    missing 是部署故障。页面要能区分，否则对照实验的结论会被一次装坏的部署污染。
+    """
     cfg = load_survey_config()
     if not cfg["codegraph_enabled"]:
-        return False
-    return shutil.which(cfg["codegraph_bin"]) is not None
+        return CODEGRAPH_DISABLED
+    if shutil.which(cfg["codegraph_bin"]) is None:
+        return CODEGRAPH_MISSING
+    return CODEGRAPH_ENABLED
+
+
+def codegraph_available() -> bool:
+    """codegraph 是否可用。不可用不是错误 —— 它是可选依赖，缺了就退化。"""
+    return codegraph_status() == CODEGRAPH_ENABLED
 
 
 def _codegraph_env() -> Dict[str, str]:
@@ -138,9 +161,32 @@ def _index_is_reusable(repo_dir: Path, timeout: int) -> bool:
     return True
 
 
-def build_index(repo_dir: Path, timeout: int = 600) -> Optional[Path]:
+@dataclass
+class IndexOutcome:
     """
-    为**单个仓库**准备索引，返回 codegraph.db 路径；失败返回 None。
+    一次建索引的结果。
+
+    mode 是最终走通（或最终失败）的那条路：sync 失败后退回 init 时记 init，
+    因为页面要回答的是"这一轮实际花了多少代价拿到索引"。
+    """
+
+    db_path: Optional[Path]
+    mode: str
+    elapsed_ms: int
+    error: str = ""
+
+
+def _describe_failure(completed: Optional[subprocess.CompletedProcess], limit: int) -> str:
+    """把 codegraph 的失败输出压成一行可读的原因，供日志与页面共用。"""
+    if completed is None:
+        return "codegraph 超时或无法启动"
+    detail = (completed.stderr or completed.stdout or "").strip()[:limit]
+    return f"exit={completed.returncode} {detail}".strip()
+
+
+def build_index(repo_dir: Path, timeout: int = 600) -> IndexOutcome:
+    """
+    为**单个仓库**准备索引，返回索引路径（失败为 None）、实际执行方式与耗时。
 
     已有可复用索引时走 `sync` 增量更新，否则全量 `init`。索引之所以能跨轮次留存，
     是因为拉取时的 `git clean` 排除了它（见 workspace.prepare_repo）——
@@ -152,31 +198,37 @@ def build_index(repo_dir: Path, timeout: int = 600) -> Optional[Path]:
     产生了 824 条跨仓库边，其中 100% 是假的（Dart 的 debugPrint 连到了 gin 的 debugPrint）。
     更糟的是这些假边的形状恰好就是"前端调用了后端的函数"——正是巡检想产出的结论。
     """
+    started = time.monotonic()
     db_path = repo_dir / CODEGRAPH_INDEX_DIRNAME / "codegraph.db"
+
+    def outcome(path: Optional[Path], mode: str, error: str = "") -> IndexOutcome:
+        """以本次调用开始为起点计时，构造 IndexOutcome。"""
+        # 计时包含复用判定与 sync 失败后的重建，这才是本轮为索引付出的真实代价
+        return IndexOutcome(path, mode, int((time.monotonic() - started) * 1000), error)
 
     if db_path.is_file() and _index_is_reusable(repo_dir, timeout):
         completed = _run_codegraph(["sync", str(repo_dir)], repo_dir, timeout)
         if completed is not None and completed.returncode == 0 and db_path.is_file():
             logger.info("codegraph index updated incrementally: repo=%s", repo_dir.name)
-            return db_path
+            return outcome(db_path, INDEX_MODE_SYNC)
         # sync 失败不算致命：删掉这份可疑的索引重建一次即可
-        detail = "" if completed is None else (completed.stderr or completed.stdout or "").strip()[:200]
-        logger.warning("codegraph sync failed, falling back to full index: repo=%s %s", repo_dir.name, detail)
+        logger.warning(
+            "codegraph sync failed, falling back to full index: repo=%s %s",
+            repo_dir.name, _describe_failure(completed, 200),
+        )
         shutil.rmtree(repo_dir / CODEGRAPH_INDEX_DIRNAME, ignore_errors=True)
 
     completed = _run_codegraph(["init", "-y", str(repo_dir)], repo_dir, timeout)
-    if completed is None:
-        return None
-    if completed.returncode != 0:
-        detail = (completed.stderr or completed.stdout or "").strip()[:300]
-        logger.warning("codegraph init failed: repo=%s exit=%s %s", repo_dir.name, completed.returncode, detail)
-        return None
+    if completed is None or completed.returncode != 0:
+        error = _describe_failure(completed, 300)
+        logger.warning("codegraph init failed: repo=%s %s", repo_dir.name, error)
+        return outcome(None, INDEX_MODE_FAILED, error)
 
     if not db_path.is_file():
         logger.warning("codegraph init reported success but db missing: %s", db_path)
-        return None
+        return outcome(None, INDEX_MODE_FAILED, "codegraph 报告成功但索引文件不存在")
     logger.info("codegraph index built from scratch: repo=%s", repo_dir.name)
-    return db_path
+    return outcome(db_path, INDEX_MODE_INIT)
 
 
 def _query(db_path: Path, sql: str, params: tuple = ()) -> List[tuple]:
@@ -396,23 +448,35 @@ def build_profile(repo_slug: str, repo_dir: Path, index_timeout: int = 600) -> d
         "languages": {},
         # 调用侧不依赖 codegraph，退化模式下照样抽 —— 它是跨仓库 join 的一半
         "api_calls": extract_api_calls(repo_dir),
+        "codegraph_status": codegraph_status(),
+        # 建索引的执行情况；codegraph 不可用时为 None（不是"失败"，而是根本没建）
+        "index": None,
+        # 被识别为路由注册而从调用侧剔除的条目。保留原条目而不只是计数：
+        # 线索来源判定要知道"不开 codegraph 时这些文件本来就在调用侧里"，见 clues.baseline_files
+        "dropped_calls": [],
     }
     # 在剔除路由注册之前记下是否撞了上限：剔除之后条数会低于上限，事后再数就看不出来了
     profile["api_calls_capped"] = len(profile["api_calls"]) >= MAX_API_CALLS
 
-    if not codegraph_available():
+    if profile["codegraph_status"] != CODEGRAPH_ENABLED:
         logger.info("codegraph unavailable, profile degraded to manifest: repo=%s", repo_slug)
         return profile
 
-    db_path = build_index(repo_dir, timeout=index_timeout)
-    if db_path is None:
+    result = build_index(repo_dir, timeout=index_timeout)
+    profile["index"] = {"mode": result.mode, "elapsed_ms": result.elapsed_ms, "error": result.error}
+    if result.db_path is None:
         return profile
 
+    db_path = result.db_path
     profile["kind"] = PROFILE_CODEGRAPH
     profile["routes"] = _extract_routes(db_path)
     profile["types"] = _extract_types(db_path)
     profile["languages"] = _extract_languages(db_path)
-    profile["api_calls"] = _drop_route_registrations(profile["api_calls"], profile["routes"])
+    kept = _drop_route_registrations(profile["api_calls"], profile["routes"])
+    # _drop_route_registrations 只做过滤、返回的是原对象，按身份取差集不会误伤内容相同的条目
+    kept_ids = {id(c) for c in kept}
+    profile["dropped_calls"] = [c for c in profile["api_calls"] if id(c) not in kept_ids]
+    profile["api_calls"] = kept
     logger.info(
         "Profile built: repo=%s kind=codegraph routes=%s types=%s api_calls=%s languages=%s",
         repo_slug, len(profile["routes"]), len(profile["types"]),

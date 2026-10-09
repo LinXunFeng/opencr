@@ -15,6 +15,7 @@ import {
   SURVEY_TRIGGER_LABEL
 } from "@@/constants/opencr"
 import { useUserStore } from "@/pinia/stores/user"
+import CodegraphCard from "./CodegraphCard.vue"
 import FindingTable from "./FindingTable.vue"
 import ReachDetail from "./ReachDetail.vue"
 
@@ -293,6 +294,8 @@ onMounted(() => load())
           <el-table-column prop="error_message" label="错误" min-width="180" show-overflow-tooltip />
         </el-table>
       </el-card>
+
+      <CodegraphCard :detail="detail" class="mb" />
 
       <el-card v-if="detail.summary" shadow="never" class="mb">
         <template #header>
