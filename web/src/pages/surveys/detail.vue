@@ -16,6 +16,7 @@ import {
 } from "@@/constants/opencr"
 import { useUserStore } from "@/pinia/stores/user"
 import FindingTable from "./FindingTable.vue"
+import ReachDetail from "./ReachDetail.vue"
 
 const route = useRoute()
 const userStore = useUserStore()
@@ -247,6 +248,11 @@ onMounted(() => load())
           覆盖的仓库（{{ detail.repos.length }}）
         </template>
         <el-table :data="detail.repos" size="small">
+          <el-table-column type="expand">
+            <template #default="{ row }">
+              <ReachDetail :reach="row.reach" />
+            </template>
+          </el-table-column>
           <el-table-column prop="repo_slug" label="仓库" min-width="160" />
           <el-table-column label="分支" width="140">
             <template #default="{ row }">
@@ -273,6 +279,17 @@ onMounted(() => load())
             </template>
           </el-table-column>
           <el-table-column prop="file_count" label="文件数" width="100" />
+          <el-table-column label="L1 可达" width="130">
+            <template #default="{ row }">
+              <el-tooltip v-if="row.reach?.source_files" :content="SURVEY_NOTES.reach" placement="top">
+                <span :class="{ degraded: row.reach.truncated }">
+                  {{ Math.round(row.reach.reachable_files / row.reach.source_files * 100) }}%
+                  （{{ row.reach.reachable_files }}/{{ row.reach.source_files }}）
+                </span>
+              </el-tooltip>
+              <span v-else>—</span>
+            </template>
+          </el-table-column>
           <el-table-column prop="error_message" label="错误" min-width="180" show-overflow-tooltip />
         </el-table>
       </el-card>

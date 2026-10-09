@@ -87,6 +87,16 @@ def _render_findings(findings: List[dict], include_body: bool) -> str:
     return "\n".join(blocks)
 
 
+def _reach_cell(reach) -> str:
+    """仓库表里的 L1 可达一格：可达 / 源码总数（占比），画像被截断时注明。"""
+    if not reach or not reach.get("source_files"):
+        return "-"
+    total = reach["source_files"]
+    reachable = reach.get("reachable_files", 0)
+    cell = f"{reachable}/{total}（{reachable / total * 100:.0f}%）"
+    return cell + "，画像被截断" if reach.get("truncated") else cell
+
+
 def render_run_markdown(detail: dict) -> str:
     """把 get_survey_run_detail 的结果渲染成一篇完整报告。"""
     include_body = bool(detail.get("body_included", True))
@@ -125,14 +135,19 @@ def render_run_markdown(detail: dict) -> str:
     if repos:
         lines.append("## 覆盖的仓库")
         lines.append("")
-        lines.append("| 仓库 | 分支 | 提交 | 状态 | 画像 | 文件数 |")
-        lines.append("| --- | --- | --- | --- | --- | --- |")
+        lines.append("| 仓库 | 分支 | 提交 | 状态 | 画像 | 文件数 | L1 可达 |")
+        lines.append("| --- | --- | --- | --- | --- | --- | --- |")
         for r in repos:
             lines.append(
                 f"| {r.get('repo_slug','')} | {r.get('branch','') or '默认'} | "
                 f"`{r.get('commit_sha','') or '-'}` | {r.get('status','')} | "
-                f"{r.get('profile_kind','') or '-'} | {r.get('file_count', 0)} |"
+                f"{r.get('profile_kind','') or '-'} | {r.get('file_count', 0)} | {_reach_cell(r.get('reach'))} |"
             )
+        lines.append("")
+        lines.append(
+            "_L1 可达：整合分析能点名取证的源码文件占比。只有在画像里带完整路径的文件"
+            "（路由、类型骨架、接口调用、依赖清单、根目录文件）才可能被点名。_"
+        )
         lines.append("")
 
     summary = (detail.get("summary") or "").strip()

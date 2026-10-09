@@ -34,13 +34,14 @@ from ..storage.models import (
     SURVEY_PHASE_SUMMARIZING,
 )
 from .analysis import (
-    Budget, inspect_focus, load_skill_prompt, match_skills, merge_focuses, plan_focus, summarize,
+    Budget, inspect_focus, l1_repo_budget, load_skill_prompt, match_skills, merge_focuses, plan_focus, summarize,
 )
 from .common import SurveyError, finding_fingerprint
 from .config import load_max_repos, load_survey_config, resolve_budget
-from .crossrepo import build_cross_repo_map
+from .crossrepo import build_cross_repo_map, render_cross_repo_map
 from .ledger import plan_rechecks, update_ledger_for_run
 from .profile import build_profile, codegraph_available, save_profile
+from .reach import collect_reach
 from .push import PushRejected, begin_pushes, execute_pushes
 from .sources import resolve_sources
 from .workspace import artifacts_dir, count_files, delete_workspace, prepare_repo
@@ -167,6 +168,29 @@ def _collect_findings(
     return findings, inspected
 
 
+def _record_reach(run_uid: str, prepared: List[dict], cross_map: dict, budget: Budget) -> None:
+    """
+    统计每个仓库的 Reach 并写到本轮的仓库记录上。
+
+    放在画像生成之后、L1 之前：此时画像与 L1 的预算分配都已确定，统计口径与 L1 实际拿到的输入一致。
+    """
+    try:
+        per_repo = l1_repo_budget(len(prepared), len(render_cross_repo_map(cross_map)), budget.l1_max_chars)
+    except Exception as e:
+        # 统计只是排查辅助：失败的后果是这一轮所有仓库显示"无记录"，巡检本身照常进行
+        logger.warning("Reach budget split failed, skipping reach: %s", e)
+        return
+    for item in prepared:
+        # 超大仓库要遍历全部文件，不刷心跳的话这段时间可能被误判为疑似中断
+        repo.survey_heartbeat(run_uid)
+        try:
+            reach = collect_reach(item["profile"], item["dir"], per_repo)
+            repo.record_survey_repo_reach(run_uid, item["slug"], reach)
+        except Exception as e:
+            # 同上：失败的后果是界面上这个仓库显示"无记录"
+            logger.warning("Reach measurement failed: repo=%s: %s", item["slug"], e)
+
+
 def execute_survey_run(survey_uid: str, trigger: str) -> Optional[str]:
     """
     执行一次巡检，返回 run_uid；巡检不存在返回 None。
@@ -213,6 +237,7 @@ def execute_survey_run(survey_uid: str, trigger: str) -> Optional[str]:
 
         profiles = [item["profile"] for item in prepared]
         cross_map = build_cross_repo_map(profiles)
+        _record_reach(run_uid, prepared, cross_map, budget)
 
         repo.update_survey_progress(run_uid, phase=SURVEY_PHASE_MATCHING_SKILL)
         candidates = _candidate_skills(survey, cfg.get("skills_dir", ""))

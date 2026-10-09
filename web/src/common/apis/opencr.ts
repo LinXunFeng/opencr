@@ -267,6 +267,29 @@ export interface SurveyRunRepo {
   profile_kind: string
   file_count: number
   error_message: string
+  /** 拉取失败的仓库、早于该功能的运行、统计本身失败时为 null */
+  reach: SurveyReach | null
+}
+
+/** Reach：L1 能点名取证的源码文件范围，口径见 SURVEY_NOTES.reach */
+export interface SurveyReach {
+  source_files: number
+  listed_files: number
+  reachable_files: number
+  by_source: Record<string, number>
+  by_depth: { depth: number, reachable: number, total: number }[]
+  truncated: boolean
+  profile_chars: number
+  budget_chars: number
+  caps: string[]
+  scan_limited: boolean
+  /** 以下两项列出具体目录与文件，Guest 拿不到（服务端剔除） */
+  hidden_dirs?: { dir: string, hidden: number, total: number }[]
+  heavy_hidden_files?: { path: string, symbols: number }[]
+  /** 没有 codegraph 索引时为 null：无从判断哪些文件"重" */
+  heavy_hidden_count: number | null
+  /** 计入 heavy_hidden_count 的符号数阈值 */
+  heavy_threshold: number
 }
 
 /** Push：一次运行的结果同步到一个输出目标的记录。失败不改变运行本身的状态 */

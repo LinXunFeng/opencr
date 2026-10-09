@@ -190,6 +190,22 @@ export const SURVEY_REPO_STATUS_LABEL: Record<string, string> = {
   index_failed: "索引失败"
 }
 
+/** Reach 里画像中出现文件的来源 */
+export const REACH_SOURCE_LABEL: Record<string, string> = {
+  routes: "路由",
+  types: "类型骨架",
+  api_calls: "接口调用",
+  manifests: "依赖清单",
+  root_files: "根目录文件"
+}
+
+/** Reach 里撞上的抽取上限 */
+export const REACH_CAP_LABEL: Record<string, string> = {
+  routes: "路由条数达到上限",
+  types: "类型骨架条数达到上限",
+  api_calls: "接口调用条数达到上限"
+}
+
 export const PROFILE_KIND_LABEL: Record<string, string> = {
   codegraph: "结构图（含接口与类型）",
   manifest: "依赖清单级（退化）"
@@ -232,6 +248,12 @@ export const SURVEY_NOTES = {
     "巡检每轮从全量代码的结构画像中挑选一批文件读源码取证，并复核台账里仍存在的问题所在的文件——不是每个文件每轮都会被读。台账里的老问题每轮都会被复核，因此逐轮产出高度重合，报告默认按「新增」优先呈现。",
   resolvedNotStored:
     "「已消失」指上一次巡检有、本次取证过所在文件但没有再检出的问题，它由指纹比对算出，库里没有对应记录。没再检出不等于已修复。",
+  reach:
+    "L1 可达：整合分析能点名取证的源码文件占比。L1 只能从画像里带完整路径的文件中挑选——路由、类型骨架、接口调用、依赖清单与根目录文件；只有函数的文件、配置与脚本，不管放在多深的目录都看不到。画像超出 L1 预算被截断时，截掉部分里的文件同样看不到。台账里已有问题的文件不受影响，复核直接按台账路径取证。",
+  reachHeavy: "符号数来自 codegraph 索引，符号多的文件多半是核心逻辑，最值得关心它们为什么进不了 L1 的视野。",
+  reachSourceOverlap: "一个文件可同时属于多个来源",
+  reachNoRecord:
+    "没有统计记录：仓库拉取失败、运行早于该功能，或统计本身失败。",
   focusCapIncludesRecheck:
     "关注点上限同时也是每轮复核台账问题的文件数上限（另算），一轮最多取证两倍于此的文件。",
   uncheckedNotResolved:

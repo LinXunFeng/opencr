@@ -397,6 +397,8 @@ def build_profile(repo_slug: str, repo_dir: Path, index_timeout: int = 600) -> d
         # 调用侧不依赖 codegraph，退化模式下照样抽 —— 它是跨仓库 join 的一半
         "api_calls": extract_api_calls(repo_dir),
     }
+    # 在剔除路由注册之前记下是否撞了上限：剔除之后条数会低于上限，事后再数就看不出来了
+    profile["api_calls_capped"] = len(profile["api_calls"]) >= MAX_API_CALLS
 
     if not codegraph_available():
         logger.info("codegraph unavailable, profile degraded to manifest: repo=%s", repo_slug)
@@ -420,7 +422,7 @@ def build_profile(repo_slug: str, repo_dir: Path, index_timeout: int = 600) -> d
 
 
 def render_profile(profile: dict, max_chars: int) -> str:
-    """把画像渲染成 L1 的输入文本，按预算截断。"""
+    """把画像渲染成 L1 的输入文本，按预算截断。路径的写法改了要同步改 rendered_paths。"""
     slug = profile.get("repo_slug", "?")
     parts: List[str] = [f"### 仓库 `{slug}`（画像来源：{profile.get('kind')}）"]
 
@@ -457,6 +459,46 @@ def render_profile(profile: dict, max_chars: int) -> str:
 
     text = "\n\n".join(parts)
     return text[:max_chars] if max_chars > 0 else text
+
+
+def profile_paths(profile: dict) -> Dict[str, set]:
+    """画像里带了完整路径的文件，按来源分组：{"routes"|"types"|"api_calls"|"manifests"|"root_files": {路径}}。"""
+    groups: Dict[str, set] = {
+        "routes": {r["file"] for r in profile.get("routes") or [] if r.get("file")},
+        "types": {t["file"] for t in profile.get("types") or [] if t.get("file")},
+        "api_calls": {c["file"] for c in profile.get("api_calls") or [] if c.get("file")},
+        "manifests": set((profile.get("manifests") or {}).keys()),
+        # tree 里只有根目录下的文件是文件，其余条目是目录（以 "/" 结尾，可能带子目录列表）
+        "root_files": {t for t in profile.get("tree") or [] if not t.endswith("/") and " (" not in t},
+    }
+    return groups
+
+
+def rendered_paths(profile: dict, text: str) -> set:
+    """
+    render_profile 截断后的文本里仍然带着的文件路径，即 L1 能点名的文件。
+
+    与 render_profile 的输出格式逐项对应，改其中一个时必须同步改另一个 ——
+    这也是它放在这里而不是 reach.py 里的原因。
+    """
+    seen = set()
+    for r in profile.get("routes") or []:
+        if r.get("file") and f"({r['file']})" in text:
+            seen.add(r["file"])
+    for t in profile.get("types") or []:
+        if t.get("file") and f"({t['file']})" in text:
+            seen.add(t["file"])
+    for c in profile.get("api_calls") or []:
+        if c.get("file") and f"({c['file']}:{c['line']})" in text:
+            seen.add(c["file"])
+    for name in profile.get("manifests") or {}:
+        if f"#### {name}\n" in text:
+            seen.add(name)
+    lines = set(text.splitlines())
+    for name in profile_paths(profile)["root_files"]:
+        if f"- {name}" in lines:
+            seen.add(name)
+    return seen
 
 
 def save_profile(artifacts_root: Path, profile: dict) -> None:
