@@ -2,6 +2,8 @@
 import type { SurveyRun } from "@@/apis/opencr"
 import { getSurveyRunsApi, getSurveysApi } from "@@/apis/opencr"
 import {
+  CODEGRAPH_STATUS_LABEL,
+  codegraphStatusOf,
   RUN_STATUS_LABEL,
   RUN_STATUS_TAG,
   sumClueCounts,
@@ -55,7 +57,7 @@ function codegraphSummary(row: any) {
   const run = row as SurveyRun
   const stats = run.codegraph_stats
   if (!stats) return "—"
-  if (!stats.available) return stats.status === "missing" ? "找不到可执行文件" : "未启用"
+  if (!stats.available) return CODEGRAPH_STATUS_LABEL[codegraphStatusOf(stats)]
   const counts = run.clue_counts
   return `发现 ${counts?.codegraph ?? 0}/${sumClueCounts(counts)} · 连接 ${stats.cross_repo.links}`
 }

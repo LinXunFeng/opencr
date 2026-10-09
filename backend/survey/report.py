@@ -102,16 +102,19 @@ def _render_findings(findings: List[dict], include_body: bool) -> str:
             if line:
                 location += f":{line}"
             category = CATEGORY_LABELS.get(item.get("category", ""), item.get("category", ""))
+            # 与页面发现列表的「线索来源」列一致；旧数据没有来源，记为无记录
+            clue = CLUE_LABELS.get(item.get("clue_source") or CLUE_UNKNOWN, item.get("clue_source"))
+            tag = f"[{category}·线索：{clue}]"
             title = item.get("title") or ""
             if include_body and title:
-                blocks.append(f"- [{category}] {location} —— {title}")
+                blocks.append(f"- {tag} {location} —— {title}")
                 body = (item.get("body") or "").strip()
                 if body:
                     indented = "\n".join(f"  > {line}" for line in body.splitlines())
                     blocks.append(indented)
             else:
                 # Guest 视角：位置与分类是聚合信息，正文才是 ADR-0002 要挡的东西
-                blocks.append(f"- [{category}] {location}")
+                blocks.append(f"- {tag} {location}")
     return "\n".join(blocks)
 
 
@@ -154,7 +157,8 @@ def _render_codegraph(detail: dict) -> List[str]:
         lines.extend([CODEGRAPH_UNAVAILABLE_LABELS.get(stats.get("status"), CODEGRAPH_UNAVAILABLE_LABELS[CODEGRAPH_DISABLED]), ""])
 
     lines.append(
-        f"- 产出：结构图画像的仓库 {stats.get('repos_structured', 0)} / {stats.get('repos_total', 0)}，"
+        f"- 产出：结构图画像的仓库 {stats.get('repos_structured', 0)} / {stats.get('repos_total', 0)}"
+        f"（其中抽取为空 {stats.get('repos_empty', 0)} 个），"
         f"接口 {stats.get('routes', 0)} 个，类型 {stats.get('types', 0)} 个；"
         f"剔除被误认为调用的路由注册 {stats.get('dropped_registrations', 0)} 条。"
     )

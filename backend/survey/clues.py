@@ -83,11 +83,11 @@ def _classify(index: Tuple[Set[str], Set[str]], file_path: str) -> str:
     两边都出现时判为 baseline 而不是 codegraph：既然不靠 codegraph 也看得到，
     就不能把它记成 codegraph 的功劳 —— 宁可低估收益，也不要高估。
     """
-    baseline, structured = index
+    baseline_set, codegraph_set = index
     target = normalize_file_path(file_path)
-    if target in baseline:
+    if target in baseline_set:
         return CLUE_BASELINE
-    if target in structured:
+    if target in codegraph_set:
         return CLUE_CODEGRAPH
     return CLUE_UNLISTED
 

@@ -1326,6 +1326,8 @@ def set_survey_codegraph_stats(run_uid: str, stats: dict) -> None:
     with session_scope() as session:
         run = session.scalar(select(SurveyRun).where(SurveyRun.run_uid == run_uid))
         if run is None:
+            # 运行记录被并发清理掉了；快照只是观测数据，记一笔便于排查"为什么这轮没有 codegraph 记录"
+            logger.warning("Survey run not found when recording codegraph stats: %s", run_uid)
             return
         run.codegraph_stats = json.dumps(stats, ensure_ascii=False)
 

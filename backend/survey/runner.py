@@ -12,6 +12,7 @@ from typing import Dict, List, Optional, Tuple
 from ..review.skills import load_available_review_skills
 from ..storage import repo
 from ..storage.models import (
+    CODEGRAPH_ENABLED,
     DEGRADE_BUDGET_EXHAUSTED,
     DEGRADE_INDEX_FAILED,
     DEGRADE_PROFILE_FALLBACK,
@@ -41,7 +42,7 @@ from .common import SurveyError, finding_fingerprint
 from .config import load_max_repos, load_survey_config, resolve_budget
 from .crossrepo import build_cross_repo_map, render_cross_repo_map
 from .ledger import plan_rechecks, update_ledger_for_run
-from .profile import build_profile, codegraph_available, save_profile
+from .profile import build_profile, codegraph_status, save_profile
 from .reach import collect_reach
 from .push import PushRejected, begin_pushes, execute_pushes
 from .sources import resolve_sources
@@ -75,7 +76,9 @@ def _prepare_workspaces(
     """
     prepared: List[dict] = []
     artifacts = artifacts_dir(survey["slug"])
-    codegraph_ok = codegraph_available()
+    # 整轮只查一次，并传给每个仓库的画像：状态要在快照、降级与仓库状态之间保持一致
+    run_codegraph_status = codegraph_status()
+    codegraph_ok = run_codegraph_status == CODEGRAPH_ENABLED
     if not codegraph_ok:
         # 画像退化成 manifest 级，L1 只知道有哪些文件、不知道有哪些接口与类型。
         # 巡检照常完成，但这是实打实的产出质量损失，必须让看报告的人知道。
@@ -108,7 +111,9 @@ def _prepare_workspaces(
             continue
 
         repo.update_survey_progress(run_uid, phase=SURVEY_PHASE_PROFILING, repos_done=index)
-        profile = build_profile(slug, repo_dir, index_timeout=budget_cfg["index_timeout_seconds"])
+        profile = build_profile(
+            slug, repo_dir, index_timeout=budget_cfg["index_timeout_seconds"], status=run_codegraph_status
+        )
         status = REPO_OK
         index_error = ""
         if codegraph_ok and profile["kind"] == PROFILE_MANIFEST:
@@ -120,14 +125,14 @@ def _prepare_workspaces(
             index_error = (profile.get("index") or {}).get("error", "")
         save_profile(artifacts, profile)
 
-        structured = profile["kind"] != PROFILE_MANIFEST
+        has_structure = profile["kind"] != PROFILE_MANIFEST
         repo.record_survey_repo(
             run_uid, slug, target["url"], branch, sha, status,
             profile_kind=profile["kind"], file_count=count_files(repo_dir),
             error_message=index_error, index=profile.get("index"),
             # 只有结构图画像才有"抽出了几条"可言；退化画像留 NULL，与"抽出 0 条"区分开
-            route_count=len(profile["routes"]) if structured else None,
-            type_count=len(profile["types"]) if structured else None,
+            route_count=len(profile["routes"]) if has_structure else None,
+            type_count=len(profile["types"]) if has_structure else None,
         )
         prepared.append({"slug": slug, "dir": repo_dir, "profile": profile})
 

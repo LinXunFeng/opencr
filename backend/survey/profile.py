@@ -21,7 +21,7 @@ import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from ..storage.models import (
     CODEGRAPH_DISABLED,
@@ -376,19 +376,23 @@ def extract_api_calls(repo_dir: Path) -> List[dict]:
     return calls
 
 
-def _drop_route_registrations(calls: List[dict], routes: List[dict]) -> List[dict]:
+def _drop_route_registrations(calls: List[dict], routes: List[dict]) -> Tuple[List[dict], List[dict]]:
     """
-    剔除把"路由注册"误当成"接口调用"的条目。
+    剔除把"路由注册"误当成"接口调用"的条目，返回 (保留的, 剔除的)。
 
     `r.POST("/api/order/create", handler)` 这一行既被 codegraph 抽成 route 节点，
     也会被调用侧的正则命中。不剔掉的话，每个后端仓库都会显示成"自己调用了自己的接口"，
     而真正要找的"前端调了一个后端不存在的接口"会淹没在这些自匹配里。
     只在**同一文件同一路径**时剔除，跨文件的同名路径是真实信息，不能一并抹掉。
+    剔除的条目也要返回：线索来源判定要知道"不开 codegraph 时这些文件本来就在调用侧里"。
     """
     registrations = {(r.get("file", ""), r.get("path", "")) for r in routes or []}
-    if not registrations:
-        return calls
-    return [c for c in calls if (c.get("file", ""), c.get("path", "")) not in registrations]
+    kept: List[dict] = []
+    dropped: List[dict] = []
+    for call in calls:
+        is_registration = (call.get("file", ""), call.get("path", "")) in registrations
+        (dropped if is_registration else kept).append(call)
+    return kept, dropped
 
 
 def _read_manifests(repo_dir: Path) -> Dict[str, str]:
@@ -431,9 +435,11 @@ def _build_tree_summary(repo_dir: Path, max_entries: int = 80) -> List[str]:
     return entries
 
 
-def build_profile(repo_slug: str, repo_dir: Path, index_timeout: int = 600) -> dict:
+def build_profile(
+    repo_slug: str, repo_dir: Path, index_timeout: int = 600, status: Optional[str] = None
+) -> dict:
     """
-    生成一个仓库的画像。
+    生成一个仓库的画像。status 是本轮的 codegraph 状态（见 codegraph_status），不传则现查。
 
     codegraph 不可用时退化为 manifest 级画像：巡检照常完成，但 L1 是结构盲的
     （只知道有哪些文件，不知道有哪些接口与类型），由调用方记一条 Degradation。
@@ -448,7 +454,9 @@ def build_profile(repo_slug: str, repo_dir: Path, index_timeout: int = 600) -> d
         "languages": {},
         # 调用侧不依赖 codegraph，退化模式下照样抽 —— 它是跨仓库 join 的一半
         "api_calls": extract_api_calls(repo_dir),
-        "codegraph_status": codegraph_status(),
+        # 由调用方传入整轮共用的状态：逐仓库各查一次的话，运行中途改配置或装卸可执行文件，
+        # 同一轮里会出现"快照说已启用、降级却说不可用"这种互相矛盾的记录
+        "codegraph_status": status or codegraph_status(),
         # 建索引的执行情况；codegraph 不可用时为 None（不是"失败"，而是根本没建）
         "index": None,
         # 被识别为路由注册而从调用侧剔除的条目。保留原条目而不只是计数：
@@ -472,11 +480,9 @@ def build_profile(repo_slug: str, repo_dir: Path, index_timeout: int = 600) -> d
     profile["routes"] = _extract_routes(db_path)
     profile["types"] = _extract_types(db_path)
     profile["languages"] = _extract_languages(db_path)
-    kept = _drop_route_registrations(profile["api_calls"], profile["routes"])
-    # _drop_route_registrations 只做过滤、返回的是原对象，按身份取差集不会误伤内容相同的条目
-    kept_ids = {id(c) for c in kept}
-    profile["dropped_calls"] = [c for c in profile["api_calls"] if id(c) not in kept_ids]
-    profile["api_calls"] = kept
+    profile["api_calls"], profile["dropped_calls"] = _drop_route_registrations(
+        profile["api_calls"], profile["routes"]
+    )
     logger.info(
         "Profile built: repo=%s kind=codegraph routes=%s types=%s api_calls=%s languages=%s",
         repo_slug, len(profile["routes"]), len(profile["types"]),

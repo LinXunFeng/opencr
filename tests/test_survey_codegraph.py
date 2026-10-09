@@ -242,6 +242,38 @@ class FindingClueInheritanceTests(unittest.TestCase):
         self.assertEqual([f["clue_source"] for f in findings], ["codegraph", "baseline"])
 
 
+class RunWideCodegraphStatusTests(unittest.TestCase):
+    def test_every_repo_profile_gets_the_status_checked_once_per_run(self):
+        """逐仓库各查一次的话，运行中途环境一变，同一轮里快照、降级与仓库状态就会互相矛盾。"""
+        from backend.survey import runner
+
+        seen = []
+
+        def fake_build_profile(slug, repo_dir, index_timeout=600, status=None):
+            seen.append(status)
+            return _profile(repo_slug=slug, codegraph_status=status)
+
+        targets = [{"slug": "a", "url": "u1"}, {"slug": "b", "url": "u2"}, {"slug": "c", "url": "u3"}]
+        status_probe = mock.Mock(side_effect=["missing", "enabled", "enabled"])
+        with mock.patch.object(runner, "codegraph_status", status_probe), \
+                mock.patch.object(runner, "prepare_repo", return_value=(Path("/tmp"), "main", "sha")), \
+                mock.patch.object(runner, "build_profile", side_effect=fake_build_profile), \
+                mock.patch.object(runner, "save_profile"), \
+                mock.patch.object(runner, "count_files", return_value=1), \
+                mock.patch.object(runner, "artifacts_dir", return_value=Path("/tmp")), \
+                mock.patch.object(runner, "repo") as fake_repo:
+            prepared = runner._prepare_workspaces(
+                {"slug": "s"}, "uid", targets, {"index_timeout_seconds": 5, "fetch_timeout_seconds": 5}
+            )
+
+        self.assertEqual(status_probe.call_count, 1)
+        self.assertEqual(seen, ["missing", "missing", "missing"])
+        self.assertEqual(len(prepared), 3)
+        # 不可用时只记一次整轮降级，不会再把每个仓库标成 index_failed
+        kinds = [c.args[1] for c in fake_repo.add_survey_degradation.call_args_list]
+        self.assertEqual(kinds, ["profile_fallback"])
+
+
 class SurveyConfigEnvOverrideTests(unittest.TestCase):
     """
     巡检配置的环境变量必须能覆盖 config.yaml。
@@ -413,7 +445,7 @@ class CodegraphStorageTests(unittest.TestCase):
         })
         markdown = render_run_markdown(self.repo.get_survey_run_detail(run_uid))
         self.assertIn("## codegraph", markdown)
-        self.assertIn("结构图画像的仓库 1 / 2，接口 3 个，类型 4 个", markdown)
+        self.assertIn("结构图画像的仓库 1 / 2（其中抽取为空 0 个），接口 3 个，类型 4 个", markdown)
         self.assertIn("| api | 全量重建 | 1.5s | 3 | 4 | - |", markdown)
         self.assertIn("| web | 失败 | 0.0s | - | - | exit=2 boom |", markdown)
         self.assertIn("接口连接 2 处", markdown)
@@ -423,6 +455,17 @@ class CodegraphStorageTests(unittest.TestCase):
         guest = render_run_markdown(self.repo.get_survey_run_detail(run_uid, include_body=False))
         self.assertNotIn("boom", guest)
         self.assertIn("| web | 失败 | 0.0s | - | - | 建索引失败 |", guest)
+
+    def test_markdown_findings_carry_their_clue_source(self):
+        """导出与页面同源：页面发现列表有「线索来源」列，导出的每条发现也要有。"""
+        from backend.survey.report import render_run_markdown
+
+        run_uid = self._start()
+        self.repo.record_survey_findings(run_uid, [self._finding("a.go", "codegraph"), self._finding("b.go", "")])
+        for include_body in (True, False):
+            markdown = render_run_markdown(self.repo.get_survey_run_detail(run_uid, include_body=include_body))
+            self.assertIn("[安全·线索：codegraph] `api/a.go`", markdown)
+            self.assertIn("[安全·线索：无记录] `api/b.go`", markdown)
 
     def test_markdown_tells_missing_binary_apart_from_switched_off(self):
         from backend.survey.report import render_run_markdown

@@ -10,7 +10,8 @@
 - 新增**线索来源**：每个关注点按其位置是 codegraph 指出的、基础画像就能看到的、还是画像外推断的分为三类，Finding 继承所属关注点的来源。报告页展示关注点与发现的来源分布，发现列表新增「线索来源」列并可按来源筛选。术语见 `CONTEXT.md`。线索来源是出处而非因果归因，两边都能看到的位置记为基础画像，宁可低估 codegraph 的收益。
 - 报告页同时展示 codegraph 带来的跨仓库事实（接口连接、HTTP 方法不一致、范围内无人调用的接口）与被剔除的误报调用数；巡检记录列表新增 codegraph 列（线索来自 codegraph 的发现数 / 全部、接口连接数），便于对比开关 codegraph 前后的运行。
 - 报告页区分 codegraph「配置关闭」与「已启用但找不到可执行文件」：前者可用于对照实验，后者是部署故障，以错误样式提示不要拿这一轮做对照。
-- 导出的 Markdown 报告新增 codegraph 一节，内容与页面一致。
+- 导出的 Markdown 报告新增 codegraph 一节，内容与页面一致；每条发现同样标注线索来源。
+- 报告页「产出」区标出建成索引但没有抽出任何接口与类型的仓库数。
 - 运行详情接口新增 `codegraph_stats` 与 `clue_counts`，仓库条目新增 `index_mode`、`index_ms`、`route_count`、`type_count`，发现条目新增 `clue_source`；运行列表接口新增 `codegraph_stats` 与 `clue_counts`。这些都是计数与标签，游客同样可见。
 
 ### Fixed

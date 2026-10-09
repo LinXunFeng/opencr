@@ -246,6 +246,27 @@ export function sumClueCounts(counts?: Partial<Record<typeof CLUE_KEYS[number], 
   return CLUE_KEYS.reduce((sum, key) => sum + (counts?.[key] ?? 0), 0)
 }
 
+/**
+ * 一次运行里 codegraph 的状态（codegraph_stats.status）。
+ * 早期快照没有 status 字段，按 available 推断，不可用时一律当作「配置关闭」，不误报成部署故障。
+ */
+export function codegraphStatusOf(stats: { status?: string, available: boolean }) {
+  if (stats.available) return "enabled"
+  return stats.status === "missing" ? "missing" : "disabled"
+}
+
+export const CODEGRAPH_STATUS_LABEL: Record<string, string> = {
+  enabled: "本轮已启用",
+  disabled: "本轮未启用",
+  missing: "找不到可执行文件"
+}
+
+export const CODEGRAPH_STATUS_TAG: Record<string, TagType> = {
+  enabled: "success",
+  disabled: "info",
+  missing: "danger"
+}
+
 /** codegraph 不可用时的说明。两种原因都会让画像退化，但只有「配置关闭」能拿来做对照 */
 export const CODEGRAPH_UNAVAILABLE_LABEL: Record<string, string> = {
   disabled: "本轮未启用 codegraph（配置关闭），画像均为依赖清单级。可以与启用时的运行对比下面的数字，看 codegraph 带来的差别。",
@@ -320,6 +341,10 @@ export const SURVEY_NOTES = {
     "线索来源只说明这个位置是画像的哪一部分指给模型的，不是因果归因：没有 codegraph 时，模型也可能凭目录名猜到同一个文件。两边都能看到的位置记为基础画像，宁可低估 codegraph 的收益也不高估。要量化因果，请对同一批提交分别开关 codegraph 各跑几轮比对。",
   crossRepoNeedsRoutes:
     "跨仓库连接、方法不一致、无人调用的接口都以 codegraph 抽出的接口为一端，未启用时这三项必然为 0；此时调用侧的路径只能全部算作「范围内无人提供」。",
+  codegraphNoRecord:
+    "这次运行没有 codegraph 记录（该功能上线前的运行，或运行在建画像之前就已结束）。",
+  focusNotReached:
+    "本轮未走到整合分析这一步",
   droppedRegistrations:
     "调用侧扫描会把路由注册那一行也当成调用，codegraph 抽出接口后才能剔除，否则每个后端都像在调用自己。",
   runListCodegraph:

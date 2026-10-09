@@ -5,7 +5,10 @@ import {
   CLUE_SOURCE_DESC,
   CLUE_SOURCE_LABEL,
   CLUE_SOURCE_TAG,
+  CODEGRAPH_STATUS_LABEL,
+  CODEGRAPH_STATUS_TAG,
   CODEGRAPH_UNAVAILABLE_LABEL,
+  codegraphStatusOf,
   INDEX_MODE_LABEL,
   INDEX_MODE_TAG,
   sumClueCounts,
@@ -24,15 +27,8 @@ const stats = computed(() => props.detail.codegraph_stats)
 /** 只列启用了 codegraph 的仓库；拉取失败的仓库根本没到建索引这一步 */
 const indexedRepos = computed(() => props.detail.repos.filter(r => r.index_mode))
 
-/** 状态标签。早期快照没有 status 字段，不可用时一律按「配置关闭」处理，不误报成部署故障 */
-const statusLabel = computed(() => {
-  if (!stats.value) return ""
-  if (stats.value.available) return "本轮已启用"
-  return stats.value.status === "missing" ? "找不到可执行文件" : "本轮未启用"
-})
-const unavailableNote = computed(() =>
-  CODEGRAPH_UNAVAILABLE_LABEL[stats.value?.status === "missing" ? "missing" : "disabled"]
-)
+/** 本轮 codegraph 状态：enabled / disabled / missing，没有快照时为空串 */
+const status = computed(() => (stats.value ? codegraphStatusOf(stats.value) : ""))
 
 /** 要展示的线索来源标签：unknown 只在确有旧数据时出现，其余三类即使为 0 也展示 */
 function clueItems(counts: ClueCounts | null | undefined) {
@@ -72,23 +68,20 @@ function isEmptyExtraction(row: any) {
     <template #header>
       <div class="header">
         <span>codegraph 执行情况与收益</span>
-        <el-tag
-          v-if="stats" size="small" effect="plain"
-          :type="stats.available ? 'success' : stats.status === 'missing' ? 'danger' : 'info'"
-        >
-          {{ statusLabel }}
+        <el-tag v-if="status" size="small" effect="plain" :type="CODEGRAPH_STATUS_TAG[status]">
+          {{ CODEGRAPH_STATUS_LABEL[status] }}
         </el-tag>
       </div>
     </template>
 
     <div v-if="!stats" class="sub">
-      这次运行没有 codegraph 记录（该功能上线前的运行，或运行在建画像之前就已结束）。
+      {{ SURVEY_NOTES.codegraphNoRecord }}
     </div>
 
     <template v-else>
       <el-alert
-        v-if="!stats.available" class="mb" :closable="false" show-icon
-        :type="stats.status === 'missing' ? 'error' : 'info'" :title="unavailableNote"
+        v-if="status !== 'enabled'" class="mb" :closable="false" show-icon
+        :type="status === 'missing' ? 'error' : 'info'" :title="CODEGRAPH_UNAVAILABLE_LABEL[status]"
       />
 
       <div class="section-title">
@@ -102,6 +95,11 @@ function isEmptyExtraction(row: any) {
           <div class="label">
             结构图画像的仓库
           </div>
+          <el-tooltip v-if="stats.repos_empty" :content="SURVEY_NOTES.emptyExtraction">
+            <div class="label warn">
+              其中 {{ stats.repos_empty }} 个抽取为空
+            </div>
+          </el-tooltip>
         </div>
         <div class="tile">
           <div class="value">
@@ -185,7 +183,7 @@ function isEmptyExtraction(row: any) {
             </el-tooltip>
             <span class="sub">codegraph 占 {{ share(stats.focus) }}</span>
           </template>
-          <span v-else class="sub">本轮未走到整合分析这一步</span>
+          <span v-else class="sub">{{ SURVEY_NOTES.focusNotReached }}</span>
         </el-descriptions-item>
         <el-descriptions-item label="发现（L2 取证后入库）">
           <el-tooltip v-for="item in clueItems(detail.clue_counts)" :key="item.key" :content="CLUE_SOURCE_DESC[item.key]">
