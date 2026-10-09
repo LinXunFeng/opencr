@@ -10,6 +10,8 @@ import os
 from pathlib import Path
 
 from ..review.config import _pick_config_int, _pick_config_value, load_file_config
+from ..storage import repo
+from .common import DEFAULT_MAX_REPOS_PER_SURVEY, MAX_REPOS_LOWER_BOUND, MAX_REPOS_UPPER_BOUND
 
 logger = logging.getLogger(__name__)
 
@@ -109,6 +111,27 @@ def load_survey_config() -> dict:
         resolved["budget"],
     )
     return resolved
+
+
+# 运行期设置的键名，后台设置接口与这里共用
+SETTING_MAX_REPOS = "survey_max_repos"
+
+
+def load_max_repos() -> int:
+    """
+    单次巡检的仓库上限（运行期设置，未设置时取默认值）。
+
+    存数据库而非 config.yaml，理由见 DEFAULT_MAX_REPOS_PER_SURVEY 的注释。
+    读出的值再夹一次上下限：库里的脏值（手改过库、或旧版本写入）
+    不该让巡检变成一个仓库都不处理，或者没有上限。
+    """
+    raw = repo.get_setting(SETTING_MAX_REPOS)
+    try:
+        value = int(raw) if raw is not None else DEFAULT_MAX_REPOS_PER_SURVEY
+    except (TypeError, ValueError):
+        logger.warning("Invalid %s setting %r, using default", SETTING_MAX_REPOS, raw)
+        value = DEFAULT_MAX_REPOS_PER_SURVEY
+    return min(max(value, MAX_REPOS_LOWER_BOUND), MAX_REPOS_UPPER_BOUND)
 
 
 def load_public_url() -> str:

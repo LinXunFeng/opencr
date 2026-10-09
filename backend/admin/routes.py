@@ -24,8 +24,8 @@ from ..review.config import (
 )
 from ..storage import repo
 from ..storage.models import PUSH_TRIGGER_MANUAL
-from ..survey.common import SurveyError, slugify
-from ..survey.config import load_public_url, load_survey_config
+from ..survey.common import MAX_REPOS_LOWER_BOUND, MAX_REPOS_UPPER_BOUND, SurveyError, slugify
+from ..survey.config import SETTING_MAX_REPOS, load_max_repos, load_public_url, load_survey_config
 from ..survey.destinations import DESTINATION_TYPES, list_destination_types, load_destinations
 from ..survey.profile import codegraph_available
 from ..survey.push import PushRejected, begin_pushes, check_destination, execute_pushes_in_background
@@ -65,7 +65,18 @@ WRITABLE_SETTINGS = {
     # 嵌套在 guest_read 之下：guest_read 关着时它没有意义。
     # 默认开启，与 MR 审查一致；打开后巡检发现的正文与整合叙述**依然剔除**。
     "survey_guest_read": {"type": "bool"},
+    SETTING_MAX_REPOS: {"type": "int", "min": MAX_REPOS_LOWER_BOUND, "max": MAX_REPOS_UPPER_BOUND},
 }
+
+
+def _writable_settings() -> dict:
+    """可写子集的当前生效值；GET 与 PATCH 共用，避免两处返回的字段漂移。"""
+    return {
+        "guest_read": guest_read_enabled(),
+        "guest_retry": guest_retry_enabled(),
+        "survey_guest_read": survey_guest_read_enabled(),
+        SETTING_MAX_REPOS: load_max_repos(),
+    }
 
 
 def _window_days(default: int) -> int:
@@ -438,11 +449,7 @@ def api_settings():
                     "bind_local_only": admin_cfg["bind_local_only"],
                 },
             },
-            "writable": {
-                "guest_read": guest_read_enabled(),
-                "guest_retry": guest_retry_enabled(),
-                "survey_guest_read": survey_guest_read_enabled(),
-            },
+            "writable": _writable_settings(),
         }
     )
 
@@ -457,26 +464,30 @@ def api_update_settings():
     静默忽略会让调用方以为改成功了。
     """
     payload = request.get_json(silent=True) or {}
-    if not isinstance(payload, dict) or any(type(v) is not bool for v in payload.values()):
-        return jsonify({"error": "设置必须为布尔值对象"}), 400
+    if not isinstance(payload, dict):
+        return jsonify({"error": "设置必须为对象"}), 400
     unknown = [k for k in payload if k not in WRITABLE_SETTINGS]
     if unknown:
         return jsonify({"error": f"不可写的配置项: {', '.join(sorted(unknown))}"}), 400
 
+    # 先整体校验再写入：一半写进去、一半被拒的部分成功，调用方无从得知哪些生效了
+    for key, value in payload.items():
+        spec = WRITABLE_SETTINGS[key]
+        if spec["type"] == "bool" and type(value) is not bool:
+            return jsonify({"error": f"{key} 必须为布尔值"}), 400
+        if spec["type"] == "int":
+            # bool 是 int 的子类，true 会被当成 1 放过去，所以用 type() 精确判断
+            if type(value) is not int or not spec["min"] <= value <= spec["max"]:
+                return jsonify({"error": f"{key} 必须为 {spec['min']}~{spec['max']} 之间的整数"}), 400
+
     for key, value in payload.items():
         if WRITABLE_SETTINGS[key]["type"] == "bool":
             repo.set_setting(key, "1" if value else "0")
-            logger.info("Admin changed setting %s -> %s", key, bool(value))
+        else:
+            repo.set_setting(key, str(value))
+        logger.info("Admin changed setting %s -> %s", key, value)
 
-    return jsonify(
-        {
-            "writable": {
-                "guest_read": guest_read_enabled(),
-                "guest_retry": guest_retry_enabled(),
-                "survey_guest_read": survey_guest_read_enabled(),
-            }
-        }
-    )
+    return jsonify({"writable": _writable_settings()})
 
 
 # ---------------------------------------------------------------------------

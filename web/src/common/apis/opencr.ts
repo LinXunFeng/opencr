@@ -123,7 +123,13 @@ export interface DashboardData {
 
 export interface SettingsData {
   readonly: Record<string, any>
-  writable: { guest_read: boolean, guest_retry: boolean, survey_guest_read: boolean }
+  writable: {
+    guest_read: boolean
+    guest_retry: boolean
+    survey_guest_read: boolean
+    /** 单次巡检的仓库上限，超出部分截掉并记一条 repos_truncated 降级 */
+    survey_max_repos: number
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -374,9 +380,7 @@ export function getSettingsApi() {
   return request<SettingsData>({ url: "settings", method: "get" })
 }
 
-export function updateSettingsApi(
-  data: Partial<{ guest_read: boolean, guest_retry: boolean, survey_guest_read: boolean }>
-) {
+export function updateSettingsApi(data: Partial<SettingsData["writable"]>) {
   return request<{ writable: SettingsData["writable"] }>({ url: "settings", method: "patch", data })
 }
 

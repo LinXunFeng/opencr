@@ -16,6 +16,7 @@ from ..storage.models import (
     DEGRADE_INDEX_FAILED,
     DEGRADE_PROFILE_FALLBACK,
     DEGRADE_REPO_FETCH_FAILED,
+    DEGRADE_REPOS_TRUNCATED,
     ERROR_SURVEY,
     ERROR_UNEXPECTED,
     PROFILE_MANIFEST,
@@ -34,7 +35,7 @@ from ..storage.models import (
 )
 from .analysis import Budget, inspect_focus, load_skill_prompt, match_skills, plan_focus, summarize
 from .common import SurveyError, finding_fingerprint
-from .config import load_survey_config, resolve_budget
+from .config import load_max_repos, load_survey_config, resolve_budget
 from .crossrepo import build_cross_repo_map
 from .ledger import update_ledger_for_run
 from .profile import build_profile, codegraph_available, save_profile
@@ -183,9 +184,11 @@ def execute_survey_run(survey_uid: str, trigger: str) -> Optional[str]:
 
     try:
         repo.update_survey_progress(run_uid, phase=SURVEY_PHASE_FETCHING)
-        targets = resolve_sources(survey["sources"])
+        targets, truncated = resolve_sources(survey["sources"], load_max_repos())
         if not targets:
             raise SurveyError("巡检没有任何可用的仓库来源")
+        if truncated:
+            repo.add_survey_degradation(run_uid, DEGRADE_REPOS_TRUNCATED, count=truncated)
         repo.update_survey_progress(run_uid, repos_total=len(targets))
 
         prepared = _prepare_workspaces(survey, run_uid, targets, budget_cfg)

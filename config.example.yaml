@@ -199,6 +199,16 @@ admin:
 # （"今天有外部人员来，先关一下"），要求改文件加重启就等于没人会用。
 # 游客能看到运行状态与聚合统计，但看不到审查发现的正文；
 # 完整取舍见 docs/adr/0002-guest-read-scope.md。
+#
+# One more runtime setting lives in the console/database:
+#   survey_max_repos  max repos per survey run, after org expansion and dedup
+#                     (default 200, range 1~1000). Extra repos are skipped and the
+#                     run records a repos_truncated degradation. Takes effect on
+#                     the next survey run, no restart needed.
+# 另有一个运行期设置同样在后台「设置」页修改、存在数据库中：
+#   survey_max_repos  单次巡检的仓库上限，按组织展开、去重之后计数
+#                     （默认 200，可填 1~1000）。超出的仓库不参与本轮，
+#                     运行记一条 repos_truncated 降级。下一次巡检生效，无需重启。
 
 # Persistence settings for review history and acceptance statistics.
 # 审查历史与采纳统计的持久化配置。

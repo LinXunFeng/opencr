@@ -272,6 +272,9 @@ DEGRADE_REPO_FETCH_FAILED = "repo_fetch_failed"
 DEGRADE_INDEX_FAILED = "index_failed"
 DEGRADE_BUDGET_EXHAUSTED = "budget_exhausted"
 DEGRADE_PROFILE_FALLBACK = "profile_fallback"
+# 来源展开后超过单次巡检的仓库上限，多出的仓库未参与本轮。count 记被截掉的仓库数。
+# 不影响台账：被截掉的仓库没有 SurveyRunRepo 记录，自然不在可信仓库集合里。
+DEGRADE_REPOS_TRUNCATED = "repos_truncated"
 
 # --- SurveyFinding.category ----------------------------------------------
 # 闭集，不允许模型自由发挥 —— 它是指纹的组成部分，措辞漂移会让跨轮次对比失效。

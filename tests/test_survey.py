@@ -321,6 +321,32 @@ class SurveyConfigTests(SurveyStorageTestCase):
         self.assertEqual(slug, "mobile-weekly")
         self.assertIsNone(self.repo.get_survey(self.survey["survey_uid"]))
 
+    def test_max_repos_defaults_to_200_and_clamps_dirty_values(self):
+        """未设置时取默认 200；库里的脏值不能让巡检变成零仓库或没有上限。"""
+        from backend.survey.config import SETTING_MAX_REPOS, load_max_repos
+
+        self.assertEqual(load_max_repos(), 200)
+        self.repo.set_setting(SETTING_MAX_REPOS, "350")
+        self.assertEqual(load_max_repos(), 350)
+        self.repo.set_setting(SETTING_MAX_REPOS, "0")
+        self.assertEqual(load_max_repos(), 1)
+        self.repo.set_setting(SETTING_MAX_REPOS, "99999")
+        self.assertEqual(load_max_repos(), 1000)
+        self.repo.set_setting(SETTING_MAX_REPOS, "abc")
+        self.assertEqual(load_max_repos(), 200)
+
+    def test_resolve_sources_reports_truncated_count(self):
+        """截断数要交给调用方记降级，只写日志会让被截掉的仓库悄无声息地退出巡检。"""
+        from backend.survey.sources import resolve_sources
+
+        sources = [{"kind": "repo", "url": f"https://g.com/a/r{i}.git"} for i in range(5)]
+        targets, truncated = resolve_sources(sources, 3)
+        self.assertEqual(len(targets), 3)
+        self.assertEqual(truncated, 2)
+
+        targets, truncated = resolve_sources(sources, 5)
+        self.assertEqual((len(targets), truncated), (5, 0))
+
 
 class SurveyFindingDiffTests(SurveyStorageTestCase):
     def test_new_and_persisted_are_labelled(self):

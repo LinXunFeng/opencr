@@ -12,9 +12,17 @@ from typing import List, Optional
 
 from ..storage.models import SURVEY_CATEGORIES, CATEGORY_CORRECTNESS
 
-# 组织展开出来的仓库上限。没有它的话，指向一个上千项目的顶层 group
+# 单次巡检的仓库上限。没有它的话，指向一个上千项目的顶层 group
 # 会让一次巡检把磁盘塞满，而用户在界面上只填了一行。
-MAX_REPOS_PER_SURVEY = 50
+#
+# 默认值从 50 提到 200：实战中一个业务组织就超过了 50，被截掉的仓库悄无声息地
+# 不参与巡检。它是运行期设置（后台「设置」页可改），不放 config.yaml ——
+# 调这个数的人通常正盯着一轮被截断的巡检，要求改文件加重启就等于没人会去调。
+DEFAULT_MAX_REPOS_PER_SURVEY = 200
+# 界面可填的上下限。上限取 1000：与组织展开的翻页上限（10 页 × 100）同量级，
+# 再往上单轮的拉取与建索引时间已经远超任何合理的预算。
+MAX_REPOS_LOWER_BOUND = 1
+MAX_REPOS_UPPER_BOUND = 1000
 
 # 单个仓库工作区的目录名长度上限，留足给文件系统路径
 MAX_SLUG_LENGTH = 64

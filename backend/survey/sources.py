@@ -8,13 +8,12 @@
 """
 
 import logging
-from typing import Dict, List
+from typing import Dict, List, Tuple
 from urllib.parse import urlparse
 
 from ..review.gitlab import list_group_projects, require_gitlab_config
 from ..storage.models import SOURCE_ORG, SOURCE_REPO
 from .common import (
-    MAX_REPOS_PER_SURVEY,
     SurveyError,
     matches_any_pattern,
     parse_json_list,
@@ -24,7 +23,7 @@ from .common import (
 logger = logging.getLogger(__name__)
 
 # 单个组织最多翻多少页（每页 100）。上限存在的意义是别让一个指错的顶层 group
-# 把整个实例的项目都拉回来 —— 真正的裁剪交给 MAX_REPOS_PER_SURVEY 和排除清单。
+# 把整个实例的项目都拉回来 —— 真正的裁剪交给单次巡检的仓库上限和排除清单。
 MAX_GROUP_PAGES = 10
 
 
@@ -55,7 +54,7 @@ def expand_group(group_path: str, exclude_patterns: List[str]) -> List[Dict[str,
     列出组织（含子组）下的全部非归档项目。
 
     翻页上限的意义是别让一个指错的顶层 group 把整个实例的项目都拉回来；
-    真正的裁剪交给 MAX_REPOS_PER_SURVEY 与排除清单。
+    真正的裁剪交给单次巡检的仓库上限与排除清单。
     """
     normalized = normalize_group_path(group_path)
     repos: List[Dict[str, str]] = []
@@ -90,9 +89,12 @@ def expand_group(group_path: str, exclude_patterns: List[str]) -> List[Dict[str,
     return repos
 
 
-def resolve_sources(sources: List[dict]) -> List[Dict[str, str]]:
+def resolve_sources(sources: List[dict], max_repos: int) -> Tuple[List[Dict[str, str]], int]:
     """
-    把 Survey 的来源清单展开成去重后的仓库列表。
+    把 Survey 的来源清单展开成去重后的仓库列表，超出 max_repos 的部分截掉。
+
+    返回 (仓库列表, 被截掉的仓库数)。截断数交给调用方记降级 ——
+    只写日志的话，被截掉的仓库会悄无声息地退出巡检，报告看起来完全正常。
 
     单个来源展开失败不会让整轮直接失败 —— 由调用方按"部分失败记降级、
     全部失败才判失败"处理，所以这里把错误随条目一起返回而不是抛出去。
@@ -127,13 +129,12 @@ def resolve_sources(sources: List[dict]) -> List[Dict[str, str]]:
             seen_slugs.add(slug)
             resolved.append({**item, "slug": slug})
 
-    if len(resolved) > MAX_REPOS_PER_SURVEY:
-        logger.warning(
-            "Repo count %s exceeds limit %s, truncating", len(resolved), MAX_REPOS_PER_SURVEY
-        )
-        resolved = resolved[:MAX_REPOS_PER_SURVEY]
+    truncated = max(len(resolved) - max_repos, 0)
+    if truncated:
+        logger.warning("Repo count %s exceeds limit %s, truncating", len(resolved), max_repos)
+        resolved = resolved[:max_repos]
 
-    return resolved
+    return resolved, truncated
 
 
 def check_platform_ready() -> None:
