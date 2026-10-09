@@ -1284,8 +1284,17 @@ def record_survey_repo(
     profile_kind: str = "",
     file_count: int = 0,
     error_message: str = "",
+    index: Optional[dict] = None,
+    route_count: Optional[int] = None,
+    type_count: Optional[int] = None,
 ) -> None:
-    """记录一次运行里单个仓库的处理结果。"""
+    """
+    记录一次运行里单个仓库的处理结果。
+
+    index 是画像里的建索引结果（{mode, elapsed_ms, error}，这里只取前两项，失败原因走 error_message），
+    未启用 codegraph 时为 None；
+    route_count / type_count 只在画像确实来自 codegraph 时传入，其余情况留 NULL。
+    """
     from .models import SurveyRun, SurveyRunRepo
 
     with session_scope() as session:
@@ -1303,8 +1312,25 @@ def record_survey_repo(
                 profile_kind=profile_kind or None,
                 file_count=int(file_count or 0),
                 error_message=(error_message or "")[:2000] or None,
+                index_mode=index.get("mode") if index else None,
+                index_ms=index.get("elapsed_ms") if index else None,
+                route_count=route_count,
+                type_count=type_count,
             )
         )
+
+
+def set_survey_codegraph_stats(run_uid: str, stats: dict) -> None:
+    """写入（覆盖）一次运行的 codegraph 快照，见 survey.clues.summarize_codegraph。"""
+    from .models import SurveyRun
+
+    with session_scope() as session:
+        run = session.scalar(select(SurveyRun).where(SurveyRun.run_uid == run_uid))
+        if run is None:
+            # 运行记录被并发清理掉了；快照只是观测数据，记一笔便于排查"为什么这轮没有 codegraph 记录"
+            logger.warning("Survey run not found when recording codegraph stats: %s", run_uid)
+            return
+        run.codegraph_stats = json.dumps(stats, ensure_ascii=False)
 
 
 def previous_survey_fingerprints(survey_id: int, before_run_id: int) -> set:
@@ -1400,6 +1426,7 @@ def record_survey_findings(run_uid: str, findings: List[dict]) -> Dict[str, int]
                     body=(item.get("body") or "")[:8000] or None,
                     fingerprint=fingerprint,
                     state=state,
+                    clue_source=item.get("clue_source") or None,
                 )
             )
     return counters
@@ -1529,6 +1556,11 @@ def _survey_run_to_dict(run: "SurveyRun", stale_after_seconds: int = 600) -> dic
         skills = json.loads(run.matched_skills) if run.matched_skills else []
     except (ValueError, TypeError):
         skills = []
+    try:
+        # 功能上线前的旧运行没有快照，返回 None 让界面显示"无记录"而不是一排 0
+        codegraph_stats = json.loads(run.codegraph_stats) if run.codegraph_stats else None
+    except (ValueError, TypeError):
+        codegraph_stats = None
 
     is_stale = (
         run.status == RUN_RUNNING
@@ -1550,6 +1582,7 @@ def _survey_run_to_dict(run: "SurveyRun", stale_after_seconds: int = 600) -> dic
         "heartbeat_at": run.heartbeat_at.isoformat() if run.heartbeat_at else "",
         "finished_at": run.finished_at.isoformat() if run.finished_at else "",
         "is_stale": is_stale,
+        "codegraph_stats": codegraph_stats,
     }
 
 
@@ -1569,12 +1602,39 @@ def _survey_finding_to_dict(finding: "SurveyFinding", include_body: bool) -> dic
         "severity": finding.severity,
         "state": finding.state,
         "fingerprint": finding.fingerprint,
+        # 线索来源是标签不是正文，Guest 同样可见；旧数据为空串
+        "clue_source": finding.clue_source or "",
         "created_at": finding.created_at.isoformat() if finding.created_at else "",
     }
     if include_body:
         item["title"] = finding.title or ""
         item["body"] = finding.body or ""
     return item
+
+
+def _survey_clue_counts(session, run_ids: List[int]) -> Dict[int, Dict[str, int]]:
+    """
+    按运行统计已落库 Finding 的线索来源分布：{run_id: {CLUE_SOURCES 的每个键, unknown}}。
+
+    从 survey_finding 现算而不是读快照：被忽略的条目不入库，快照里的数字会比列表多。
+    unknown 是功能上线前的旧数据，单列出来，不并进任何一类。
+    """
+    from .models import CLUE_SOURCES, CLUE_UNKNOWN, SurveyFinding
+
+    result: Dict[int, Dict[str, int]] = {
+        run_id: {**{source: 0 for source in CLUE_SOURCES}, CLUE_UNKNOWN: 0} for run_id in run_ids
+    }
+    if not run_ids:
+        return result
+    rows = session.execute(
+        select(SurveyFinding.run_id, SurveyFinding.clue_source, func.count())
+        .where(SurveyFinding.run_id.in_(run_ids))
+        .group_by(SurveyFinding.run_id, SurveyFinding.clue_source)
+    ).all()
+    for run_id, source, count in rows:
+        key = source if source in CLUE_SOURCES else CLUE_UNKNOWN
+        result[run_id][key] += int(count)
+    return result
 
 
 def list_survey_runs(survey_uid: str = "", limit: int = 50, stale_after_seconds: int = 600) -> List[dict]:
@@ -1590,8 +1650,13 @@ def list_survey_runs(survey_uid: str = "", limit: int = 50, stale_after_seconds:
             stmt = stmt.where(SurveyRun.survey_id == survey_id)
         runs = session.scalars(stmt).all()
         survey_names = dict(session.execute(select(Survey.id, Survey.name)).all())
+        clue_counts = _survey_clue_counts(session, [r.id for r in runs])
         return [
-            {**_survey_run_to_dict(r, stale_after_seconds), "survey_name": survey_names.get(r.survey_id, "")}
+            {
+                **_survey_run_to_dict(r, stale_after_seconds),
+                "survey_name": survey_names.get(r.survey_id, ""),
+                "clue_counts": clue_counts[r.id],
+            }
             for r in runs
         ]
 
@@ -1635,12 +1700,19 @@ def get_survey_run_detail(
                 "status": r.status,
                 "profile_kind": r.profile_kind or "",
                 "file_count": r.file_count,
-                "error_message": r.error_message or "",
+                # 拉取与建索引的原始报错（git / codegraph 的输出）可能带出路径与代码片段，
+                # 与推送记录的错误信息同等对待：Guest 只看状态，不看原文
+                "error_message": (r.error_message or "") if include_body else "",
                 "reach": _reach_to_dict(r.reach, include_body),
+                "index_mode": r.index_mode or "",
+                "index_ms": r.index_ms,
+                "route_count": r.route_count,
+                "type_count": r.type_count,
             }
             for r in repos
         ]
         detail["findings"] = [_survey_finding_to_dict(f, include_body) for f in findings]
+        detail["clue_counts"] = _survey_clue_counts(session, [run.id])[run.id]
 
         current_fps = {f.fingerprint for f in findings}
         prev_run_id = session.scalar(

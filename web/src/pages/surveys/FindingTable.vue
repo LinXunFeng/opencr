@@ -1,6 +1,13 @@
 <script lang="ts" setup>
 import type { SurveyFinding } from "@@/apis/opencr"
-import { CATEGORY_LABEL, SEVERITY_LABEL, SEVERITY_TAG } from "@@/constants/opencr"
+import {
+  CATEGORY_LABEL,
+  CLUE_SOURCE_DESC,
+  CLUE_SOURCE_LABEL,
+  CLUE_SOURCE_TAG,
+  SEVERITY_LABEL,
+  SEVERITY_TAG
+} from "@@/constants/opencr"
 
 /**
  * 巡检发现列表。
@@ -20,6 +27,18 @@ const emit = defineEmits<{ ignore: [finding: SurveyFinding] }>()
 // 与项目既有页面的写法保持一致（见 pages/runs/index.vue）
 function location(row: any) {
   return `${row.repo_slug}/${row.file_path}${row.line ? `:${row.line}` : ""}`
+}
+
+/** 旧数据没有线索来源，归到「无记录」而不是留空，筛选时才选得中它 */
+function clueOf(row: any) {
+  return (row as SurveyFinding).clue_source || "unknown"
+}
+
+const clueFilters = Object.entries(CLUE_SOURCE_LABEL).map(([value, text]) => ({ text, value }))
+
+/** el-table 的筛选回调：行的线索来源是否等于选中的值 */
+function filterClue(value: string, row: any) {
+  return clueOf(row) === value
 }
 
 function emitIgnore(row: any) {
@@ -44,6 +63,15 @@ function emitIgnore(row: any) {
     <el-table-column label="类别" width="140">
       <template #default="{ row }">
         {{ CATEGORY_LABEL[row.category] || row.category }}
+      </template>
+    </el-table-column>
+    <el-table-column label="线索来源" width="120" :filters="clueFilters" :filter-method="filterClue">
+      <template #default="{ row }">
+        <el-tooltip :content="CLUE_SOURCE_DESC[clueOf(row)]">
+          <el-tag size="small" :type="CLUE_SOURCE_TAG[clueOf(row)]" effect="plain">
+            {{ CLUE_SOURCE_LABEL[clueOf(row)] }}
+          </el-tag>
+        </el-tooltip>
       </template>
     </el-table-column>
     <el-table-column label="位置" min-width="280" show-overflow-tooltip>

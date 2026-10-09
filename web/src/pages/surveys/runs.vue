@@ -2,9 +2,12 @@
 import type { SurveyRun } from "@@/apis/opencr"
 import { getSurveyRunsApi, getSurveysApi } from "@@/apis/opencr"
 import {
+  CODEGRAPH_STATUS_LABEL,
+  namedClueTotal,
   RUN_STATUS_LABEL,
   RUN_STATUS_TAG,
   SURVEY_DEGRADATION_LABEL,
+  SURVEY_NOTES,
   SURVEY_PHASE_LABEL,
   SURVEY_TRIGGER_LABEL
 } from "@@/constants/opencr"
@@ -43,6 +46,19 @@ function duration(row: any) {
   if (seconds < 60) return `${seconds} 秒`
   if (seconds < 3600) return `${Math.floor(seconds / 60)} 分 ${seconds % 60} 秒`
   return `${Math.floor(seconds / 3600)} 时 ${Math.floor((seconds % 3600) / 60)} 分`
+}
+
+/**
+ * 列表里的 codegraph 摘要：发现里有几条线索来自 codegraph，以及跨仓库连接数。
+ * 旧运行没有快照显示「—」，未启用显示「未启用」——两者都不能显示成 0。
+ */
+function codegraphSummary(row: any) {
+  const run = row as SurveyRun
+  const stats = run.codegraph_stats
+  if (!stats) return "—"
+  if (stats.status !== "enabled") return CODEGRAPH_STATUS_LABEL[stats.status]
+  const counts = run.clue_counts
+  return `发现 ${counts?.codegraph ?? 0}/${namedClueTotal(counts)} · 连接 ${stats.cross_repo.links}`
 }
 
 function open(row: any) {
@@ -107,6 +123,13 @@ onMounted(load)
               </el-tag>
             </el-tooltip>
             <span v-if="!row.degradations.length" class="sub">—</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="codegraph" min-width="150">
+          <template #default="{ row }">
+            <el-tooltip :content="SURVEY_NOTES.runListCodegraph">
+              <span :class="{ sub: row.codegraph_stats?.status !== 'enabled' }">{{ codegraphSummary(row) }}</span>
+            </el-tooltip>
           </template>
         </el-table-column>
         <el-table-column label="触发" width="100">

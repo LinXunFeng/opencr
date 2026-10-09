@@ -208,8 +208,9 @@ class ProfileExtractionTests(unittest.TestCase):
             {"path": "/api/a", "file": "client.go", "line": 3},
         ]
         routes = [{"path": "/api/a", "file": "main.go"}]
-        kept = _drop_route_registrations(calls, routes)
+        kept, dropped = _drop_route_registrations(calls, routes)
         self.assertEqual([c["file"] for c in kept], ["client.go"])
+        self.assertEqual([c["file"] for c in dropped], ["main.go"])
 
     def test_api_calls_are_extracted_from_source(self):
         """codegraph 完全不捕获调用侧的 URL 字面量，这一半必须我们自己抽（ADR-0003）。"""
@@ -677,8 +678,9 @@ class ReachTests(unittest.TestCase):
         root = Path(tempfile.mkdtemp(prefix="opencr-reach-cap-"))
         self.addCleanup(shutil.rmtree, root, True)
         with mock.patch.object(profile_mod, "extract_api_calls", return_value=calls), \
-                mock.patch.object(profile_mod, "codegraph_available", return_value=True), \
-                mock.patch.object(profile_mod, "build_index", return_value=root / "codegraph.db"), \
+                mock.patch.object(profile_mod, "codegraph_status", return_value="enabled"), \
+                mock.patch.object(profile_mod, "build_index",
+                                  return_value=profile_mod.IndexOutcome(root / "codegraph.db", "init", 0)), \
                 mock.patch.object(profile_mod, "_extract_routes", return_value=routes), \
                 mock.patch.object(profile_mod, "_extract_types", return_value=[]), \
                 mock.patch.object(profile_mod, "_extract_languages", return_value={}):

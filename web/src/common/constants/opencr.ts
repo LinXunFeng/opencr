@@ -211,6 +211,79 @@ export const PROFILE_KIND_LABEL: Record<string, string> = {
   manifest: "依赖清单级（退化）"
 }
 
+export const INDEX_MODE_LABEL: Record<string, string> = {
+  sync: "增量更新",
+  init: "全量重建",
+  failed: "失败"
+}
+
+export const INDEX_MODE_TAG: Record<string, TagType> = {
+  sync: "success",
+  init: "primary",
+  failed: "danger"
+}
+
+/** 线索来源：这个位置是画像的哪一部分指给模型的 */
+export const CLUE_SOURCE_LABEL: Record<string, string> = {
+  codegraph: "codegraph",
+  baseline: "基础画像",
+  unlisted: "画像外",
+  recheck: "台账复核",
+  unknown: "无记录"
+}
+
+export const CLUE_SOURCE_TAG: Record<string, TagType> = {
+  codegraph: "success",
+  baseline: "info",
+  unlisted: "warning",
+  recheck: "primary",
+  unknown: "info"
+}
+
+/** 线索来源计数的全部键，unknown 放最后：它只在有旧数据时才有值 */
+export const CLUE_KEYS = ["codegraph", "baseline", "unlisted", "recheck", "unknown"] as const
+
+/** 位置由本轮画像指给 L1 的三类：codegraph 占比只在这个范围里算 */
+const NAMED_CLUE_KEYS = ["codegraph", "baseline", "unlisted"] as const
+
+/**
+ * L1 本轮点名的条目数，即 codegraph 占比的分母。
+ * 台账复核与旧数据不算进来：复核的位置来自上一轮的发现，算进分母会让台账越大、codegraph 占比越被稀释
+ */
+export function namedClueTotal(counts?: Partial<Record<typeof CLUE_KEYS[number], number>> | null) {
+  return NAMED_CLUE_KEYS.reduce((sum, key) => sum + (counts?.[key] ?? 0), 0)
+}
+
+/** 一次运行里 codegraph 的状态（codegraph_stats.status） */
+export const CODEGRAPH_STATUS_LABEL: Record<string, string> = {
+  enabled: "本轮已启用",
+  disabled: "本轮未启用",
+  missing: "找不到可执行文件"
+}
+
+export const CODEGRAPH_STATUS_TAG: Record<string, TagType> = {
+  enabled: "success",
+  disabled: "info",
+  missing: "danger"
+}
+
+/**
+ * codegraph 不可用时的说明。两种原因都会让画像退化，但只有「配置关闭」能拿来做对照。
+ * 与 backend/survey/report.py 的 CODEGRAPH_UNAVAILABLE_LABELS 逐字一致，改一边要同步另一边。
+ */
+export const CODEGRAPH_UNAVAILABLE_LABEL: Record<string, string> = {
+  disabled: "本轮未启用 codegraph（配置关闭），画像均为依赖清单级。可以与启用时的运行对比这里的数字，看 codegraph 带来的差别。",
+  missing: "codegraph 已启用但找不到可执行文件，画像均退化为依赖清单级——这是部署故障，不是有意关闭，不要拿这一轮做对照。"
+}
+
+export const CLUE_SOURCE_DESC: Record<string, string> = {
+  codegraph: "只有 codegraph 抽出的接口、处理函数或类型里出现过这个文件",
+  baseline: "不靠 codegraph 也能看到：接口调用侧、依赖清单或仓库顶层文件",
+  unlisted: "画像里没出现过这个文件，是模型从目录结构推断出来的",
+  recheck: "本轮 L1 没有点名这个文件，是因为台账里它还有「存在」的问题才被复核",
+  unknown: "没有记录线索来源：该功能上线前产出的发现，或没有走到标注这一步的关注点"
+}
+
 /**
  * 巡检降级的解释文案。
  *
@@ -268,6 +341,23 @@ export const SURVEY_NOTES = {
     "台账里的「本轮未发现」只说明这一轮取证过所在文件、模型没有再报出它，不说明问题已修复。每轮都会优先复核仍为「存在」的问题；没有得出可信结论的文件（没轮到复核、文件超出读取上限只看了片段、源码读取或模型输出失败）保持原状态，不会被标记。",
   pushOnlyLatest:
     "推送的内容永远是台账的当前状态，因此只能以该巡检最近一次成功的运行发起推送。推送失败不影响运行本身的状态。",
+  clueSource:
+    "线索来源只说明这个位置是画像的哪一部分指给模型的，不是因果归因：没有 codegraph 时，模型也可能凭目录名猜到同一个文件。两边都能看到的位置记为基础画像，宁可低估 codegraph 的收益也不高估。台账复核的文件不是画像指出来的，单独计数，也不算进 codegraph 占比的分母。要量化因果，请对同一批提交分别开关 codegraph 各跑几轮比对。",
+  crossRepoNeedsRoutes:
+    "跨仓库连接、方法不一致、无人调用的接口都以 codegraph 抽出的接口为一端，未启用时这三项必然为 0；此时调用侧的路径只能全部算作「范围内无人提供」。",
+  focusClueRow: "关注点（L1 点名与台账复核）",
+  findingClueRow: "发现（L2 取证后入库）",
+  indexFailedFallback: "建索引失败",
+  codegraphNoRecord:
+    "这次运行没有 codegraph 记录（该功能上线前的运行，或运行在建画像之前就已结束）。",
+  focusNotReached:
+    "本轮未走到整合分析这一步",
+  droppedRegistrations:
+    "调用侧扫描会把路由注册那一行也当成调用，codegraph 抽出接口后才能剔除，否则每个后端都像在调用自己。",
+  runListCodegraph:
+    "发现：线索来自 codegraph 的条数 / L1 点名产出的发现（不含台账复核）；连接：跨仓库接口连接数。",
+  emptyExtraction:
+    "建成了索引，但没有抽出任何接口与类型：可能是 codegraph 不支持该仓库的语言，也可能仓库里本来就没有。",
   workspaceKept:
     "删除巡检不会连带删除本地工作区——那可能是几十 GB 代码，且删除不可逆。工作区清理是单独的动作。"
 }

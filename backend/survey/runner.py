@@ -12,6 +12,7 @@ from typing import Dict, List, Optional, Tuple
 from ..review.skills import load_available_review_skills
 from ..storage import repo
 from ..storage.models import (
+    CODEGRAPH_ENABLED,
     DEGRADE_BUDGET_EXHAUSTED,
     DEGRADE_INDEX_FAILED,
     DEGRADE_PROFILE_FALLBACK,
@@ -34,13 +35,15 @@ from ..storage.models import (
     SURVEY_PHASE_SUMMARIZING,
 )
 from .analysis import (
-    Budget, inspect_focus, l1_repo_budget, load_skill_prompt, match_skills, merge_focuses, plan_focus, summarize,
+    Budget, focus_key, inspect_focus, l1_repo_budget, load_skill_prompt, match_skills, merge_focuses, plan_focus,
+    summarize,
 )
+from .clues import annotate_focuses, summarize_codegraph
 from .common import SurveyError, finding_fingerprint
 from .config import load_max_repos, load_survey_config, resolve_budget
 from .crossrepo import build_cross_repo_map, render_cross_repo_map
 from .ledger import plan_rechecks, update_ledger_for_run
-from .profile import build_profile, codegraph_available, save_profile
+from .profile import build_profile, codegraph_status, save_profile
 from .reach import collect_reach
 from .push import PushRejected, begin_pushes, execute_pushes
 from .sources import resolve_sources
@@ -74,7 +77,9 @@ def _prepare_workspaces(
     """
     prepared: List[dict] = []
     artifacts = artifacts_dir(survey["slug"])
-    codegraph_ok = codegraph_available()
+    # 整轮只查一次，并传给每个仓库的画像：状态要在快照、降级与仓库状态之间保持一致
+    run_codegraph_status = codegraph_status()
+    codegraph_ok = run_codegraph_status == CODEGRAPH_ENABLED
     if not codegraph_ok:
         # 画像退化成 manifest 级，L1 只知道有哪些文件、不知道有哪些接口与类型。
         # 巡检照常完成，但这是实打实的产出质量损失，必须让看报告的人知道。
@@ -107,19 +112,28 @@ def _prepare_workspaces(
             continue
 
         repo.update_survey_progress(run_uid, phase=SURVEY_PHASE_PROFILING, repos_done=index)
-        profile = build_profile(slug, repo_dir, index_timeout=budget_cfg["index_timeout_seconds"])
+        profile = build_profile(
+            slug, repo_dir, index_timeout=budget_cfg["index_timeout_seconds"], status=run_codegraph_status
+        )
         status = REPO_OK
+        index_error = ""
         if codegraph_ok and profile["kind"] == PROFILE_MANIFEST:
             # codegraph 装着但这个仓库没建成索引，是单仓库级别的问题。
             # 状态单独记成 index_failed 而不是 ok：它不影响台账判定（那只看文件是否被取证过），
             # 但运行详情里要能看出这个仓库的画像退化了、L1 的点名可能选偏。
             repo.add_survey_degradation(run_uid, DEGRADE_INDEX_FAILED)
             status = REPO_INDEX_FAILED
+            index_error = (profile.get("index") or {}).get("error", "")
         save_profile(artifacts, profile)
 
+        has_structure = profile["kind"] != PROFILE_MANIFEST
         repo.record_survey_repo(
             run_uid, slug, target["url"], branch, sha, status,
             profile_kind=profile["kind"], file_count=count_files(repo_dir),
+            error_message=index_error, index=profile.get("index"),
+            # 只有结构图画像才有"抽出了几条"可言；退化画像留 NULL，与"抽出 0 条"区分开
+            route_count=len(profile["routes"]) if has_structure else None,
+            type_count=len(profile["types"]) if has_structure else None,
         )
         prepared.append({"slug": slug, "dir": repo_dir, "profile": profile})
 
@@ -162,6 +176,9 @@ def _collect_findings(
             # 它记为没有结论，名下的台账行保持原状态，不会被错标成本轮未发现
             logger.warning("Focus inspection failed (%s/%s): %s", focus["repo_slug"], focus["file_path"], e)
             continue
+        for item in items:
+            # Finding 继承关注点的线索来源：L2 只读这一个文件，位置是关注点指过来的
+            item["clue_source"] = focus.get("clue_source", "")
         findings.extend(items)
         record["conclusive"] = conclusive
 
@@ -238,6 +255,7 @@ def execute_survey_run(survey_uid: str, trigger: str) -> Optional[str]:
         profiles = [item["profile"] for item in prepared]
         cross_map = build_cross_repo_map(profiles)
         _record_reach(run_uid, prepared, cross_map, budget)
+        _record_codegraph_stats(run_uid, profiles, cross_map)
 
         repo.update_survey_progress(run_uid, phase=SURVEY_PHASE_MATCHING_SKILL)
         candidates = _candidate_skills(survey, cfg.get("skills_dir", ""))
@@ -261,6 +279,9 @@ def execute_survey_run(survey_uid: str, trigger: str) -> Optional[str]:
             ignored={item["fingerprint"] for item in repo.list_survey_ignores(survey_uid)},
         )
         focuses = merge_focuses(rechecks, planned, pending)
+        # 在合并之后标注：合并会把 L1 与复核对同一文件的点名并成一条，标注要落在实际取证的那一条上
+        annotate_focuses(focuses, profiles, named_by_l1={focus_key(f) for f in planned})
+        _record_codegraph_stats(run_uid, profiles, cross_map, focuses)
 
         repo.update_survey_progress(run_uid, phase=SURVEY_PHASE_INSPECTING)
         raw_findings, inspected = _collect_findings(focuses, prepared, skill_prompt, budget, run_uid)
@@ -293,6 +314,22 @@ def execute_survey_run(survey_uid: str, trigger: str) -> Optional[str]:
     if succeeded:
         _publish(run_uid)
     return run_uid
+
+
+def _record_codegraph_stats(
+    run_uid: str, profiles: List[dict], cross_map: dict, focuses: Optional[List[dict]] = None
+) -> None:
+    """
+    落库 codegraph 快照。L1 前后各写一次：L1 调用失败时，画像与跨仓库事实仍然能在页面上看到。
+
+    写入失败只记日志 —— 这份快照是观测数据，丢了它不影响任何一条 Finding。
+    """
+    try:
+        repo.set_survey_codegraph_stats(
+            run_uid, summarize_codegraph(profiles, cross_map, focuses)
+        )
+    except Exception:
+        logger.warning("Recording codegraph stats failed: run=%s", run_uid, exc_info=True)
 
 
 def _publish(run_uid: str) -> None:

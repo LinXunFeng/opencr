@@ -335,6 +335,16 @@ def normalize_file_path(raw) -> str:
     return "" if path in ("", ".") else path
 
 
+def focus_key(focus: dict) -> Tuple[str, str]:
+    """
+    关注点的文件身份：(仓库, 规整后的路径)。
+
+    合并取证顺序（merge_focuses）与判定"这个文件是不是 L1 点名的"（clues.annotate_focuses）
+    必须用同一个身份：两边口径不一，L1 点名的文件就会被误记成台账复核。
+    """
+    return (focus.get("repo_slug", ""), normalize_file_path(focus.get("file_path", "")))
+
+
 def _read_focus_source(
     repo_dir: Path, file_path: str, max_chars: int, anchor_lines: Optional[List[int]] = None
 ) -> Optional[FocusSource]:
@@ -382,13 +392,9 @@ def merge_focuses(rechecks: List[dict], planned: List[dict], pending: Dict[Tuple
     - 两边交替排列：预算按墙钟计，撞顶时排在后面的整批落空，
       全放前面会让台账大的巡检永远发现不了新问题，全放后面则复核形同虚设。
     """
-    def file_key(item: dict) -> Tuple[str, str]:
-        """比对用的文件身份。"""
-        return (item["repo_slug"], normalize_file_path(item["file_path"]))
-
     planned_by_file: Dict[Tuple[str, str], dict] = {}
     for focus in planned:
-        key = file_key(focus)
+        key = focus_key(focus)
         current = planned_by_file.get(key)
         if current is None:
             planned_by_file[key] = {**focus, "reason": _tagged_reason(focus)}
@@ -396,12 +402,12 @@ def merge_focuses(rechecks: List[dict], planned: List[dict], pending: Dict[Tuple
             # L1 常对同一文件按不同类别点名多次，只取第一条会让其余怀疑永远进不了 L2，
             # 文件却被判成有结论，漏查的那几类看起来就像"看过、没有问题"
             current["reason"] = f"{current['reason']}\n{_tagged_reason(focus)}"
-    pending_by_file = {file_key(item): item for item in pending.values()}
+    pending_by_file = {focus_key(item): item for item in pending.values()}
 
     recheck_items: List[dict] = []
     recheck_keys = set()
     for item in rechecks:
-        key = file_key(item)
+        key = focus_key(item)
         recheck_keys.add(key)
         twin = planned_by_file.get(key) or {}
         fallback_category = item["previous"][0]["category"] if item["previous"] else ""
