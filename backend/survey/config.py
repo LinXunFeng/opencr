@@ -55,19 +55,30 @@ def _pick_with_env(config_data: dict, path: str, env_name: str) -> str:
     return env_value or _pick_config_value(config_data, path)
 
 
+def _pick_int_with_env(config_data: dict, default: int, path: str, env_name: str) -> int:
+    """同 _pick_with_env，取值为整数；未设置或不是整数时取 default。"""
+    raw = _pick_with_env(config_data, path, env_name)
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        # 写错的值退回默认而不是让服务起不来：巡检开关不该拖垮 MR 审查。
+        # 代价是错误被静默吞掉，因此留一条日志，排查"为什么间隔不是我配的值"时有据可查。
+        logger.warning("Invalid integer for %s / %s: %r, using default %s", path, env_name, raw, default)
+        return default
+
+
 def load_survey_config() -> dict:
     """读取巡检配置。"""
     config_data = load_file_config()
 
     enabled_raw = _pick_with_env(config_data, "survey.enabled", "OPENCR_SURVEY_ENABLED")
     workspace_dir = _pick_with_env(config_data, "survey.workspace_dir", "OPENCR_SURVEY_WORKSPACE_DIR")
-    scheduler_interval_raw = _pick_with_env(
-        config_data, "survey.scheduler_interval_seconds", "OPENCR_SURVEY_SCHEDULER_INTERVAL_SECONDS"
+    scheduler_interval = _pick_int_with_env(
+        config_data, DEFAULT_SCHEDULER_INTERVAL_SECONDS,
+        "survey.scheduler_interval_seconds", "OPENCR_SURVEY_SCHEDULER_INTERVAL_SECONDS",
     )
-    try:
-        scheduler_interval = int(scheduler_interval_raw) if scheduler_interval_raw else DEFAULT_SCHEDULER_INTERVAL_SECONDS
-    except ValueError:
-        scheduler_interval = DEFAULT_SCHEDULER_INTERVAL_SECONDS
     codegraph_enabled_raw = _pick_with_env(
         config_data, "survey.codegraph_enabled", "OPENCR_SURVEY_CODEGRAPH_ENABLED"
     )

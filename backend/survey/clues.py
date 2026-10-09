@@ -148,7 +148,6 @@ def summarize_codegraph(
     cross_map = cross_map or {}
     return {
         "status": status,
-        "available": status == CODEGRAPH_ENABLED,
         "repos_total": len(profiles or []),
         "repos_structured": len(structured),
         # 索引建成了却一条路由、一个类型都没抽出来：可能是 codegraph 不支持该仓库的语言，

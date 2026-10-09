@@ -73,9 +73,10 @@ CLUE_LABELS: Dict[str, str] = {
     CLUE_UNKNOWN: "无记录",
 }
 
+# 与 opencr.ts 的 CODEGRAPH_UNAVAILABLE_LABEL 逐字一致
 CODEGRAPH_UNAVAILABLE_LABELS: Dict[str, str] = {
-    CODEGRAPH_DISABLED: "本次运行未启用 codegraph（配置关闭），画像均为依赖清单级。",
-    CODEGRAPH_MISSING: "codegraph 已启用但找不到可执行文件，画像均退化为依赖清单级——这是部署故障，不是有意关闭。",
+    CODEGRAPH_DISABLED: "本轮未启用 codegraph（配置关闭），画像均为依赖清单级。可以与启用时的运行对比这里的数字，看 codegraph 带来的差别。",
+    CODEGRAPH_MISSING: "codegraph 已启用但找不到可执行文件，画像均退化为依赖清单级——这是部署故障，不是有意关闭，不要拿这一轮做对照。",
 }
 
 _SEVERITY_ORDER = [SEVERITY_CRITICAL, SEVERITY_WARNING, SEVERITY_ADVICE, SEVERITY_UNKNOWN]
@@ -153,12 +154,14 @@ def _render_codegraph(detail: dict) -> List[str]:
     if not stats:
         return []
     lines: List[str] = ["## codegraph", ""]
-    if not stats.get("available"):
-        lines.extend([CODEGRAPH_UNAVAILABLE_LABELS.get(stats.get("status"), CODEGRAPH_UNAVAILABLE_LABELS[CODEGRAPH_DISABLED]), ""])
+    if stats.get("status") in CODEGRAPH_UNAVAILABLE_LABELS:
+        lines.extend([CODEGRAPH_UNAVAILABLE_LABELS[stats["status"]], ""])
 
+    # 与报告页一致：只在确有抽取为空的仓库时才提，0 个时这句话只是噪音
+    empty = stats.get("repos_empty") or 0
+    empty_note = f"（其中抽取为空 {empty} 个）" if empty else ""
     lines.append(
-        f"- 产出：结构图画像的仓库 {stats.get('repos_structured', 0)} / {stats.get('repos_total', 0)}"
-        f"（其中抽取为空 {stats.get('repos_empty', 0)} 个），"
+        f"- 产出：结构图画像的仓库 {stats.get('repos_structured', 0)} / {stats.get('repos_total', 0)}{empty_note}，"
         f"接口 {stats.get('routes', 0)} 个，类型 {stats.get('types', 0)} 个；"
         f"剔除被误认为调用的路由注册 {stats.get('dropped_registrations', 0)} 条。"
     )

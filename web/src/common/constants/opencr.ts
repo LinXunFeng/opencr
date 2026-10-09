@@ -246,15 +246,7 @@ export function sumClueCounts(counts?: Partial<Record<typeof CLUE_KEYS[number], 
   return CLUE_KEYS.reduce((sum, key) => sum + (counts?.[key] ?? 0), 0)
 }
 
-/**
- * 一次运行里 codegraph 的状态（codegraph_stats.status）。
- * 早期快照没有 status 字段，按 available 推断，不可用时一律当作「配置关闭」，不误报成部署故障。
- */
-export function codegraphStatusOf(stats: { status?: string, available: boolean }) {
-  if (stats.available) return "enabled"
-  return stats.status === "missing" ? "missing" : "disabled"
-}
-
+/** 一次运行里 codegraph 的状态（codegraph_stats.status） */
 export const CODEGRAPH_STATUS_LABEL: Record<string, string> = {
   enabled: "本轮已启用",
   disabled: "本轮未启用",
@@ -267,9 +259,12 @@ export const CODEGRAPH_STATUS_TAG: Record<string, TagType> = {
   missing: "danger"
 }
 
-/** codegraph 不可用时的说明。两种原因都会让画像退化，但只有「配置关闭」能拿来做对照 */
+/**
+ * codegraph 不可用时的说明。两种原因都会让画像退化，但只有「配置关闭」能拿来做对照。
+ * 与 backend/survey/report.py 的 CODEGRAPH_UNAVAILABLE_LABELS 逐字一致，改一边要同步另一边。
+ */
 export const CODEGRAPH_UNAVAILABLE_LABEL: Record<string, string> = {
-  disabled: "本轮未启用 codegraph（配置关闭），画像均为依赖清单级。可以与启用时的运行对比下面的数字，看 codegraph 带来的差别。",
+  disabled: "本轮未启用 codegraph（配置关闭），画像均为依赖清单级。可以与启用时的运行对比这里的数字，看 codegraph 带来的差别。",
   missing: "codegraph 已启用但找不到可执行文件，画像均退化为依赖清单级——这是部署故障，不是有意关闭，不要拿这一轮做对照。"
 }
 

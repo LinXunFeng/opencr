@@ -104,7 +104,7 @@ class CodegraphSummaryTests(unittest.TestCase):
         focuses = [{"clue_source": "codegraph"}, {"clue_source": "baseline"}, {"clue_source": "codegraph"}]
         stats = summarize_codegraph([_profile()], cross_map, focuses)
 
-        self.assertTrue(stats["available"])
+        self.assertEqual(stats["status"], "enabled")
         self.assertEqual((stats["routes"], stats["types"]), (1, 1))
         self.assertEqual(stats["dropped_registrations"], 2)
         self.assertEqual(stats["cross_repo"], {"links": 2, "method_mismatch": 1, "orphan_calls": 0, "unused_routes": 1})
@@ -131,12 +131,11 @@ class CodegraphSummaryTests(unittest.TestCase):
         degraded = _profile(kind="manifest", routes=[], types=[], index=None, dropped_calls=[],
                             codegraph_status="disabled")
         stats = summarize_codegraph([degraded], {})
-        self.assertFalse(stats["available"])
         self.assertEqual(stats["status"], "disabled")
         self.assertEqual((stats["repos_structured"], stats["repos_empty"]), (0, 0))
         # 索引失败的仓库画像也退化成清单级，但 codegraph 本身是启用的
         failed = _profile(kind="manifest", routes=[], types=[], index={"mode": "failed", "elapsed_ms": 5})
-        self.assertTrue(summarize_codegraph([failed], {})["available"])
+        self.assertEqual(summarize_codegraph([failed], {})["status"], "enabled")
 
     def test_missing_binary_is_told_apart_from_switched_off(self):
         """对照实验关掉 codegraph 与部署装坏了都会退化，但只有前者能拿来比。"""
@@ -144,7 +143,7 @@ class CodegraphSummaryTests(unittest.TestCase):
 
         missing = _profile(kind="manifest", routes=[], types=[], index=None, codegraph_status="missing")
         stats = summarize_codegraph([missing], {})
-        self.assertEqual((stats["status"], stats["available"]), ("missing", False))
+        self.assertEqual(stats["status"], "missing")
 
     def test_profile_status_reflects_config_and_binary(self):
         from backend.survey import profile
@@ -314,6 +313,15 @@ class SurveyConfigEnvOverrideTests(unittest.TestCase):
         self.assertFalse(resolved["codegraph_enabled"])
         self.assertEqual(resolved["scheduler_interval_seconds"], 90)
 
+    def test_invalid_interval_falls_back_to_default_with_a_warning(self):
+        """写错的值不能让服务起不来，但也不能悄无声息：要留日志。"""
+        from backend.survey.config import DEFAULT_SCHEDULER_INTERVAL_SECONDS
+
+        with self.assertLogs("backend.survey.config", level="WARNING") as logs:
+            resolved = self._load({}, {"OPENCR_SURVEY_SCHEDULER_INTERVAL_SECONDS": "5m"})
+        self.assertEqual(resolved["scheduler_interval_seconds"], DEFAULT_SCHEDULER_INTERVAL_SECONDS)
+        self.assertTrue(any("5m" in line for line in logs.output))
+
     def test_disabled_codegraph_via_env_is_not_available(self):
         from backend.survey import config, profile
 
@@ -387,9 +395,9 @@ class CodegraphStorageTests(unittest.TestCase):
 
         self.repo.finish_survey_run(old_run, RUN_SUCCEEDED)
         run_uid = self._start()
-        self.repo.set_survey_codegraph_stats(run_uid, {"available": True, "focus": None})
+        self.repo.set_survey_codegraph_stats(run_uid, {"status": "enabled", "focus": None})
         self.assertEqual(self.repo.get_survey_run_detail(run_uid)["codegraph_stats"],
-                         {"available": True, "focus": None})
+                         {"status": "enabled", "focus": None})
 
     def test_clue_counts_exclude_ignored_findings_and_separate_old_rows(self):
         run_uid = self._start()
@@ -438,14 +446,14 @@ class CodegraphStorageTests(unittest.TestCase):
             error_message="exit=2 boom", index={"mode": "failed", "elapsed_ms": 10},
         )
         self.repo.set_survey_codegraph_stats(run_uid, {
-            "status": "enabled", "available": True, "repos_total": 2, "repos_structured": 1,
+            "status": "enabled", "repos_total": 2, "repos_structured": 1,
             "repos_empty": 0, "routes": 3, "types": 4, "dropped_registrations": 1,
             "cross_repo": {"links": 2, "method_mismatch": 0, "orphan_calls": 5, "unused_routes": 1},
             "focus": {"codegraph": 3, "baseline": 1, "unlisted": 0},
         })
         markdown = render_run_markdown(self.repo.get_survey_run_detail(run_uid))
         self.assertIn("## codegraph", markdown)
-        self.assertIn("结构图画像的仓库 1 / 2（其中抽取为空 0 个），接口 3 个，类型 4 个", markdown)
+        self.assertIn("结构图画像的仓库 1 / 2，接口 3 个，类型 4 个", markdown)
         self.assertIn("| api | 全量重建 | 1.5s | 3 | 4 | - |", markdown)
         self.assertIn("| web | 失败 | 0.0s | - | - | exit=2 boom |", markdown)
         self.assertIn("接口连接 2 处", markdown)
@@ -471,12 +479,26 @@ class CodegraphStorageTests(unittest.TestCase):
         from backend.survey.report import render_run_markdown
 
         run_uid = self._start()
-        base = {"available": False, "cross_repo": {}, "focus": None}
+        base = {"cross_repo": {}, "focus": None}
         self.repo.set_survey_codegraph_stats(run_uid, {**base, "status": "missing"})
-        self.assertIn("找不到可执行文件", render_run_markdown(self.repo.get_survey_run_detail(run_uid)))
-        # 早于 status 字段的快照按"未启用"渲染，不会误报成部署故障
-        self.repo.set_survey_codegraph_stats(run_uid, base)
-        self.assertIn("未启用 codegraph", render_run_markdown(self.repo.get_survey_run_detail(run_uid)))
+        missing = render_run_markdown(self.repo.get_survey_run_detail(run_uid))
+        self.assertIn("找不到可执行文件", missing)
+        self.assertNotIn("配置关闭", missing)
+        self.repo.set_survey_codegraph_stats(run_uid, {**base, "status": "disabled"})
+        disabled = render_run_markdown(self.repo.get_survey_run_detail(run_uid))
+        self.assertIn("未启用 codegraph（配置关闭）", disabled)
+        self.assertNotIn("找不到可执行文件", disabled)
+
+    def test_markdown_mentions_empty_extraction_only_when_there_is_some(self):
+        """与报告页一致：为 0 时不提，否则未启用的运行也会读到一句多余的"其中抽取为空 0 个"。"""
+        from backend.survey.report import render_run_markdown
+
+        run_uid = self._start()
+        base = {"status": "enabled", "repos_total": 2, "repos_structured": 2, "cross_repo": {}, "focus": None}
+        self.repo.set_survey_codegraph_stats(run_uid, {**base, "repos_empty": 0})
+        self.assertNotIn("抽取为空", render_run_markdown(self.repo.get_survey_run_detail(run_uid)))
+        self.repo.set_survey_codegraph_stats(run_uid, {**base, "repos_empty": 1})
+        self.assertIn("2 / 2（其中抽取为空 1 个）", render_run_markdown(self.repo.get_survey_run_detail(run_uid)))
 
 
 if __name__ == "__main__":

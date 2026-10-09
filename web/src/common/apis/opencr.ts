@@ -233,10 +233,8 @@ export interface ClueCounts {
 
 /** codegraph 本轮的产出与去向，运行级快照 */
 export interface CodegraphStats {
-  /** enabled / disabled（配置关闭）/ missing（开着但找不到可执行文件）；早期快照没有这个字段 */
-  status?: "enabled" | "disabled" | "missing"
-  /** 本轮建画像时 codegraph 是否可用 */
-  available: boolean
+  /** 本轮建画像时 codegraph 的状态：enabled / disabled（配置关闭）/ missing（开着但找不到可执行文件） */
+  status: "enabled" | "disabled" | "missing"
   repos_total: number
   /** 画像来自 codegraph 的仓库数 */
   repos_structured: number

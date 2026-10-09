@@ -3,7 +3,6 @@ import type { SurveyRun } from "@@/apis/opencr"
 import { getSurveyRunsApi, getSurveysApi } from "@@/apis/opencr"
 import {
   CODEGRAPH_STATUS_LABEL,
-  codegraphStatusOf,
   RUN_STATUS_LABEL,
   RUN_STATUS_TAG,
   sumClueCounts,
@@ -57,7 +56,7 @@ function codegraphSummary(row: any) {
   const run = row as SurveyRun
   const stats = run.codegraph_stats
   if (!stats) return "—"
-  if (!stats.available) return CODEGRAPH_STATUS_LABEL[codegraphStatusOf(stats)]
+  if (stats.status !== "enabled") return CODEGRAPH_STATUS_LABEL[stats.status]
   const counts = run.clue_counts
   return `发现 ${counts?.codegraph ?? 0}/${sumClueCounts(counts)} · 连接 ${stats.cross_repo.links}`
 }
@@ -129,7 +128,7 @@ onMounted(load)
         <el-table-column label="codegraph" min-width="150">
           <template #default="{ row }">
             <el-tooltip :content="SURVEY_NOTES.runListCodegraph">
-              <span :class="{ sub: !row.codegraph_stats?.available }">{{ codegraphSummary(row) }}</span>
+              <span :class="{ sub: row.codegraph_stats?.status !== 'enabled' }">{{ codegraphSummary(row) }}</span>
             </el-tooltip>
           </template>
         </el-table-column>

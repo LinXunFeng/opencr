@@ -8,7 +8,6 @@ import {
   CODEGRAPH_STATUS_LABEL,
   CODEGRAPH_STATUS_TAG,
   CODEGRAPH_UNAVAILABLE_LABEL,
-  codegraphStatusOf,
   INDEX_MODE_LABEL,
   INDEX_MODE_TAG,
   sumClueCounts,
@@ -28,7 +27,7 @@ const stats = computed(() => props.detail.codegraph_stats)
 const indexedRepos = computed(() => props.detail.repos.filter(r => r.index_mode))
 
 /** 本轮 codegraph 状态：enabled / disabled / missing，没有快照时为空串 */
-const status = computed(() => (stats.value ? codegraphStatusOf(stats.value) : ""))
+const status = computed(() => stats.value?.status ?? "")
 
 /** 要展示的线索来源标签：unknown 只在确有旧数据时出现，其余三类即使为 0 也展示 */
 function clueItems(counts: ClueCounts | null | undefined) {
