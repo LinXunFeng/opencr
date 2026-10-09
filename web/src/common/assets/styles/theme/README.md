@@ -5,13 +5,13 @@
 
 当前注册了五套：
 
-| class        | 菜单名 | 说明                                             |
-| ------------ | ------ | ------------------------------------------------ |
-| `normal`     | 默认   | 模板原样，深色侧边栏 + 纯白内容区，无额外样式    |
-| `dark`       | 黑暗   | 复用 Element Plus 自带的 dark 变量               |
-| `dark-blue`  | 深蓝   | 海军蓝，变量写在 `styles/element-plus.css`       |
-| `aurora`     | 极光   | 浅色，靛蓝主色，白色侧边栏                       |
-| `graphite`   | 石墨   | 深色，石墨灰 + 青色强调                          |
+| class       | 菜单名 | 说明                                          |
+| ----------- | ------ | --------------------------------------------- |
+| `normal`    | 默认   | 模板原样，深色侧边栏 + 纯白内容区，无额外样式 |
+| `dark`      | 黑暗   | 复用 Element Plus 自带的 dark 变量            |
+| `dark-blue` | 深蓝   | 海军蓝，变量写在 `styles/element-plus.css`    |
+| `aurora`    | 极光   | 浅色，靛蓝主色，白色侧边栏                    |
+| `graphite`  | 石墨   | 深色，石墨灰 + 青色强调                       |
 
 前三套是模板带来的，结构见 `core/`；后两套是本仓库新增的，走 `shared/polish.scss`
 这条路。两条路互不影响 —— 这是当初「新增皮肤而不是改默认样式」的前提。
@@ -73,7 +73,10 @@ export type ThemeName = DefaultThemeName | "dark" | "dark-blue" | "aurora" | "gr
 ```
 
 ```ts
-{ title: "海洋", name: "ocean" }
+const themeList: ThemeList[] = [
+  // ...已有主题
+  { title: "海洋", name: "ocean" }
+]
 ```
 
 类型不加，`vue-tsc` 会直接拒绝构建。
