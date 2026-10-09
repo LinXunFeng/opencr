@@ -174,6 +174,8 @@ class GoogleSheetDestination(Destination):
             )
         # 追加列要用数值 sheetId 而不是标题，由 _ensure_worksheet 填入
         self._sheet_id: Optional[int] = None
+        # 工作表上的 Google 表格对象（用户把区域「转换为表格」后才有），由 _ensure_worksheet 填入
+        self._table: Optional[dict] = None
 
     @property
     def auth(self) -> str:
@@ -235,7 +237,7 @@ class GoogleSheetDestination(Destination):
         try:
             meta = self._transport.call(
                 "spreadsheets.get",
-                {"spreadsheetId": spreadsheet, "fields": "properties.title,sheets.properties(sheetId,title)"},
+                {"spreadsheetId": spreadsheet, "fields": "properties.title,sheets(properties(sheetId,title),tables(tableId,range))"},
                 quick=True,
             )
         except AuthRejected as e:
@@ -248,14 +250,15 @@ class GoogleSheetDestination(Destination):
         items.append(CheckItem("读取表格", CHECK_OK, f"表格「{title}」可以访问"))
 
         worksheet = target["worksheet"]
-        titles = [(s.get("properties") or {}).get("title") for s in meta.get("sheets") or []]
-        if worksheet not in titles:
+        sheets = {(s.get("properties") or {}).get("title"): s for s in meta.get("sheets") or []}
+        if worksheet not in sheets:
             items.append(CheckItem("工作表", CHECK_WARN, f"工作表「{worksheet}」不存在，首次推送时会自动创建"))
         else:
             try:
+                header_row = _header_row(_pick_table(sheets[worksheet]))
                 data = self._transport.call(
                     "spreadsheets.values.get",
-                    {"spreadsheetId": spreadsheet, "range": quote_sheet_title(worksheet) + "!1:1"},
+                    {"spreadsheetId": spreadsheet, "range": f"{quote_sheet_title(worksheet)}!{header_row}:{header_row}"},
                     quick=True,
                 )
             except DestinationError as e:
@@ -319,7 +322,8 @@ class GoogleSheetDestination(Destination):
         sheet_ref = quote_sheet_title(worksheet)
 
         grid_columns = self._ensure_worksheet(spreadsheet_id, worksheet)
-        positions, new_headers = self._resolve_columns(spreadsheet_id, sheet_ref, columns)
+        header_row = _header_row(self._table)
+        positions, new_headers = self._resolve_columns(spreadsheet_id, sheet_ref, header_row, columns)
 
         needed = max(positions.values()) + 1
         if needed > grid_columns:
@@ -327,16 +331,18 @@ class GoogleSheetDestination(Destination):
             self._append_columns(spreadsheet_id, worksheet, needed - grid_columns)
         if new_headers:
             self._write_cells(spreadsheet_id, [
-                {"range": f"{sheet_ref}!{column_letter(index)}1", "values": [[header]]}
+                {"range": f"{sheet_ref}!{column_letter(index)}{header_row}", "values": [[header]]}
                 for index, header in new_headers
             ])
+        if self._table is not None:
+            self._cover_columns(spreadsheet_id, min(positions.values()), needed)
 
         key_column = columns[0]
         if key_column.header in {header for _, header in new_headers}:
             # 键列是刚补出来的，说明表里还没有任何台账行，不必再读
             existing: Dict[str, List[int]] = {}
         else:
-            existing = self._read_keys(spreadsheet_id, sheet_ref, positions[key_column.key])
+            existing = self._read_keys(spreadsheet_id, sheet_ref, header_row, positions[key_column.key])
 
         stats = PushStats()
         updates: List[dict] = []
@@ -360,18 +366,24 @@ class GoogleSheetDestination(Destination):
         if updates:
             self._write_cells(spreadsheet_id, updates)
         if appends:
-            self._append_rows(spreadsheet_id, sheet_ref, appends)
+            if self._table is not None:
+                self._append_table_rows(spreadsheet_id, appends)
+            else:
+                self._append_rows(spreadsheet_id, sheet_ref, appends)
         return stats
 
     def _ensure_worksheet(self, spreadsheet_id: str, worksheet: str) -> int:
-        """确保工作表存在，返回它当前的列数。"""
+        """确保工作表存在，返回它当前的列数；同时记下工作表上的表格对象（没有则为 None）。"""
         meta = self._transport.call(
-            "spreadsheets.get", {"spreadsheetId": spreadsheet_id, "fields": "sheets.properties(sheetId,title,gridProperties)"}
+            "spreadsheets.get",
+            {"spreadsheetId": spreadsheet_id, "fields": "sheets(properties(sheetId,title,gridProperties),tables(tableId,range))"},
         )
+        self._table = None
         for sheet in meta.get("sheets", []) or []:
             props = sheet.get("properties", {}) or {}
             if props.get("title") == worksheet:
                 self._sheet_id = props.get("sheetId")
+                self._table = _pick_table(sheet)
                 return int((props.get("gridProperties") or {}).get("columnCount") or 26)
 
         reply = self._transport.call(
@@ -393,15 +405,18 @@ class GoogleSheetDestination(Destination):
         )
 
     def _resolve_columns(
-        self, spreadsheet_id: str, sheet_ref: str, columns: List[Column]
+        self, spreadsheet_id: str, sheet_ref: str, header_row: int, columns: List[Column]
     ) -> Tuple[Dict[str, int], List[Tuple[int, str]]]:
         """
-        读表头，按名称定位每个系统列。
+        读第 header_row 行的表头，按名称定位每个系统列。
 
         返回 ({column.key: 列序号}, [(列序号, 需要补写的表头)])。
         缺失的系统列补在现有表头之后，不插到中间 —— 插列会挪动用户的人工列。
         """
-        data = self._transport.call("spreadsheets.values.get", {"spreadsheetId": spreadsheet_id, "range": sheet_ref + "!1:1"})
+        data = self._transport.call(
+            "spreadsheets.values.get",
+            {"spreadsheetId": spreadsheet_id, "range": f"{sheet_ref}!{header_row}:{header_row}"},
+        )
         header_row = [str(v).strip() for v in ((data.get("values") or [[]])[0] or [])]
 
         index_by_header: Dict[str, int] = {}
@@ -421,13 +436,16 @@ class GoogleSheetDestination(Destination):
                 next_index += 1
         return positions, new_headers
 
-    def _read_keys(self, spreadsheet_id: str, sheet_ref: str, key_index: int) -> Dict[str, List[int]]:
-        """读键列，返回 {键: [行号...]}。同一个键出现多行（用户复制过行）时每一行都更新。"""
+    def _read_keys(
+        self, spreadsheet_id: str, sheet_ref: str, header_row: int, key_index: int
+    ) -> Dict[str, List[int]]:
+        """读表头以下的键列，返回 {键: [行号...]}。同一个键出现多行（用户复制过行）时每一行都更新。"""
         letter = column_letter(key_index)
+        first_row = header_row + 1
         data = self._transport.call(
             "spreadsheets.values.get",
             {
-                "spreadsheetId": spreadsheet_id, "range": f"{sheet_ref}!{letter}2:{letter}",
+                "spreadsheetId": spreadsheet_id, "range": f"{sheet_ref}!{letter}{first_row}:{letter}",
                 "majorDimension": "ROWS", "valueRenderOption": "UNFORMATTED_VALUE",
             },
         )
@@ -435,7 +453,7 @@ class GoogleSheetDestination(Destination):
         for offset, cells in enumerate(data.get("values") or []):
             key = str(cells[0]).strip() if cells else ""
             if key:
-                keys.setdefault(key, []).append(offset + 2)
+                keys.setdefault(key, []).append(offset + first_row)
         return keys
 
     @staticmethod
@@ -490,6 +508,92 @@ class GoogleSheetDestination(Destination):
                 },
                 body={"majorDimension": "ROWS", "values": batch},
             )
+
+
+    def _cover_columns(self, spreadsheet_id: str, first: int, end: int) -> None:
+        """
+        把表格对象的列范围扩到至少覆盖 [first, end)。
+
+        补在表头末尾的系统列落在表格对象之外；不扩的话 appendCells 只写表格范围内的格子，
+        新追加的行在这些列上永远是空的。
+        """
+        grid = dict(self._table.get("range") or {})
+        start_col = int(grid.get("startColumnIndex") or 0)
+        end_col = int(grid.get("endColumnIndex") or 0)
+        if start_col <= first and end_col >= end:
+            return
+        grid["startColumnIndex"] = min(start_col, first)
+        grid["endColumnIndex"] = max(end_col, end)
+        self._transport.call(
+            "spreadsheets.batchUpdate", {"spreadsheetId": spreadsheet_id},
+            body={"requests": [{"updateTable": {
+                "table": {"tableId": self._table.get("tableId"), "range": grid}, "fields": "range",
+            }}]},
+        )
+        self._table = {**self._table, "range": grid}
+
+    def _append_table_rows(self, spreadsheet_id: str, rows: List[List[Any]]) -> None:
+        """
+        往表格对象的末尾追加行（rows 按工作表的绝对列序排列）。
+
+        values.append 认不出表格对象：实测会把新行插到工作表最顶上，把表头挤下去，
+        下一次推送在第 1 行找不到表头，就会整批补列、整批重复追加。
+        appendCells 带 tableId 是官方给表格对象追加行的方式，会填进表格里的空行或在页脚之前插行。
+
+        单元格一律写 stringValue / numberValue，与 RAW 等价：以 "=" 开头的正文不会被当成公式。
+        人工列写空的 CellData：新行本来就是空的，清一遍没有副作用。
+        """
+        grid = self._table.get("range") or {}
+        start_col = int(grid.get("startColumnIndex") or 0)
+        end_col = int(grid.get("endColumnIndex") or 0)
+        row_data = [
+            {"values": [_cell_data(row[i] if i < len(row) else None) for i in range(start_col, end_col)]}
+            for row in rows
+        ]
+        for batch in _chunks_by_size(row_data):
+            # 与 _append_rows 一样，5xx 后重试可能多出一行重复的键，下次推送两行都会被更新
+            self._transport.call(
+                "spreadsheets.batchUpdate", {"spreadsheetId": spreadsheet_id},
+                body={"requests": [{"appendCells": {
+                    "tableId": self._table.get("tableId"), "rows": batch, "fields": "userEnteredValue",
+                }}]},
+            )
+
+
+def _pick_table(sheet: dict) -> Optional[dict]:
+    """
+    取工作表上用作台账的表格对象，没有时返回 None。
+
+    一张台账工作表上通常至多一个表格对象；有多个时取最靠上的那个，台账表头在最上面。
+    """
+    tables = sheet.get("tables") or []
+    if not tables:
+        return None
+    return min(tables, key=lambda t: (
+        int((t.get("range") or {}).get("startRowIndex") or 0),
+        int((t.get("range") or {}).get("startColumnIndex") or 0),
+    ))
+
+
+def _header_row(table: Optional[dict]) -> int:
+    """
+    表头所在的行号（1 起始）。
+
+    普通区域固定在第 1 行；表格对象以它的首行为表头 —— 用户可能在表格上方插过行，
+    或者被旧版本的 values.append 挤下去过，这时第 1 行已经不是表头了。
+    """
+    if table is None:
+        return 1
+    return int((table.get("range") or {}).get("startRowIndex") or 0) + 1
+
+
+def _cell_data(value: Any) -> dict:
+    """把 _cell_value 的结果转成 appendCells 的 CellData；None 表示人工列，写空。"""
+    if value is None:
+        return {}
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return {"userEnteredValue": {"numberValue": value}}
+    return {"userEnteredValue": {"stringValue": str(value)}}
 
 
 def _range(sheet_ref: str, row_number: int, start: int, values: List[Any]) -> dict:

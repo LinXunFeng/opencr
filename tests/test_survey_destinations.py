@@ -755,6 +755,54 @@ class GoogleSheetTests(unittest.TestCase):
         dimension = session.requests[2]["json"]["requests"][0]["appendDimension"]
         self.assertEqual(dimension, {"sheetId": 42, "dimension": "COLUMNS", "length": 2})
 
+    def test_table_object_is_appended_with_append_cells(self):
+        """
+        用户把区域转换成了表格对象：values.append 认不出它，会把新行插到工作表顶上把表头挤下去。
+        这里表格对象从第 5 行开始（就是被挤下去之后的样子），表头、键列都要跟着它走，追加改用 appendCells。
+        """
+        table = {"tableId": "t1", "range": {"sheetId": 7, "startRowIndex": 4, "endRowIndex": 9,
+                                            "startColumnIndex": 0, "endColumnIndex": 4}}
+        destination, session, _ = self._destination([
+            _Response(payload={"sheets": [{
+                "properties": {"sheetId": 7, "title": "巡检", "gridProperties": {"columnCount": 26}},
+                "tables": [table],
+            }]}),
+            # A=键 B=处理人(人工) C=标题 D=状态；缺少"同类条数"
+            _Response(payload={"values": [["键", "处理人", "标题", "状态"]]}),
+            _Response(payload={}),  # 补表头
+            _Response(payload={}),  # updateTable 扩到 E 列
+            _Response(payload={"values": [["s:1"]]}),
+            _Response(payload={}),  # 批量更新
+            _Response(payload={}),  # appendCells
+        ])
+        stats = destination.push(self.TARGET, self._columns(), [self._row("s:1"), self._row("s:new", title="=1+1")])
+        self.assertEqual(stats.to_dict(), {"updated": 1, "inserted": 1, "skipped": 0})
+
+        self.assertTrue(session.requests[1]["url"].endswith("'巡检'!5:5"))
+        self.assertEqual(session.requests[2]["json"]["data"], [{"range": "'巡检'!E5", "values": [["同类条数"]]}])
+
+        update_table = session.requests[3]["json"]["requests"][0]["updateTable"]
+        self.assertEqual(update_table["fields"], "range")
+        self.assertEqual(update_table["table"]["range"]["endColumnIndex"], 5)
+
+        self.assertTrue(session.requests[4]["url"].endswith("'巡检'!A6:A"))
+        ranges = {d["range"] for d in session.requests[5]["json"]["data"]}
+        self.assertEqual(ranges, {"'巡检'!A6:A6", "'巡检'!C6:E6"})
+
+        append = session.requests[6]
+        self.assertTrue(append["url"].endswith(":batchUpdate"))
+        request = append["json"]["requests"][0]["appendCells"]
+        self.assertEqual(request["tableId"], "t1")
+        self.assertEqual(request["fields"], "userEnteredValue")
+        # 人工列写空 CellData；以 "=" 开头的标题写成 stringValue，不会被当成公式
+        self.assertEqual(request["rows"], [{"values": [
+            {"userEnteredValue": {"stringValue": "s:new"}},
+            {},
+            {"userEnteredValue": {"stringValue": "=1+1"}},
+            {"userEnteredValue": {"stringValue": "存在"}},
+            {"userEnteredValue": {"numberValue": 2}},
+        ]}])
+
     def test_rate_limit_is_retried_with_backoff(self):
         destination, session, sleeps = self._destination([
             _Response(status=429, payload={"error": {"message": "quota"}}, headers={"Retry-After": "3"}),
@@ -804,6 +852,20 @@ class GoogleSheetTests(unittest.TestCase):
             "properties": {"title": "质量台账"}, "fields": "title",
         }}])
         self.assertFalse(any("/values:" in r["url"] or ":append" in r["url"] for r in session.requests))
+
+    def test_check_reads_headers_from_table_object(self):
+        """表格对象不在第 1 行时，测试连通性也要读它的首行，否则会误报"没有任何系统列"。"""
+        destination, session, _ = self._destination([
+            _Response(payload={"properties": {"title": "质量台账"}, "sheets": [{
+                "properties": {"sheetId": 0, "title": "巡检"},
+                "tables": [{"tableId": "t1", "range": {"startRowIndex": 4, "endColumnIndex": 4}}],
+            }]}),
+            _Response(payload={"values": [["键", "标题", "状态", "同类条数"]]}),
+            _Response(payload={}),
+        ])
+        items = destination.check(self.TARGET, self._columns())
+        self.assertTrue(session.requests[1]["url"].endswith("'巡检'!5:5"))
+        self.assertIn("系统列齐全", items[2].message)
 
     def test_check_reports_missing_worksheet_as_warning(self):
         from backend.survey.destinations.base import CHECK_WARN
