@@ -5,22 +5,20 @@ Ledger（问题台账）：状态判定与镜像行的生成。
 Ledger 由系统持有、每个成功的 SurveyRun 结束后更新一次；Destination 上的表格只是它的镜像。
 为什么库里和表里各存一份，见 docs/adr/0004-survey-ledger-mirrored-to-destinations.md。
 
-判定逻辑全部是纯函数（plan_ledger_update / aggregate_findings / build_ledger_rows），
+判定逻辑全部是纯函数（plan_ledger_update / plan_rechecks / aggregate_findings / build_ledger_rows），
 不碰数据库也不碰网络，便于单测；update_ledger_for_run 只负责把它们和 repo 串起来。
 """
 
 import json
 import logging
 from datetime import datetime, timezone
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 from ..storage import repo
 from ..storage.models import (
-    DEGRADE_BUDGET_EXHAUSTED,
     LEDGER_IGNORED,
     LEDGER_PRESENT,
     LEDGER_UNSEEN,
-    REPO_OK,
     RUN_SUCCEEDED,
     SEVERITY_ADVICE,
     SEVERITY_CRITICAL,
@@ -124,37 +122,28 @@ def aggregate_findings(findings: Iterable[dict]) -> Dict[str, dict]:
     return result
 
 
-def conclusive_repos(repos: Iterable[dict], degradations: Iterable[dict]) -> set:
-    """
-    本轮结论可信、允许标记"本轮未发现"的仓库集合。
-
-    - 仓库拉取失败或建索引失败：该仓库不可信（index_failed 是偶发故障，这一轮的关注点选得不可靠）；
-    - 预算耗尽提前收工：整轮不可信，返回空集；
-    - codegraph 未启用导致画像退化（profile_fallback）**不算**：那是部署常态，
-      算进去会让没装 codegraph 的实例永远无法标记本轮未发现。
-    """
-    if any((d or {}).get("kind") == DEGRADE_BUDGET_EXHAUSTED for d in degradations or []):
-        return set()
-    return {r["repo_slug"] for r in repos or [] if r.get("status") == REPO_OK}
-
-
 def plan_ledger_update(
     existing: Dict[str, dict],
     aggregated: Dict[str, dict],
-    reliable_repos: set,
+    inspected: Set[Tuple[str, str]],
     ignored: set,
     first_seen_lookup: Dict[str, datetime],
     run_uid: str,
     now: datetime,
+    attempted: Optional[Set[Tuple[str, str]]] = None,
 ) -> List[dict]:
     """
     算出本轮要写入 Ledger 的变更，返回待 upsert 的条目列表（只含发生变化的字段）。
 
+    inspected 是本轮得出可信结论的文件集合 {(repo_slug, file_path)}；attempted 是交给过 L2 的文件
+    （含没得出结论的），落在其中的行刷新 last_checked_at，供复核轮转。
+
     - 本轮出现：状态置为存在，刷新聚合内容与最近发现；新指纹的首次发现取库里仍保留的最早记录。
     - 本轮没出现、且在忽略清单里：已忽略。
-    - 本轮没出现、不在忽略清单里：所在仓库本轮可信时标为本轮未发现，否则保持原状态不动 ——
-      包括"已忽略后又取消忽略"的行，它会停在已忽略，直到某一轮结论可信（Q25 的推导，不做特殊处理）。
+    - 本轮没出现、不在忽略清单里：所在文件本轮被取证过时标为本轮未发现，否则保持原状态不动 ——
+      包括"已忽略后又取消忽略"的行，它会停在已忽略，直到某一轮取证过它的文件（Q25 的推导，不做特殊处理）。
     """
+    attempted = set(attempted or ()) | set(inspected)
     changes: List[dict] = []
 
     for fingerprint, item in aggregated.items():
@@ -170,21 +159,99 @@ def plan_ledger_update(
             "first_seen_at": first_seen,
             "last_seen_at": now,
             "last_run_uid": run_uid,
+            "last_checked_at": now,
         })
 
     for fingerprint, current in existing.items():
         if fingerprint in aggregated:
             continue
+        file_key = (current.get("repo_slug") or "", current.get("file_path") or "")
+        change: dict = {}
         if fingerprint in ignored:
             target = LEDGER_IGNORED
-        elif current.get("repo_slug") in reliable_repos:
+        elif file_key in inspected:
+            # 按文件而不是按仓库判定：仓库拉取成功只说明文件"可以被看"，
+            # L1 每轮点名的文件都不一样，没被点名的文件本来就不可能出现
             target = LEDGER_UNSEEN
         else:
-            continue
-        if current.get("state") != target:
-            changes.append({"fingerprint": fingerprint, "state": target})
+            target = None
+        if target is not None and current.get("state") != target:
+            change["state"] = target
+        if file_key in attempted:
+            change["last_checked_at"] = now
+        if change:
+            changes.append({"fingerprint": fingerprint, **change})
 
     return changes
+
+
+def plan_rechecks(
+    entries: Iterable[dict], max_files: int, ignored: Optional[set] = None
+) -> Tuple[List[dict], Dict[Tuple[str, str], dict]]:
+    """
+    从 Ledger 里挑出本轮要复核的文件。
+
+    返回 (复核清单, 全部待复核文件的索引)：
+    - 复核清单：最多 max_files 个文件，每项 {"repo_slug", "file_path", "previous", "anchor_lines"}；
+    - 索引：{(repo_slug, file_path): 同形态的项}，覆盖所有仍为"存在"的文件。L1 恰好点名了
+      没进复核清单的文件时，靠它把上一轮的问题一并交给 L2，否则那一轮取证会在模型不知情的
+      情况下把这些问题判成本轮未发现。
+
+    只复核状态为"存在"的行，以及取消了忽略、状态还停在已忽略的行（ignored 是当前的忽略清单）：
+    后者一旦所在文件被取证就会被判定，不交给 L2 复核的话，就是在模型没看它的情况下判它本轮未发现。
+    本轮未发现的行已经被取证过一次，再反复复核只是在烧预算；仍在忽略清单里的行用户明确说过不想再看。
+    排序按上次复核时间（last_checked_at）从早到晚：交给过 L2 的文件不论有没有结论都会刷新、排到队尾，
+    超出名额的文件下一轮自然轮到。
+    """
+    ignored = ignored or set()
+    by_file: Dict[Tuple[str, str], dict] = {}
+    for entry in entries:
+        state = entry.get("state")
+        unignored = state == LEDGER_IGNORED and entry.get("fingerprint") not in ignored
+        if (state != LEDGER_PRESENT and not unignored) or not entry.get("file_path"):
+            continue
+        # 沿用台账里的路径原文，不做 normalize_file_path：复核产出的指纹要和原来那一行对上，
+        # 规范化之后旧行会被判成本轮未发现、同时冒出一行新的
+        key = (entry.get("repo_slug") or "", entry["file_path"])
+        target = by_file.setdefault(key, {
+            "repo_slug": key[0], "file_path": key[1], "previous": [], "anchor_lines": [],
+            "_checked": [], "_seen": [],
+        })
+        lines = _positive_lines(entry.get("lines"))
+        target["previous"].append({
+            "category": entry.get("category") or "",
+            "severity": entry.get("severity") or SEVERITY_UNKNOWN,
+            "title": entry.get("title") or "",
+            "lines": lines,
+        })
+        target["anchor_lines"] = sorted(set(target["anchor_lines"]) | set(lines))
+        target["_checked"].append(entry.get("last_checked_at") or datetime.min)
+        target["_seen"].append(entry.get("last_seen_at") or datetime.min)
+
+    def order(item: dict) -> tuple:
+        """从没复核过的优先，其次是最久没复核、最久没再发现的。"""
+        return (min(item["_checked"]), min(item["_seen"]), item["repo_slug"], item["file_path"])
+
+    ordered = sorted(by_file.values(), key=order)
+    index = {}
+    for item in ordered:
+        item.pop("_checked")
+        item.pop("_seen")
+        index[(item["repo_slug"], item["file_path"])] = item
+    return ordered[:max(int(max_files), 0)], index
+
+
+def _positive_lines(raw) -> List[int]:
+    """台账里的行号列表转成正整数列表；脏数据跳过而不是抛错，一条坏行号不该让整轮巡检失败。"""
+    result = []
+    for value in raw or []:
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            continue
+        if number > 0:
+            result.append(number)
+    return sorted(set(result))
 
 
 def update_ledger_for_run(run_uid: str) -> Optional[dict]:
@@ -204,7 +271,8 @@ def update_ledger_for_run(run_uid: str) -> Optional[dict]:
     changes = plan_ledger_update(
         existing=existing,
         aggregated=aggregated,
-        reliable_repos=conclusive_repos(inputs["repos"], inputs["degradations"]),
+        inspected=inputs["inspected"],
+        attempted=inputs["attempted"],
         ignored=inputs["ignored"],
         first_seen_lookup=repo.earliest_survey_finding_times(inputs["survey_id"], new_fingerprints),
         run_uid=run_uid,
@@ -214,7 +282,9 @@ def update_ledger_for_run(run_uid: str) -> Optional[dict]:
 
     counts = {LEDGER_PRESENT: 0, LEDGER_UNSEEN: 0, LEDGER_IGNORED: 0}
     for change in changes:
-        counts[change["state"]] = counts.get(change["state"], 0) + 1
+        # 只刷新复核时间的变更不带状态
+        if "state" in change:
+            counts[change["state"]] = counts.get(change["state"], 0) + 1
     logger.info("Ledger updated: run=%s changes=%s", run_uid, counts)
     return counts
 

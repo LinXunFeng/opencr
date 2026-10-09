@@ -21,7 +21,7 @@ const route = useRoute()
 const userStore = useUserStore()
 const loading = ref(true)
 const detail = ref<SurveyRunDetail | null>(null)
-/** 默认停在「新增」：全量巡检逐轮高度重合，只看新增才有信噪比 */
+/** 默认停在「新增」：老问题每轮都会被复核，逐轮产出高度重合，只看新增才有信噪比 */
 const activeTab = ref("new")
 
 const runUid = computed(() => String(route.params.runUid || ""))
@@ -83,6 +83,7 @@ function describeTarget(target?: Record<string, string>) {
 const newFindings = computed(() => (detail.value?.findings ?? []).filter(f => f.state === "new"))
 const persistedFindings = computed(() => (detail.value?.findings ?? []).filter(f => f.state === "persisted"))
 const resolvedFindings = computed(() => detail.value?.resolved_findings ?? [])
+const uncheckedFindings = computed(() => detail.value?.unchecked_findings ?? [])
 
 function formatTime(value: string) {
   return value ? new Date(value).toLocaleString() : "—"
@@ -306,6 +307,10 @@ onMounted(() => load())
           <el-tab-pane :label="`已消失 (${detail.counts.resolved})`" name="resolved">
             <el-alert class="mb" type="success" :closable="false" show-icon :title="SURVEY_NOTES.resolvedNotStored" />
             <FindingTable :items="resolvedFindings" :can-ignore="false" />
+          </el-tab-pane>
+          <el-tab-pane :label="`本轮未复查 (${detail.counts.unchecked})`" name="unchecked">
+            <el-alert class="mb" type="warning" :closable="false" show-icon :title="SURVEY_NOTES.uncheckedNotResolved" />
+            <FindingTable :items="uncheckedFindings" :can-ignore="false" />
           </el-tab-pane>
         </el-tabs>
       </el-card>

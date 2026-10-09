@@ -104,7 +104,8 @@ def render_run_markdown(detail: dict) -> str:
         f"本次共 **{counts.get('total', 0)}** 条发现："
         f"新增 **{counts.get('new', 0)}**、"
         f"仍存在 **{counts.get('persisted', 0)}**、"
-        f"较上次已消失 **{counts.get('resolved', 0)}**。",
+        f"较上次已消失 **{counts.get('resolved', 0)}**、"
+        f"本轮未复查 **{counts.get('unchecked', 0)}**。",
         "",
     ]
 
@@ -142,15 +143,24 @@ def render_run_markdown(detail: dict) -> str:
     new_items = [f for f in findings if f.get("state") == "new"]
     persisted_items = [f for f in findings if f.get("state") == "persisted"]
     resolved_items = detail.get("resolved_findings") or []
+    unchecked_items = detail.get("unchecked_findings") or []
 
     lines.extend(["## 新增", "", _render_findings(new_items, include_body), ""])
     lines.extend(["## 仍存在", "", _render_findings(persisted_items, include_body), ""])
     lines.extend([
         "## 较上次已消失",
         "",
-        "_以下问题在上一次巡检中出现过，本次未再检出。_",
+        "_以下问题在上一次巡检中出现过，本次取证过所在文件但未再检出。这不等于已修复。_",
         "",
         _render_findings(resolved_items, include_body),
+        "",
+    ])
+    lines.extend([
+        "## 本轮未复查",
+        "",
+        "_以下问题在上一次巡检中出现过，本次没有再报出，但所在文件本次没有得出可信结论（没轮到取证、文件超出读取上限只看了片段、源码读取或模型输出失败），状态未知。_",
+        "",
+        _render_findings(unchecked_items, include_body),
         "",
     ])
 

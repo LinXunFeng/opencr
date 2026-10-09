@@ -294,7 +294,9 @@ export interface SurveyRunDetail extends SurveyRun {
   findings: SurveyFinding[]
   /** 上一次有、本次没有的发现。它们没有对应的库记录，是比对算出来的 */
   resolved_findings: SurveyFinding[]
-  counts: { new: number, persisted: number, resolved: number, total: number }
+  /** 上次有、本次没出现，且本轮没取证过所在文件：状态未知，不能算已消失 */
+  unchecked_findings: SurveyFinding[]
+  counts: { new: number, persisted: number, resolved: number, unchecked: number, total: number }
   pushes: SurveyPush[]
   /** 是该巡检最近一次成功的运行、且配置了输出目标 */
   pushable: boolean
