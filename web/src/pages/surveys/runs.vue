@@ -3,7 +3,9 @@ import type { SurveyRun } from "@@/apis/opencr"
 import { getSurveyRunsApi, getSurveysApi } from "@@/apis/opencr"
 import {
   CODEGRAPH_STATUS_LABEL,
+  formatTime,
   namedClueTotal,
+  parseServerTime,
   RUN_STATUS_LABEL,
   RUN_STATUS_TAG,
   SURVEY_DEGRADATION_LABEL,
@@ -34,15 +36,11 @@ async function load() {
   }
 }
 
-function formatTime(value: string) {
-  return value ? new Date(value).toLocaleString() : "—"
-}
-
 /** 持续时长。进行中的用当前时间算，否则页面上会一直显示 0 秒 */
 function duration(row: any) {
   if (!row.started_at) return "—"
-  const end = row.finished_at ? new Date(row.finished_at) : new Date()
-  const seconds = Math.max(Math.round((end.getTime() - new Date(row.started_at).getTime()) / 1000), 0)
+  const end = row.finished_at ? parseServerTime(row.finished_at) : new Date()
+  const seconds = Math.max(Math.round((end.getTime() - parseServerTime(row.started_at).getTime()) / 1000), 0)
   if (seconds < 60) return `${seconds} 秒`
   if (seconds < 3600) return `${Math.floor(seconds / 60)} 分 ${seconds % 60} 秒`
   return `${Math.floor(seconds / 3600)} 时 ${Math.floor((seconds % 3600) / 60)} 分`

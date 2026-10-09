@@ -107,10 +107,19 @@ export const COVERAGE_NOTE
 export const STALE_NOTE
   = "服务是多进程运行的，任何进程都无法断言其他进程的审查已经死了。因此心跳超时只会标注为「疑似中断」，不会改写成失败——它也可能只是卡在一次特别慢的模型调用上。"
 
+/**
+ * 解析服务端时间字符串。
+ * 后端存的是 naive UTC，isoformat() 不带时区后缀；直接 new Date() 会被浏览器当成本地时间，
+ * 在东八区少 8 小时，拿它和 Date.now() 相减算耗时又会多出 8 小时。因此凡是服务端时间都必须走这里。
+ */
+export function parseServerTime(iso: string): Date {
+  return new Date(/(?:Z|[+-]\d{2}:\d{2})$/.test(iso) ? iso : `${iso}Z`)
+}
+
+/** 把服务端时间格式化成本地时间；空值返回「—」，解析失败原样返回 */
 export function formatTime(iso?: string): string {
-  if (!iso) return "-"
-  const normalized = iso.endsWith("Z") ? iso : `${iso}Z`
-  const date = new Date(normalized)
+  if (!iso) return "—"
+  const date = parseServerTime(iso)
   if (Number.isNaN(date.getTime())) return iso
   return date.toLocaleString("zh-CN", { hour12: false })
 }

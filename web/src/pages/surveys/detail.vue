@@ -2,6 +2,7 @@
 import type { SurveyFinding, SurveyPush, SurveyRunDetail } from "@@/apis/opencr"
 import { addSurveyIgnoreApi, getSurveyRunDetailApi, pushSurveyRunApi } from "@@/apis/opencr"
 import {
+  formatTime,
   PROFILE_KIND_LABEL,
   PUSH_STATUS_LABEL,
   PUSH_STATUS_TAG,
@@ -86,10 +87,6 @@ const newFindings = computed(() => (detail.value?.findings ?? []).filter(f => f.
 const persistedFindings = computed(() => (detail.value?.findings ?? []).filter(f => f.state === "persisted"))
 const resolvedFindings = computed(() => detail.value?.resolved_findings ?? [])
 const uncheckedFindings = computed(() => detail.value?.unchecked_findings ?? [])
-
-function formatTime(value: string) {
-  return value ? new Date(value).toLocaleString() : "—"
-}
 
 /** 导出走服务端渲染，因此游客导出的报告同样不含正文——否则导出就成了绕过可见范围的后门 */
 function exportMarkdown() {
