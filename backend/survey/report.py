@@ -20,6 +20,7 @@ from ..storage.models import (
     CATEGORY_SECURITY,
     CLUE_BASELINE,
     CLUE_CODEGRAPH,
+    CLUE_RECHECK,
     CLUE_UNKNOWN,
     CLUE_UNLISTED,
     CODEGRAPH_DISABLED,
@@ -70,6 +71,7 @@ CLUE_LABELS: Dict[str, str] = {
     CLUE_CODEGRAPH: "codegraph",
     CLUE_BASELINE: "基础画像",
     CLUE_UNLISTED: "画像外",
+    CLUE_RECHECK: "台账复核",
     CLUE_UNKNOWN: "无记录",
 }
 
@@ -135,9 +137,23 @@ def _format_counts(counts: dict) -> str:
     return "、".join(parts) or "（无）"
 
 
+def _codegraph_share(counts: dict) -> str:
+    """
+    codegraph 在 L1 点名条目中的占比，与报告页 namedClueTotal 同口径。
+
+    分母不含台账复核与旧数据：复核的位置来自上一轮的发现，算进去会让台账越大、占比越被稀释。
+    """
+    counts = counts or {}
+    named = sum(counts.get(key, 0) for key in (CLUE_CODEGRAPH, CLUE_BASELINE, CLUE_UNLISTED))
+    if not named:
+        return ""
+    return f"；codegraph 占 L1 点名的 {round(counts.get(CLUE_CODEGRAPH, 0) / named * 100)}%"
+
+
 def _repo_note(repo: dict) -> str:
     """建索引情况表里的「说明」列：失败原因（Guest 视角下已被剔除）或抽取为空的提示。"""
     if repo.get("index_mode") == INDEX_MODE_FAILED:
+        # 失败原因在 _describe_failure 里已压成一行，这里不必再处理换行
         return repo.get("error_message") or "建索引失败"
     if repo.get("route_count") == 0 and repo.get("type_count") == 0:
         return "没有抽出任何接口与类型"
@@ -171,9 +187,13 @@ def _render_codegraph(detail: dict) -> List[str]:
         f"范围内无人调用的接口 {cross.get('unused_routes', 0)} 个，"
         f"范围内无人提供的调用 {cross.get('orphan_calls', 0)} 处。"
     )
-    if stats.get("focus") is not None:
-        lines.append(f"- 关注点线索来源：{_format_counts(stats['focus'])}")
-    lines.append(f"- 发现线索来源：{_format_counts(detail.get('clue_counts') or {})}")
+    if stats.get("focus") is None:
+        # 与报告页一致：要能和"有关注点但一条都没有"区分开
+        lines.append("- 关注点线索来源：本轮未走到整合分析这一步")
+    else:
+        lines.append(f"- 关注点线索来源：{_format_counts(stats['focus'])}{_codegraph_share(stats['focus'])}")
+    clue_counts = detail.get("clue_counts") or {}
+    lines.append(f"- 发现线索来源：{_format_counts(clue_counts)}{_codegraph_share(clue_counts)}")
     lines.extend(["", "_线索来源只说明这个位置是画像的哪一部分指给模型的，不是因果归因。_", ""])
 
     indexed = [r for r in detail.get("repos") or [] if r.get("index_mode")]

@@ -3,9 +3,9 @@ import type { SurveyRun } from "@@/apis/opencr"
 import { getSurveyRunsApi, getSurveysApi } from "@@/apis/opencr"
 import {
   CODEGRAPH_STATUS_LABEL,
+  namedClueTotal,
   RUN_STATUS_LABEL,
   RUN_STATUS_TAG,
-  sumClueCounts,
   SURVEY_DEGRADATION_LABEL,
   SURVEY_NOTES,
   SURVEY_PHASE_LABEL,
@@ -58,7 +58,7 @@ function codegraphSummary(row: any) {
   if (!stats) return "—"
   if (stats.status !== "enabled") return CODEGRAPH_STATUS_LABEL[stats.status]
   const counts = run.clue_counts
-  return `发现 ${counts?.codegraph ?? 0}/${sumClueCounts(counts)} · 连接 ${stats.cross_repo.links}`
+  return `发现 ${counts?.codegraph ?? 0}/${namedClueTotal(counts)} · 连接 ${stats.cross_repo.links}`
 }
 
 function open(row: any) {

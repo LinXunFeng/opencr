@@ -10,7 +10,7 @@ import {
   CODEGRAPH_UNAVAILABLE_LABEL,
   INDEX_MODE_LABEL,
   INDEX_MODE_TAG,
-  sumClueCounts,
+  namedClueTotal,
   SURVEY_NOTES
 } from "@@/constants/opencr"
 
@@ -29,16 +29,16 @@ const indexedRepos = computed(() => props.detail.repos.filter(r => r.index_mode)
 /** 本轮 codegraph 状态：enabled / disabled / missing，没有快照时为空串 */
 const status = computed(() => stats.value?.status ?? "")
 
-/** 要展示的线索来源标签：unknown 只在确有旧数据时出现，其余三类即使为 0 也展示 */
+/** 要展示的线索来源标签：台账复核与旧数据只在确有条目时出现，画像指出的三类即使为 0 也展示 */
 function clueItems(counts: ClueCounts | null | undefined) {
   return CLUE_KEYS
     .map(key => ({ key, value: counts?.[key] ?? 0 }))
-    .filter(item => item.value > 0 || item.key !== "unknown")
+    .filter(item => item.value > 0 || (item.key !== "recheck" && item.key !== "unknown"))
 }
 
-/** codegraph 来源在全部条目中的占比文本；没有条目时为「—」而不是 0% */
+/** codegraph 来源在 L1 点名的条目中的占比文本；没有这类条目时为「—」而不是 0% */
 function share(counts: ClueCounts | null | undefined) {
-  const all = sumClueCounts(counts)
+  const all = namedClueTotal(counts)
   return all ? `${Math.round(((counts?.codegraph ?? 0) / all) * 100)}%` : "—"
 }
 
@@ -173,7 +173,7 @@ function isEmptyExtraction(row: any) {
         线索来源
       </div>
       <el-descriptions :column="1" border size="small" class="mb">
-        <el-descriptions-item label="关注点（L1 点名）">
+        <el-descriptions-item :label="SURVEY_NOTES.focusClueRow">
           <template v-if="stats.focus">
             <el-tooltip v-for="item in clueItems(stats.focus)" :key="item.key" :content="CLUE_SOURCE_DESC[item.key]">
               <el-tag size="small" :type="CLUE_SOURCE_TAG[item.key]" effect="plain" class="mr">
@@ -184,7 +184,7 @@ function isEmptyExtraction(row: any) {
           </template>
           <span v-else class="sub">{{ SURVEY_NOTES.focusNotReached }}</span>
         </el-descriptions-item>
-        <el-descriptions-item label="发现（L2 取证后入库）">
+        <el-descriptions-item :label="SURVEY_NOTES.findingClueRow">
           <el-tooltip v-for="item in clueItems(detail.clue_counts)" :key="item.key" :content="CLUE_SOURCE_DESC[item.key]">
             <el-tag size="small" :type="CLUE_SOURCE_TAG[item.key]" effect="plain" class="mr">
               {{ CLUE_SOURCE_LABEL[item.key] }} {{ item.value }}
@@ -227,7 +227,7 @@ function isEmptyExtraction(row: any) {
           </el-table-column>
           <el-table-column label="说明" min-width="220" show-overflow-tooltip>
             <template #default="{ row }">
-              <span v-if="row.index_mode === 'failed'" class="danger">{{ row.error_message || "建索引失败" }}</span>
+              <span v-if="row.index_mode === 'failed'" class="danger">{{ row.error_message || SURVEY_NOTES.indexFailedFallback }}</span>
               <span v-else-if="isEmptyExtraction(row)" class="warn">{{ SURVEY_NOTES.emptyExtraction }}</span>
               <span v-else class="sub">—</span>
             </template>

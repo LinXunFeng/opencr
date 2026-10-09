@@ -228,6 +228,9 @@ export interface ClueCounts {
   codegraph: number
   baseline: number
   unlisted: number
+  /** 本轮 L1 没有点名、只因台账复核而取证的 */
+  recheck: number
+  /** 没有记录来源：功能上线前的发现，或缺标注的关注点（正常流程不会出现） */
   unknown?: number
 }
 
@@ -282,7 +285,7 @@ export interface SurveyFinding {
   /** new = 本次新增；persisted = 上次也有。"已消失"不在这里，见 resolved_findings */
   state: "new" | "persisted"
   fingerprint: string
-  /** codegraph / baseline / unlisted；旧数据为空串 */
+  /** codegraph / baseline / unlisted / recheck（台账复核）；旧数据为空串 */
   clue_source: string
   created_at: string
   /** Guest 拿不到标题与正文，字段直接不存在（服务端剔除，不是前端隐藏） */

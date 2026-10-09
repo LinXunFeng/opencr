@@ -278,8 +278,12 @@ INDEX_MODE_FAILED = "failed"
 CLUE_CODEGRAPH = "codegraph"
 CLUE_BASELINE = "baseline"
 CLUE_UNLISTED = "unlisted"
-CLUE_SOURCES = (CLUE_CODEGRAPH, CLUE_BASELINE, CLUE_UNLISTED)
-# 只出现在统计里，不落库：功能上线前产出的 Finding 没有线索来源，单列而不并进任何一类
+# 本轮 L1 没有点名、只因台账里还有"存在"的问题而被复核的文件。它的位置来自台账而不是画像，
+# 按路径归到前三类就会把"上次发现过"记成 codegraph 或基础画像的功劳
+CLUE_RECHECK = "recheck"
+CLUE_SOURCES = (CLUE_CODEGRAPH, CLUE_BASELINE, CLUE_UNLISTED, CLUE_RECHECK)
+# 只出现在统计里，不落库：功能上线前产出的 Finding、以及缺标注的关注点（正常流程不会出现）没有线索来源，
+# 单列而不并进任何一类
 CLUE_UNKNOWN = "unknown"
 
 # --- codegraph 在一次运行里的状态（codegraph_stats.status）---------------
@@ -517,6 +521,7 @@ class SurveyRunRepo(Base):
     file_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     # 以下四列在未启用 codegraph、或功能上线前的旧运行里为 NULL，界面据此显示"无记录"而不是 0 ——
     # 0 是"建了索引但什么都没抽出来"，两者含义完全不同。
+    # 建索引失败时 index_mode 为 failed、index_ms 有值，route_count / type_count 仍为 NULL：没有可数的产出。
     index_mode: Mapped[Optional[str]] = mapped_column(String(16))
     index_ms: Mapped[Optional[int]] = mapped_column(Integer)
     route_count: Mapped[Optional[int]] = mapped_column(Integer)

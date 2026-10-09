@@ -35,7 +35,8 @@ from ..storage.models import (
     SURVEY_PHASE_SUMMARIZING,
 )
 from .analysis import (
-    Budget, inspect_focus, l1_repo_budget, load_skill_prompt, match_skills, merge_focuses, plan_focus, summarize,
+    Budget, focus_key, inspect_focus, l1_repo_budget, load_skill_prompt, match_skills, merge_focuses, plan_focus,
+    summarize,
 )
 from .clues import annotate_focuses, summarize_codegraph
 from .common import SurveyError, finding_fingerprint
@@ -266,8 +267,7 @@ def execute_survey_run(survey_uid: str, trigger: str) -> Optional[str]:
 
         repo.update_survey_progress(run_uid, phase=SURVEY_PHASE_INTEGRATING)
         repo.survey_heartbeat(run_uid)
-        planned = annotate_focuses(plan_focus(profiles, cross_map, skill_prompt, budget), profiles)
-        _record_codegraph_stats(run_uid, profiles, cross_map, planned)
+        planned = plan_focus(profiles, cross_map, skill_prompt, budget)
         # 复核名额与 L1 的关注点上限相同、另算，不挤占 L1 的名额：
         # 共用一个上限的话，台账一大，新问题就再也进不了取证。
         # 不单独开配置项，是因为它和 l2_max_focus 控制的是同一种成本（L2 调用次数）
@@ -279,6 +279,9 @@ def execute_survey_run(survey_uid: str, trigger: str) -> Optional[str]:
             ignored={item["fingerprint"] for item in repo.list_survey_ignores(survey_uid)},
         )
         focuses = merge_focuses(rechecks, planned, pending)
+        # 在合并之后标注：合并会把 L1 与复核对同一文件的点名并成一条，标注要落在实际取证的那一条上
+        annotate_focuses(focuses, profiles, named_by_l1={focus_key(f) for f in planned})
+        _record_codegraph_stats(run_uid, profiles, cross_map, focuses)
 
         repo.update_survey_progress(run_uid, phase=SURVEY_PHASE_INSPECTING)
         raw_findings, inspected = _collect_findings(focuses, prepared, skill_prompt, budget, run_uid)

@@ -1291,7 +1291,8 @@ def record_survey_repo(
     """
     记录一次运行里单个仓库的处理结果。
 
-    index 是画像里的建索引结果（{mode, elapsed_ms}），未启用 codegraph 时为 None；
+    index 是画像里的建索引结果（{mode, elapsed_ms, error}，这里只取前两项，失败原因走 error_message），
+    未启用 codegraph 时为 None；
     route_count / type_count 只在画像确实来自 codegraph 时传入，其余情况留 NULL。
     """
     from .models import SurveyRun, SurveyRunRepo
@@ -1613,7 +1614,7 @@ def _survey_finding_to_dict(finding: "SurveyFinding", include_body: bool) -> dic
 
 def _survey_clue_counts(session, run_ids: List[int]) -> Dict[int, Dict[str, int]]:
     """
-    按运行统计已落库 Finding 的线索来源分布：{run_id: {codegraph, baseline, unlisted, unknown}}。
+    按运行统计已落库 Finding 的线索来源分布：{run_id: {CLUE_SOURCES 的每个键, unknown}}。
 
     从 survey_finding 现算而不是读快照：被忽略的条目不入库，快照里的数字会比列表多。
     unknown 是功能上线前的旧数据，单列出来，不并进任何一类。

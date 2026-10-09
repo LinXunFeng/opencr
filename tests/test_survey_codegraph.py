@@ -84,6 +84,22 @@ class ClueClassificationTests(unittest.TestCase):
         self.assertEqual(classify_clue(_profile(), "./handlers/order.go"), "codegraph")
         self.assertEqual(classify_clue(_profile(), "/model/order.go"), "codegraph")
 
+    def test_rechecks_not_named_by_l1_are_credited_to_the_ledger(self):
+        """
+        台账复核的文件是"上次发现过问题"才来的，不是画像指出来的。按路径判定的话，
+        恰好也在 codegraph 路由里的复核文件会被记成 codegraph 的功劳。
+        """
+        from backend.survey.analysis import focus_key
+        from backend.survey.clues import annotate_focuses
+
+        l1 = {"repo_slug": "api", "file_path": "model/order.go"}
+        focuses = [
+            {"repo_slug": "api", "file_path": "handlers/order.go"},   # 纯复核，路径恰好是 codegraph 文件
+            {"repo_slug": "api", "file_path": "./model/order.go"},    # 复核且 L1 也点名了
+        ]
+        annotate_focuses(focuses, [_profile()], named_by_l1={focus_key(l1)})
+        self.assertEqual([f["clue_source"] for f in focuses], ["recheck", "codegraph"])
+
     def test_focuses_are_annotated_per_repo(self):
         from backend.survey.clues import annotate_focuses
 
@@ -108,7 +124,7 @@ class CodegraphSummaryTests(unittest.TestCase):
         self.assertEqual((stats["routes"], stats["types"]), (1, 1))
         self.assertEqual(stats["dropped_registrations"], 2)
         self.assertEqual(stats["cross_repo"], {"links": 2, "method_mismatch": 1, "orphan_calls": 0, "unused_routes": 1})
-        self.assertEqual(stats["focus"], {"codegraph": 2, "baseline": 1, "unlisted": 0})
+        self.assertEqual(stats["focus"], {"codegraph": 2, "baseline": 1, "unlisted": 0, "recheck": 0})
 
     def test_focus_is_none_until_l1_has_run(self):
         """"没有关注点"和"还没到这一步"在页面上要能区分。"""
@@ -116,7 +132,15 @@ class CodegraphSummaryTests(unittest.TestCase):
 
         self.assertIsNone(summarize_codegraph([_profile()], {})["focus"])
         self.assertEqual(summarize_codegraph([_profile()], {}, [])["focus"],
-                         {"codegraph": 0, "baseline": 0, "unlisted": 0})
+                         {"codegraph": 0, "baseline": 0, "unlisted": 0, "recheck": 0})
+
+    def test_unannotated_focus_is_counted_as_unknown(self):
+        """标注缺失说明调用顺序被改坏了：记为无记录让它显形，而不是悄悄抬高某一类。"""
+        from backend.survey.clues import summarize_codegraph
+
+        stats = summarize_codegraph([_profile()], {}, [{"clue_source": "codegraph"}, {}])
+        self.assertEqual(stats["focus"]["unknown"], 1)
+        self.assertEqual(stats["focus"]["unlisted"], 0)
 
     def test_empty_extraction_is_counted_separately(self):
         """索引建成却一条都没抽出来，效果等同未启用，但画像类型显示的是结构图。"""
@@ -216,6 +240,10 @@ class IndexOutcomeTests(unittest.TestCase):
         self.assertEqual(outcome.mode, "failed")
         self.assertIsNone(outcome.db_path)
         self.assertIn("unsupported", outcome.error)
+
+        multiline = self._run([mock.Mock(returncode=1, stderr="line one\n  line two\n", stdout="")])
+        # 多行 stderr 原样落库会撑破 Markdown 导出里的表格行
+        self.assertEqual(multiline.error, "exit=1 line one line two")
 
         timeout = self._run([None])
         self.assertEqual(timeout.mode, "failed")
@@ -411,7 +439,7 @@ class CodegraphStorageTests(unittest.TestCase):
         ])
 
         detail = self.repo.get_survey_run_detail(run_uid, include_body=False)
-        expected = {"codegraph": 1, "baseline": 1, "unlisted": 0, "unknown": 1}
+        expected = {"codegraph": 1, "baseline": 1, "unlisted": 0, "recheck": 0, "unknown": 1}
         self.assertEqual(detail["clue_counts"], expected)
         # 线索来源是标签不是正文，Guest 视角同样可见
         self.assertEqual([f["clue_source"] for f in detail["findings"]], ["codegraph", "baseline", ""])
@@ -458,7 +486,7 @@ class CodegraphStorageTests(unittest.TestCase):
         self.assertIn("| web | 失败 | 0.0s | - | - | exit=2 boom |", markdown)
         self.assertIn("接口连接 2 处", markdown)
         self.assertIn("范围内无人提供的调用 5 处", markdown)
-        self.assertIn("关注点线索来源：codegraph 3、基础画像 1", markdown)
+        self.assertIn("关注点线索来源：codegraph 3、基础画像 1；codegraph 占 L1 点名的 75%", markdown)
         # 导出与界面同源：Guest 导出同样看不到原始报错
         guest = render_run_markdown(self.repo.get_survey_run_detail(run_uid, include_body=False))
         self.assertNotIn("boom", guest)
@@ -483,11 +511,27 @@ class CodegraphStorageTests(unittest.TestCase):
         self.repo.set_survey_codegraph_stats(run_uid, {**base, "status": "missing"})
         missing = render_run_markdown(self.repo.get_survey_run_detail(run_uid))
         self.assertIn("找不到可执行文件", missing)
+        # focus 为 None（L1 没跑到）时写明原因，与页面一致
+        self.assertIn("关注点线索来源：本轮未走到整合分析这一步", missing)
         self.assertNotIn("配置关闭", missing)
         self.repo.set_survey_codegraph_stats(run_uid, {**base, "status": "disabled"})
         disabled = render_run_markdown(self.repo.get_survey_run_detail(run_uid))
         self.assertIn("未启用 codegraph（配置关闭）", disabled)
         self.assertNotIn("找不到可执行文件", disabled)
+
+    def test_markdown_share_excludes_rechecks(self):
+        """与页面同口径：台账复核不进分母，否则台账越大 codegraph 占比越被稀释。"""
+        from backend.survey.report import render_run_markdown
+
+        run_uid = self._start()
+        self.repo.set_survey_codegraph_stats(run_uid, {
+            "status": "enabled", "cross_repo": {},
+            "focus": {"codegraph": 1, "baseline": 1, "unlisted": 0, "recheck": 8},
+        })
+        markdown = render_run_markdown(self.repo.get_survey_run_detail(run_uid))
+        self.assertIn("台账复核 8；codegraph 占 L1 点名的 50%", markdown)
+        # 没有 L1 点名的发现时不写占比，而不是写成 0%
+        self.assertNotIn("发现线索来源：（无）；", markdown)
 
     def test_markdown_mentions_empty_extraction_only_when_there_is_some(self):
         """与报告页一致：为 0 时不提，否则未启用的运行也会读到一句多余的"其中抽取为空 0 个"。"""

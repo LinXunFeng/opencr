@@ -14,59 +14,48 @@ from typing import Dict, Iterable, List, Optional, Set, Tuple
 from ..storage.models import (
     CLUE_BASELINE,
     CLUE_CODEGRAPH,
+    CLUE_RECHECK,
     CLUE_SOURCES,
+    CLUE_UNKNOWN,
     CLUE_UNLISTED,
     CODEGRAPH_DISABLED,
     CODEGRAPH_ENABLED,
     CODEGRAPH_MISSING,
     PROFILE_CODEGRAPH,
 )
-
-
-def normalize_file_path(path: str) -> str:
-    """
-    把文件路径规整成仓库内的相对形式再比较。
-
-    模型给出的路径偶尔带 `./` 或前导斜杠，codegraph 存的是不带前缀的相对路径
-    （实测 1.6.0：`src/api/server.ts`）。不规整的话同一个文件会被判成"画像外"。
-    """
-    text = str(path or "").strip().replace("\\", "/")
-    while text.startswith("./"):
-        text = text[2:]
-    return text.lstrip("/")
+from .analysis import focus_key, normalize_file_path
+from .profile import profile_paths
 
 
 def _paths(values: Iterable[str]) -> Set[str]:
-    """规整一组路径并去掉空值。"""
+    """
+    规整一组路径并去掉空值。
+
+    与 L1 关注点用同一个 normalize_file_path：关注点路径在 plan_focus 里已经按它规整过，
+    两边规整规则不一致的话，同一个文件会被判成"画像外"。
+    """
     return {p for p in (normalize_file_path(v) for v in values) if p}
 
 
 def codegraph_files(profile: dict) -> Set[str]:
     """画像里只有 codegraph 才能提供的文件：路由注册处、路由处理函数、类型定义。"""
-    files: List[str] = []
-    for route in profile.get("routes") or []:
-        files.extend([route.get("file", ""), route.get("handler_file", "")])
-    files.extend(t.get("file", "") for t in profile.get("types") or [])
-    return _paths(files)
+    groups = profile_paths(profile)
+    # 处理函数文件不在 profile_paths 里（画像正文不渲染它），但跨仓库连接事实里会带上，L1 看得到
+    handlers = [r.get("handler_file", "") for r in profile.get("routes") or []]
+    return _paths([*groups["routes"], *groups["types"], *handlers])
 
 
 def baseline_files(profile: dict) -> Set[str]:
     """
-    没有 codegraph 也会出现在画像里的文件：调用侧、依赖清单、仓库顶层文件。
+    没有 codegraph 也会出现在画像里的文件：调用侧、依赖清单、仓库根目录文件。
 
+    分组沿用 profile_paths，与 Reach 统计对"画像里有哪些文件"的口径一致。
     调用侧要连同被剔除的路由注册一起算：不开 codegraph 时那些行原本就在调用侧里，
     只因为 codegraph 认出了它们是路由才被剔掉 —— 漏算的话，后端的路由文件会全被记成 codegraph 的功劳。
-    目录结构摘要里只有目录名与顶层文件名，目录不算"指向了某个文件"。
     """
-    calls = list(profile.get("api_calls") or []) + list(profile.get("dropped_calls") or [])
-    files: List[str] = [c.get("file", "") for c in calls]
-    files.extend((profile.get("manifests") or {}).keys())
-    for entry in profile.get("tree") or []:
-        # 目录条目形如 "lib/" 或 "lib/ (a, b)"，一定含斜杠；顶层文件名不可能含斜杠
-        name = str(entry)
-        if "/" not in name:
-            files.append(name)
-    return _paths(files)
+    groups = profile_paths(profile)
+    dropped = [c.get("file", "") for c in profile.get("dropped_calls") or []]
+    return _paths([*groups["api_calls"], *dropped, *groups["manifests"], *groups["root_files"]])
 
 
 def _clue_index(profile: Optional[dict]) -> Tuple[Set[str], Set[str]]:
@@ -97,18 +86,28 @@ def classify_clue(profile: Optional[dict], file_path: str) -> str:
     return _classify(_clue_index(profile), file_path)
 
 
-def annotate_focuses(focuses: List[dict], profiles: List[dict]) -> List[dict]:
-    """给每个关注点标上线索来源（原地修改并返回同一列表）。"""
+def annotate_focuses(
+    focuses: List[dict], profiles: List[dict], named_by_l1: Optional[Set[Tuple[str, str]]] = None
+) -> List[dict]:
+    """
+    给每个关注点标上线索来源（原地修改并返回同一列表）。
+
+    named_by_l1 是本轮 L1 点名过的文件身份（见 focus_key）；传入时，不在其中的关注点
+    都来自台账复核，记为 recheck。L1 也点名了的复核文件照常按路径判定：位置确实是画像指出来的。
+    """
     # 文件集按仓库算一次：画像可能有上千个类型，逐个关注点重算是 O(关注点 × 画像)
     indexes = {p.get("repo_slug"): _clue_index(p) for p in profiles or []}
     for focus in focuses or []:
+        if named_by_l1 is not None and focus_key(focus) not in named_by_l1:
+            focus["clue_source"] = CLUE_RECHECK
+            continue
         index = indexes.get(focus.get("repo_slug")) or (set(), set())
         focus["clue_source"] = _classify(index, focus.get("file_path", ""))
     return focuses
 
 
 def _empty_counts() -> Dict[str, int]:
-    """线索来源计数的初始形状，保证三个键始终存在，前端不必判空。"""
+    """线索来源计数的初始形状，保证 CLUE_SOURCES 的每个键始终存在，前端不必判空。"""
     return {source: 0 for source in CLUE_SOURCES}
 
 
@@ -141,7 +140,9 @@ def summarize_codegraph(
     if focuses is not None:
         focus_counts = _empty_counts()
         for focus in focuses:
-            source = focus.get("clue_source") or CLUE_UNLISTED
+            # 正常流程里 annotate_focuses 总在这之前跑，不会缺标注。真缺了就记为无记录而不是归进某一类：
+            # 归进"画像外"会悄悄抬高它，调用顺序被改坏这件事也就被掩盖了
+            source = focus.get("clue_source") or CLUE_UNKNOWN
             focus_counts[source] = focus_counts.get(source, 0) + 1
 
     status = _run_status(profiles)

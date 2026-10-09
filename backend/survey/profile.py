@@ -180,7 +180,8 @@ def _describe_failure(completed: Optional[subprocess.CompletedProcess], limit: i
     """把 codegraph 的失败输出压成一行可读的原因，供日志与页面共用。"""
     if completed is None:
         return "codegraph 超时或无法启动"
-    detail = (completed.stderr or completed.stdout or "").strip()[:limit]
+    # stderr 常是多行的；原样落库会撑破 Markdown 导出里的表格行
+    detail = " ".join((completed.stderr or completed.stdout or "").split())[:limit]
     return f"exit={completed.returncode} {detail}".strip()
 
 
