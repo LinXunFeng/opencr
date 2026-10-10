@@ -501,15 +501,13 @@ def render_profile(profile: dict, max_chars: int) -> str:
     if languages:
         parts.append("语言构成：" + ", ".join(f"{k}×{v}" for k, v in languages.items()))
 
-    tree = profile.get("tree") or []
-    if tree:
-        parts.append("目录结构：\n" + "\n".join(f"- {t}" for t in tree))
-
-    manifests = profile.get("manifests") or {}
-    if manifests:
-        blocks = [f"#### {name}\n```\n{content}\n```" for name, content in manifests.items()]
-        parts.append("依赖清单：\n" + "\n".join(blocks))
-
+    # 段落顺序决定了预算不够时谁被截掉。带源码路径的三段（路由、接口调用、类型骨架）在前，
+    # 目录结构与依赖清单在后：L1 只能点名画像里出现过的路径，而后两段几乎不带源码路径，
+    # 单份依赖清单就能写到 MAX_MANIFEST_CHARS。不要把它们挪回前面：每仓库预算一小，
+    # 三段就会被整段截掉，L1 可达直接归零。
+    # 目录结构排在依赖清单之前：它条数有上限，还带着根目录文件这类可点名的路径。
+    # 代价是预算紧张时依赖清单先丢，L1 看不到依赖版本冲突；skill 匹配读的是画像字典
+    # 而不是这段文本，不受影响。
     routes = profile.get("routes") or []
     if routes:
         lines = [
@@ -527,6 +525,15 @@ def render_profile(profile: dict, max_chars: int) -> str:
     if types:
         lines = [f"- {t['kind']} `{t['name']}` ({t['file']})" for t in types]
         parts.append(f"类型骨架（{len(types)}）：\n" + "\n".join(lines))
+
+    tree = profile.get("tree") or []
+    if tree:
+        parts.append("目录结构：\n" + "\n".join(f"- {t}" for t in tree))
+
+    manifests = profile.get("manifests") or {}
+    if manifests:
+        blocks = [f"#### {name}\n```\n{content}\n```" for name, content in manifests.items()]
+        parts.append("依赖清单：\n" + "\n".join(blocks))
 
     text = "\n\n".join(parts)
     return text[:max_chars] if max_chars > 0 else text

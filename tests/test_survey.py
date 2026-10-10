@@ -623,6 +623,20 @@ class ReachTests(unittest.TestCase):
         # 没有 codegraph 符号数时与"一个都没有"区分开
         self.assertIsNone(reach["heavy_hidden_count"])
 
+    def test_path_sections_survive_tight_budget_before_manifests(self):
+        """预算紧张时先丢依赖清单，带源码路径的段落要留下，否则仓库一多 L1 可达就归零。"""
+        from backend.survey.profile import MAX_MANIFEST_CHARS, render_profile
+        from backend.survey.reach import measure_reach
+
+        profile = {**self.PROFILE, "manifests": {"go.mod": "x" * MAX_MANIFEST_CHARS}}
+        text = render_profile(profile, 300)
+        self.assertIn("(internal/order/handler.go)", text)
+        self.assertIn("(internal/order/deep/x/model.go)", text)
+        reach = measure_reach(profile, self.SOURCES, 300, 0)
+        self.assertTrue(reach["truncated"])
+        # 路由与类型骨架各一个，外加目录结构里的根目录文件 main.go
+        self.assertEqual(reach["reachable_files"], 3)
+
     def test_rendered_paths_follows_render_profile(self):
         """反查与渲染格式必须一致，否则统计会悄悄算错。"""
         from backend.survey.profile import render_profile, rendered_paths
