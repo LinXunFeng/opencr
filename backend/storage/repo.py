@@ -1752,10 +1752,20 @@ def get_survey_run_detail(
         return detail
 
 
+# 忽略理由的长度上限。前端校验用同一个数（web/src/common/constants/opencr.ts 的 IGNORE_NOTE_MAX）
+SURVEY_IGNORE_NOTE_MAX = 2000
+
+
+def _clean_ignore_note(note: str) -> Optional[str]:
+    """规整忽略理由：去掉首尾空白并截断；空理由存 NULL，界面上才会显示"未填写"而不是一段空白。"""
+    return (note or "").strip()[:SURVEY_IGNORE_NOTE_MAX] or None
+
+
 def add_survey_ignore(survey_uid: str, fingerprint: str, note: str = "") -> bool:
     """把一条发现标记为"已知问题、不再提醒"。已存在时视为成功。"""
     from .models import LEDGER_IGNORED, Survey, SurveyIgnore, SurveyLedgerEntry
 
+    note = _clean_ignore_note(note)
     with session_scope() as session:
         survey_id = session.scalar(select(Survey.id).where(Survey.survey_uid == survey_uid))
         if survey_id is None:
@@ -1767,8 +1777,12 @@ def add_survey_ignore(survey_uid: str, fingerprint: str, note: str = "") -> bool
         )
         if existing is None:
             session.add(
-                SurveyIgnore(survey_id=survey_id, fingerprint=fingerprint, note=(note or "")[:2000] or None)
+                SurveyIgnore(survey_id=survey_id, fingerprint=fingerprint, note=note)
             )
+        elif note and not existing.note:
+            # 同一文件同一类别的多条发现共享指纹，第二次标记时补上第一次没填的理由；
+            # 已有理由则不覆盖 —— 改理由走编辑接口，这里静默覆盖会丢掉别人写的说明
+            existing.note = note
         # 台账里已有的那一行立刻转为已忽略，而不是等下一轮巡检：
         # 忽略之后手动重推一次，表里就应该看到变化。不删行 —— 人工列里可能已经写了处理记录。
         session.execute(
@@ -1800,9 +1814,53 @@ def remove_survey_ignore(survey_uid: str, fingerprint: str) -> bool:
         return (result.rowcount or 0) > 0
 
 
-def list_survey_ignores(survey_uid: str) -> List[dict]:
-    """某个巡检的忽略清单。"""
+def update_survey_ignore_note(survey_uid: str, fingerprint: str, note: str) -> bool:
+    """修改忽略理由。巡检或忽略记录不存在时返回 False。"""
     from .models import Survey, SurveyIgnore
+
+    with session_scope() as session:
+        survey_id = session.scalar(select(Survey.id).where(Survey.survey_uid == survey_uid))
+        if survey_id is None:
+            return False
+        result = session.execute(
+            update(SurveyIgnore)
+            .where(SurveyIgnore.survey_id == survey_id, SurveyIgnore.fingerprint == fingerprint)
+            .values(note=_clean_ignore_note(note))
+        )
+        return (result.rowcount or 0) > 0
+
+
+def survey_ignored_fingerprints(survey_uid: str) -> set:
+    """
+    某个巡检忽略清单里的指纹集合。
+
+    巡检链路只需要指纹，不走 list_survey_ignores：后者为管理页联查台账与发现表，
+    每次运行都付一遍这个开销没有意义。
+    """
+    from .models import Survey, SurveyIgnore
+
+    with session_scope() as session:
+        return set(
+            session.scalars(
+                select(SurveyIgnore.fingerprint)
+                .join(Survey, Survey.id == SurveyIgnore.survey_id)
+                .where(Survey.survey_uid == survey_uid)
+            ).all()
+        )
+
+
+def list_survey_ignores(survey_uid: str) -> List[dict]:
+    """
+    某个巡检的忽略清单，每条附带它指向的问题（位置、类别、最近一次的标题与严重度）。
+
+    不返回台账状态与最近出现时间：标记时台账行即转为已忽略，被忽略的发现也不再入库，
+    这两项对清单里的每一条都是同一个值、停在标记那一刻，展示出来只会被误读。
+
+    指纹本身是哈希，对人没有意义；不带上问题描述的话，清单里每一行都无法判断该不该取消。
+    问题描述优先取台账行，台账里没有时（早于台账功能的忽略记录）退回该指纹最近一条 Finding；
+    两处都没有（相关运行已被清理）时这些字段为空，只剩指纹与理由。
+    """
+    from .models import Survey, SurveyFinding, SurveyIgnore, SurveyLedgerEntry, SurveyRun
 
     with session_scope() as session:
         survey_id = session.scalar(select(Survey.id).where(Survey.survey_uid == survey_uid))
@@ -1811,14 +1869,48 @@ def list_survey_ignores(survey_uid: str) -> List[dict]:
         rows = session.scalars(
             select(SurveyIgnore).where(SurveyIgnore.survey_id == survey_id).order_by(SurveyIgnore.id.desc())
         ).all()
-        return [
-            {
+        fingerprints = [r.fingerprint for r in rows]
+        ledger = {
+            e.fingerprint: e
+            for e in session.scalars(
+                select(SurveyLedgerEntry).where(
+                    SurveyLedgerEntry.survey_id == survey_id, SurveyLedgerEntry.fingerprint.in_(fingerprints)
+                )
+            ).all()
+        } if fingerprints else {}
+        missing = [fp for fp in fingerprints if fp not in ledger]
+        latest_findings: Dict[str, SurveyFinding] = {}
+        if missing:
+            # 按 id 升序遍历、后者覆盖前者，得到每个指纹最近的一条
+            for f in session.scalars(
+                select(SurveyFinding)
+                .where(SurveyFinding.survey_id == survey_id, SurveyFinding.fingerprint.in_(missing))
+                .order_by(SurveyFinding.id)
+            ).all():
+                latest_findings[f.fingerprint] = f
+        # 台账的 last_run_uid 不做外键，运行按次数清理后会悬空；只给出仍然存在的运行，
+        # 否则"最近报告"点进去是 404。被忽略之后不再入库，它指向的只会越来越旧、越来越可能被清理
+        run_uids = {e.last_run_uid for e in ledger.values() if e.last_run_uid}
+        live_runs = set(
+            session.scalars(select(SurveyRun.run_uid).where(SurveyRun.run_uid.in_(run_uids))).all()
+        ) if run_uids else set()
+
+        items = []
+        for r in rows:
+            entry = ledger.get(r.fingerprint)
+            source = entry or latest_findings.get(r.fingerprint)
+            items.append({
                 "fingerprint": r.fingerprint,
                 "note": r.note or "",
                 "created_at": r.created_at.isoformat() if r.created_at else "",
-            }
-            for r in rows
-        ]
+                "repo_slug": source.repo_slug if source else "",
+                "file_path": (source.file_path or "") if source else "",
+                "category": source.category if source else "",
+                "severity": source.severity if source else "",
+                "title": (source.title or "") if source else "",
+                "last_run_uid": entry.last_run_uid if entry and entry.last_run_uid in live_runs else "",
+            })
+        return items
 
 
 def purge_survey_runs(survey_id: int, retention_runs: int) -> int:

@@ -15,6 +15,7 @@ import { formatTime, SCHEDULE_KIND_LABEL, SURVEY_NOTES, WEEKDAY_OPTIONS } from "
 import { useUserStore } from "@/pinia/stores/user"
 
 const userStore = useUserStore()
+const router = useRouter()
 const loading = ref(true)
 const surveys = ref<Survey[]>([])
 const allSkills = ref<string[]>([])
@@ -277,6 +278,10 @@ async function toggleEnabled(row: any, value: string | number | boolean) {
   }
 }
 
+function openIgnores(row: any) {
+  router.push({ name: "SurveyIgnores", params: { surveyUid: row.survey_uid } })
+}
+
 async function clearWorkspace(row: any) {
   try {
     await ElMessageBox.confirm(
@@ -401,13 +406,16 @@ onMounted(load)
             />
           </template>
         </el-table-column>
-        <el-table-column v-if="userStore.isAdmin" label="操作" width="260" fixed="right">
+        <el-table-column v-if="userStore.isAdmin" label="操作" width="330" fixed="right">
           <template #default="{ row }">
             <el-button link type="primary" size="small" @click="runNow(row)">
               立即执行
             </el-button>
             <el-button link type="primary" size="small" @click="openEdit(row)">
               编辑
+            </el-button>
+            <el-button link type="primary" size="small" @click="openIgnores(row)">
+              忽略清单
             </el-button>
             <el-button link type="warning" size="small" @click="clearWorkspace(row)">
               清理工作区

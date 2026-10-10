@@ -11,6 +11,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from datetime import datetime
 from pathlib import Path
 
@@ -274,6 +275,16 @@ class SurveyStorageTestCase(unittest.TestCase):
         db.reset_engine_for_tests()
         os.environ.pop("OPENCR_DATABASE_URL", None)
 
+    def _survey_id(self):
+        """测试巡检在库里的自增 id，供直接写台账的用例使用。"""
+        from sqlalchemy import select
+
+        from backend.storage.db import session_scope
+        from backend.storage.models import Survey
+
+        with session_scope() as session:
+            return session.scalar(select(Survey.id).where(Survey.survey_uid == self.survey["survey_uid"]))
+
     def _run(self, entries, trigger="schedule", inspected=None):
         """
         跑一轮并落库；entries 是 (file_path, category) 列表。
@@ -446,15 +457,6 @@ class SurveyFindingDiffTests(SurveyStorageTestCase):
         # 本轮未发现之后又出现，对读报告的人来说就是新问题
         self.assertEqual(counters["new"], 1)
 
-    def _survey_id(self):
-        from sqlalchemy import select
-
-        from backend.storage.db import session_scope
-        from backend.storage.models import Survey
-
-        with session_scope() as session:
-            return session.scalar(select(Survey.id).where(Survey.survey_uid == self.survey["survey_uid"]))
-
     def test_ignored_findings_are_never_stored(self):
         """入库再过滤的话，"本次 80 条"会一直包含用户说过不想再看的条目。"""
         from backend.survey.common import finding_fingerprint
@@ -475,6 +477,120 @@ class SurveyFindingDiffTests(SurveyStorageTestCase):
         self.assertTrue(self.repo.remove_survey_ignore(self.survey["survey_uid"], fingerprint))
         _, counters = self._run([("lib/a.dart", "security")])
         self.assertEqual(counters["ignored"], 0)
+
+
+class SurveyIgnoreListTests(SurveyStorageTestCase):
+    def test_list_describes_issue_from_ledger(self):
+        """指纹是哈希，清单不带上问题描述的话，没人判断得了该不该取消。"""
+        from backend.survey.common import finding_fingerprint
+
+        fingerprint = finding_fingerprint("app", "lib/a.dart", "security")
+        run_uid, _ = self._run([("lib/a.dart", "security")])
+        self.repo.upsert_survey_ledger(self._survey_id(), [{
+            "fingerprint": fingerprint, "repo_slug": "app", "file_path": "lib/a.dart",
+            "category": "security", "severity": "critical", "title": "台账标题",
+            "state": "present", "last_run_uid": run_uid,
+        }])
+        self.repo.add_survey_ignore(self.survey["survey_uid"], fingerprint, "第三方 SDK，改不了")
+
+        [item] = self.repo.list_survey_ignores(self.survey["survey_uid"])
+        self.assertEqual(item["note"], "第三方 SDK，改不了")
+        self.assertEqual((item["file_path"], item["title"], item["severity"]), ("lib/a.dart", "台账标题", "critical"))
+        self.assertEqual(item["last_run_uid"], run_uid)
+
+    def test_list_falls_back_to_latest_finding_without_ledger_row(self):
+        from backend.survey.common import finding_fingerprint
+
+        fingerprint = finding_fingerprint("app", "lib/a.dart", "security")
+        self._run([("lib/a.dart", "security")])
+        self.repo.add_survey_ignore(self.survey["survey_uid"], fingerprint)
+
+        [item] = self.repo.list_survey_ignores(self.survey["survey_uid"])
+        self.assertEqual((item["file_path"], item["title"]), ("lib/a.dart", "问题 lib/a.dart"))
+        self.assertEqual(item["last_run_uid"], "")
+
+    def test_list_keeps_entries_whose_issue_is_gone(self):
+        """相关运行被清理后仍要列出来，否则这条忽略就再也取消不了。"""
+        self.repo.add_survey_ignore(self.survey["survey_uid"], "f" * 64, "历史遗留")
+        [item] = self.repo.list_survey_ignores(self.survey["survey_uid"])
+        self.assertEqual((item["fingerprint"], item["note"], item["file_path"]), ("f" * 64, "历史遗留", ""))
+
+    def test_update_note(self):
+        uid = self.survey["survey_uid"]
+        self.repo.add_survey_ignore(uid, "f" * 64)
+        self.assertTrue(self.repo.update_survey_ignore_note(uid, "f" * 64, "补一个理由"))
+        self.assertEqual(self.repo.list_survey_ignores(uid)[0]["note"], "补一个理由")
+        self.assertTrue(self.repo.update_survey_ignore_note(uid, "f" * 64, ""))
+        self.assertEqual(self.repo.list_survey_ignores(uid)[0]["note"], "")
+        self.assertFalse(self.repo.update_survey_ignore_note(uid, "e" * 64, "x"))
+        self.assertFalse(self.repo.update_survey_ignore_note("missing", "f" * 64, "x"))
+
+    def test_blank_note_is_stored_as_missing(self):
+        """一串空白占住理由的话，之后重复标记时再也补不上。"""
+        uid = self.survey["survey_uid"]
+        self.repo.add_survey_ignore(uid, "f" * 64, "   ")
+        self.repo.add_survey_ignore(uid, "f" * 64, "  真正的理由 ")
+        self.assertEqual(self.repo.list_survey_ignores(uid)[0]["note"], "真正的理由")
+        self.repo.update_survey_ignore_note(uid, "f" * 64, " \n ")
+        self.assertEqual(self.repo.list_survey_ignores(uid)[0]["note"], "")
+
+    def test_link_to_purged_run_is_dropped(self):
+        """台账的 last_run_uid 不做外键，运行被清理后给出去就是 404。"""
+        self.repo.upsert_survey_ledger(self._survey_id(), [{
+            "fingerprint": "f" * 64, "repo_slug": "app", "file_path": "lib/a.dart",
+            "state": "present", "last_run_uid": "purged-run",
+        }])
+        self.repo.add_survey_ignore(self.survey["survey_uid"], "f" * 64)
+        [item] = self.repo.list_survey_ignores(self.survey["survey_uid"])
+        self.assertEqual((item["file_path"], item["last_run_uid"]), ("lib/a.dart", ""))
+
+    def test_ignored_fingerprints_for_the_survey_only(self):
+        other = self.repo.create_survey(
+            name="另一个巡检", slug="other",
+            schedule_kind="weekly", schedule_expr="1 09:00", timezone_name="Asia/Shanghai",
+            sources=[], next_run_at=datetime(2026, 9, 14, 1, 0),
+        )
+        self.repo.add_survey_ignore(self.survey["survey_uid"], "f" * 64)
+        self.repo.add_survey_ignore(other["survey_uid"], "e" * 64)
+        self.assertEqual(self.repo.survey_ignored_fingerprints(self.survey["survey_uid"]), {"f" * 64})
+        self.assertEqual(self.repo.survey_ignored_fingerprints("missing"), set())
+
+    def test_marking_again_fills_missing_note_but_never_overwrites(self):
+        """同一文件同一类别的多条发现共享指纹，会被重复标记。"""
+        uid = self.survey["survey_uid"]
+        self.repo.add_survey_ignore(uid, "f" * 64)
+        self.repo.add_survey_ignore(uid, "f" * 64, "第二次才填")
+        self.repo.add_survey_ignore(uid, "f" * 64, "第三次")
+        [item] = self.repo.list_survey_ignores(uid)
+        self.assertEqual(item["note"], "第二次才填")
+
+    def test_api_is_admin_only_and_round_trips(self):
+        """清单含问题标题与理由，属于正文一侧，Guest 拿不到。"""
+        from flask import Flask
+
+        from backend.admin import auth, routes
+
+        uid = self.survey["survey_uid"]
+        app = Flask(__name__)
+        app.register_blueprint(routes.admin_bp)
+        available = mock.patch.object(auth, "load_admin_config", return_value={"enabled": True, "bind_local_only": False})
+        with available, app.test_client() as client:
+            self.assertEqual(client.get(f"/api/admin/surveys/{uid}/ignores").status_code, 401)
+            self.assertEqual(
+                client.patch(f"/api/admin/surveys/{uid}/ignores/{'f' * 64}", json={"note": "x"}).status_code, 401
+            )
+            with mock.patch.object(auth, "is_admin", return_value=True):
+                created = client.post(f"/api/admin/surveys/{uid}/ignores", json={"fingerprint": "f" * 64, "note": "初始"})
+                self.assertEqual(created.status_code, 201)
+                patched = client.patch(f"/api/admin/surveys/{uid}/ignores/{'f' * 64}", json={"note": "改过"})
+                self.assertEqual(patched.status_code, 200)
+                listing = client.get(f"/api/admin/surveys/{uid}/ignores").get_json()
+                self.assertEqual(listing["survey_name"], "移动端周巡检")
+                self.assertEqual(listing["items"][0]["note"], "改过")
+                self.assertEqual(
+                    client.patch(f"/api/admin/surveys/{uid}/ignores/{'e' * 64}", json={"note": "x"}).status_code, 404
+                )
+                self.assertEqual(client.get("/api/admin/surveys/missing/ignores").status_code, 404)
 
 
 class SurveyRetentionTests(SurveyStorageTestCase):

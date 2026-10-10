@@ -276,7 +276,7 @@ def execute_survey_run(survey_uid: str, trigger: str) -> Optional[str]:
         rechecks, pending = plan_rechecks(
             [e for e in repo.list_survey_ledger_by_uid(survey_uid) if e["repo_slug"] in prepared_slugs],
             budget.l2_max_focus,
-            ignored={item["fingerprint"] for item in repo.list_survey_ignores(survey_uid)},
+            ignored=repo.survey_ignored_fingerprints(survey_uid),
         )
         focuses = merge_focuses(rechecks, planned, pending)
         # 在合并之后标注：合并会把 L1 与复核对同一文件的点名并成一条，标注要落在实际取证的那一条上

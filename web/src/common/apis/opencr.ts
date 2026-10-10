@@ -493,10 +493,31 @@ export function clearSurveyWorkspaceApi(surveyUid: string) {
   return request<{ removed: boolean }>({ url: `surveys/${surveyUid}/workspace`, method: "delete" })
 }
 
+/** 忽略清单的一项。问题描述字段取自台账或最近一条发现，两处都没有时为空串 */
+export interface SurveyIgnore {
+  fingerprint: string
+  note: string
+  created_at: string
+  repo_slug: string
+  file_path: string
+  category: string
+  severity: string
+  title: string
+  last_run_uid: string
+}
+
 export function getSurveyIgnoresApi(surveyUid: string) {
-  return request<{ items: Array<{ fingerprint: string, note: string, created_at: string }> }>({
+  return request<{ survey_name: string, items: SurveyIgnore[] }>({
     url: `surveys/${surveyUid}/ignores`,
     method: "get"
+  })
+}
+
+export function updateSurveyIgnoreNoteApi(surveyUid: string, fingerprint: string, note: string) {
+  return request<{ updated: boolean }>({
+    url: `surveys/${surveyUid}/ignores/${fingerprint}`,
+    method: "patch",
+    data: { note }
   })
 }
 

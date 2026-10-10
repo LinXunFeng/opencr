@@ -126,6 +126,12 @@ export const constantRoutes: RouteRecordRaw[] = [
         component: () => import("@/pages/surveys/detail.vue"),
         name: "SurveyRunDetail",
         meta: { title: "巡检报告", hidden: true, activeMenu: "/surveys/runs", surveyGated: true }
+      },
+      {
+        path: "list/:surveyUid/ignores",
+        component: () => import("@/pages/surveys/ignores.vue"),
+        name: "SurveyIgnores",
+        meta: { title: "忽略清单", hidden: true, activeMenu: "/surveys/list", surveyGated: true, adminOnly: true }
       }
     ]
   },

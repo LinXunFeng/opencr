@@ -853,8 +853,11 @@ def api_clear_workspace(survey_uid: str):
 @admin_bp.route("/api/admin/surveys/<survey_uid>/ignores", methods=["GET"])
 @require_admin
 def api_survey_ignores(survey_uid: str):
-    """忽略清单。含指纹与理由，属于正文一侧，不对 Guest 开放。"""
-    return jsonify({"items": repo.list_survey_ignores(survey_uid)})
+    """忽略清单。含指纹、理由与问题标题，属于正文一侧，不对 Guest 开放。"""
+    survey = repo.get_survey(survey_uid)
+    if survey is None:
+        return jsonify({"error": "巡检不存在"}), 404
+    return jsonify({"survey_name": survey["name"], "items": repo.list_survey_ignores(survey_uid)})
 
 
 @admin_bp.route("/api/admin/surveys/<survey_uid>/ignores", methods=["POST"])
@@ -876,6 +879,16 @@ def api_remove_survey_ignore(survey_uid: str, fingerprint: str):
     """取消忽略。"""
     removed = repo.remove_survey_ignore(survey_uid, fingerprint)
     return jsonify({"removed": removed})
+
+
+@admin_bp.route("/api/admin/surveys/<survey_uid>/ignores/<fingerprint>", methods=["PATCH"])
+@require_admin
+def api_update_survey_ignore(survey_uid: str, fingerprint: str):
+    """修改忽略理由。"""
+    payload = request.get_json(silent=True) or {}
+    if not repo.update_survey_ignore_note(survey_uid, fingerprint, str(payload.get("note") or "")):
+        return jsonify({"error": "忽略记录不存在"}), 404
+    return jsonify({"updated": True})
 
 
 @admin_bp.route("/api/admin/survey-runs", methods=["GET"])
