@@ -29,6 +29,7 @@ from ..storage.models import (
     INDEX_MODE_FAILED,
     INDEX_MODE_INIT,
     INDEX_MODE_SYNC,
+    REPO_FETCH_FAILED,
     REPO_IGNORED,
     REPO_TRUNCATED,
     SEVERITY_ADVICE,
@@ -69,6 +70,12 @@ DEGRADATION_LABELS: Dict[str, str] = {
 SKIPPED_REPO_LABELS: Dict[str, str] = {
     REPO_IGNORED: "在忽略清单里",
     REPO_TRUNCATED: "超出单次巡检的仓库上限",
+}
+
+# 「本轮未复查」里所在仓库本轮没参与的原因，与前端 SURVEY_UNCHECKED_REPO_LABEL 一致
+UNCHECKED_REPO_LABELS: Dict[str, str] = {
+    REPO_TRUNCATED: "仓库超出上限",
+    REPO_FETCH_FAILED: "仓库拉取失败",
 }
 
 # 以下文案与 web/src/common/constants/opencr.ts 的同名映射是两份拷贝（跨语言无法共用），改一边要同步另一边
@@ -119,6 +126,9 @@ def _render_findings(findings: List[dict], include_body: bool) -> str:
             # 与页面发现列表的「线索来源」列一致；旧数据没有来源，记为无记录
             clue = CLUE_LABELS.get(item.get("clue_source") or CLUE_UNKNOWN, item.get("clue_source"))
             tag = f"[{category}·线索：{clue}]"
+            # 「本轮未复查」里所在仓库本轮没参与的，注明原因：没轮到取证和整个仓库没拉下来，处理方式不一样
+            if item.get("repo_status") in UNCHECKED_REPO_LABELS:
+                tag += f"[{UNCHECKED_REPO_LABELS[item['repo_status']]}]"
             title = item.get("title") or ""
             if include_body and title:
                 blocks.append(f"- {tag} {location} —— {title}")
@@ -264,7 +274,9 @@ def render_run_markdown(detail: dict) -> str:
         f"新增 **{counts.get('new', 0)}**、"
         f"仍存在 **{counts.get('persisted', 0)}**、"
         f"较上次已消失 **{counts.get('resolved', 0)}**、"
-        f"本轮未复查 **{counts.get('unchecked', 0)}**。{ignored_note}",
+        f"本轮未复查 **{counts.get('unchecked', 0)}**"
+        + (f"、所在仓库已忽略 **{counts['ignored_repo']}**" if counts.get("ignored_repo") else "")
+        + f"。{ignored_note}",
         "",
     ]
 
@@ -319,6 +331,7 @@ def render_run_markdown(detail: dict) -> str:
     persisted_items = [f for f in findings if f.get("state") == "persisted"]
     resolved_items = detail.get("resolved_findings") or []
     unchecked_items = detail.get("unchecked_findings") or []
+    ignored_repo_items = detail.get("ignored_repo_findings") or []
 
     lines.extend(["## 新增", "", _render_findings(new_items, include_body), ""])
     lines.extend(["## 仍存在", "", _render_findings(persisted_items, include_body), ""])
@@ -333,11 +346,21 @@ def render_run_markdown(detail: dict) -> str:
     lines.extend([
         "## 本轮未复查",
         "",
-        "_以下问题在上一次巡检中出现过，本次没有再报出，但所在文件本次没有得出可信结论（没轮到取证、文件超出读取上限只看了片段、源码读取或模型输出失败），状态未知。_",
+        "_以下问题在上一次巡检中出现过，本次没有再报出，但所在文件本次没有得出可信结论（没轮到取证、文件超出读取上限只看了片段、源码读取或模型输出失败，或所在仓库本次超出上限、拉取失败，条目上会注明），状态未知。_",
         "",
         _render_findings(unchecked_items, include_body),
         "",
     ])
+    if ignored_repo_items:
+        # 只在有条目时出现：这一节只会出现在忽略某个仓库之后的第一轮，平时都是空的
+        lines.extend([
+            "## 所在仓库已忽略",
+            "",
+            "_以下问题在上一次巡检中出现过，所在仓库本次在忽略清单里，没有参与巡检。它们不是没轮到检查，也不说明已修复。_",
+            "",
+            _render_findings(ignored_repo_items, include_body),
+            "",
+        ])
 
     if not include_body:
         lines.extend([

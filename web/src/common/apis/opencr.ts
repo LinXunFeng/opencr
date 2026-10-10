@@ -291,6 +291,8 @@ export interface SurveyFinding {
   /** Guest 拿不到标题与正文，字段直接不存在（服务端剔除，不是前端隐藏） */
   title?: string
   body?: string
+  /** 只出现在「本轮未复查」里：所在仓库本轮没参与的原因（truncated / fetch_failed），其余为空串 */
+  repo_status?: string
 }
 
 export interface SurveyRunRepo {
@@ -361,8 +363,10 @@ export interface SurveyRunDetail extends SurveyRun {
   resolved_findings: SurveyFinding[]
   /** 上次有、本次没出现，且本轮没取证过所在文件：状态未知，不能算已消失 */
   unchecked_findings: SurveyFinding[]
+  /** 上一轮出现过、所在仓库本轮在忽略清单里而没参与的发现，不计入 unchecked */
+  ignored_repo_findings: SurveyFinding[]
   /** ignored：本次运行里已入库、但当前在忽略清单里而被隐藏的条数，不含在其余各项内 */
-  counts: { new: number, persisted: number, resolved: number, unchecked: number, total: number, ignored: number }
+  counts: { new: number, persisted: number, resolved: number, unchecked: number, ignored_repo: number, total: number, ignored: number }
   pushes: SurveyPush[]
   /** 是该巡检最近一次成功的运行、且配置了输出目标 */
   pushable: boolean

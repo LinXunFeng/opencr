@@ -452,7 +452,9 @@ Each run's scope is the **whole codebase**, but not every file has its source re
 - **New** — absent last time, present now
 - **Persisting** — present last time, or still "present" in the ledger
 - **Resolved since last run** — present last time, file inspected this run, not detected again (not the same as fixed)
-- **Not re-checked** — present last time and not reported again, but the file got no conclusive inspection this run (not reached, longer than the read limit so only an excerpt was read, source unreadable or model output unparseable)
+- **Not re-checked** — present last time and not reported again, but the file got no conclusive inspection this run (not reached, longer than the read limit so only an excerpt was read, source unreadable or model output unparseable; when the whole repository was cut by the limit or failed to fetch this run, the entry says so)
+
+In the first run after a repository is added to the ignore list, its findings from the previous run are listed separately under **Repository ignored** (shown only when non-empty) rather than as not re-checked: they were not missed, the repository is simply no longer surveyed.
 
 Matching is done on a fingerprint of `repository + file path + category`, and deliberately
 **excludes the body text**: the model never words the same problem identically twice, so including
