@@ -31,8 +31,8 @@ export const PHASE_LABEL: Record<string, string> = {
 }
 
 export const TRIGGER_LABEL: Record<string, string> = {
-  webhook_open: "MR 创建",
-  webhook_update: "MR 更新",
+  webhook_open: "合并请求创建",
+  webhook_update: "合并请求更新",
   manual: "手动触发"
 }
 
@@ -97,11 +97,11 @@ export const ERROR_KIND_LABEL: Record<string, string> = {
 
 /** 采纳率口径说明。改判定逻辑时这段也要同步改，否则面板会撒谎。 */
 export const ACCEPTANCE_NOTE
-  = "采纳率的分母是**已结算**的审查发现（MR 已合并或关闭）。判定口径为「有 👍 表态，或对应 discussion 已 resolved」，本版本不做代码改动验证，因此该数字是近似值。"
+  = "采纳率的分母是**已结算**的审查发现（合并请求已合并或关闭）。判定口径为「有 👍 表态，或对应 discussion 已 resolved」，本版本不做代码改动验证，因此该数字是近似值。"
 
 /** 覆盖率口径说明 */
 export const COVERAGE_NOTE
-  = "覆盖率 = 可追踪 / 全部产出。整体评论中的发现、以及行内投递失败降级成普通评论的发现，走的是 GitLab 不可 resolve 的普通评论，无法结算，因此不计入采纳率分母。"
+  = "覆盖率 = 可追踪 / 全部产出。整体评论中的发现、以及行内投递失败降级成普通评论的发现，走的是代码平台上不可 resolve 的普通评论，无法结算，因此不计入采纳率分母。"
 
 /** Stale 口径说明 */
 export const STALE_NOTE
@@ -344,6 +344,14 @@ export const PUSH_TRIGGER_LABEL: Record<string, string> = {
   manual: "手动推送"
 }
 
+/**
+ * 嵌进中文句子里的平台名：英文名两侧补空格（「访问 GitLab 数次」），中文的「代码平台」不补，
+ * 否则会出现「访问 代码平台 数次」。平台名来自服务端按 code_platform.type 给出的展示名
+ */
+export function spacedPlatform(name: string): string {
+  return /^[\x20-\x7E]+$/.test(name) ? ` ${name} ` : name
+}
+
 /** 口径解释，集中放置避免各页面漂移 */
 export const SURVEY_NOTES = {
   stateDiff:
@@ -400,9 +408,21 @@ export const SURVEY_NOTES = {
   ignoreInactive:
     "旧版本按「文件 + 类别」整体忽略，升级时找不到这条忽略对应的具体问题（相关运行已被清理），它已不再生效，可以直接取消。",
   ignoreRepoScope:
-    "已忽略的仓库之后不再拉取、不再分析，也不占单次巡检的仓库上限；不论它是手填的还是从组织里展开出来的。候选列表取自最近一次巡检的仓库清单（含超出上限被截掉的），也可以直接填仓库地址或 group/project。台账里这个仓库的行转为「已忽略」，已有报告不受影响。要按规则挡掉一类仓库（例如路径里带 archive 的），用组织来源上的排除模式。",
+    "已忽略的仓库之后不再拉取、不再分析，也不占单次巡检的仓库上限；不论它是手填的还是从组织里展开出来的。候选列表默认取自最近一次巡检的仓库清单（含超出上限被截掉的），可以在添加时按当前配置刷新，也可以直接填仓库地址或「组织/仓库」路径。台账里这个仓库的行转为「已忽略」，已有报告不受影响。要按规则挡掉一类仓库（例如路径里带 archive 的），用组织来源上的排除模式。",
   ignoreRepoRemove:
     "取消后，下一轮巡检起这个仓库重新参与。它在台账里的行会停在「已忽略」，等后续巡检复核出结论后才会变为「存在」或「本轮未发现」。",
+  candidatesFromRun: (time: string, platform: string) =>
+    `候选取自 ${time} 那次巡检的仓库清单，打开时不访问${spacedPlatform(platform)}。之后改过巡检的来源、或组织里增删过仓库的话，这份清单已经过时，可以按当前配置刷新。`,
+  candidatesNoRun:
+    "这个巡检还没有记录过仓库清单的运行（没跑过，或每次都在展开仓库之前就失败了），没有现成的候选。可以按当前配置刷新，或直接填写仓库地址。",
+  candidatesLive: (time: string) =>
+    `候选于 ${time} 按当前巡检配置获取，与下一轮巡检展开出的仓库一致（含超出上限、下一轮会被截掉的）。这份清单只用于挑选，不会保存，也不影响巡检。`,
+  candidatesRefreshTip: (platform: string) =>
+    `按当前巡检配置实时展开来源：每个组织要请求${spacedPlatform(platform)}数次，组织与仓库多时需要几秒到几十秒；组织展开目前只支持 GitLab 的 group。只读取仓库清单，不拉取代码，也不触发巡检。`,
+  candidatesRefreshTimeout: (platform: string) =>
+    `获取仓库清单超时（等待超过 2 分钟），可能是组织太多或${spacedPlatform(platform)}响应慢。原有候选保持不变，也可以直接填写仓库地址。`,
+  candidatesRefreshFailed: (count: number) =>
+    `有 ${count} 个组织展开失败，它们下面的仓库不在候选里：`,
   ignoreRepoNotePrompt:
     "为什么不再巡检这个仓库？半年后这里是唯一的线索。",
   ignoreRepoNotePlaceholder:

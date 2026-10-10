@@ -32,6 +32,7 @@ from ..survey.push import PushRejected, begin_pushes, check_destination, execute
 from ..survey.report import render_run_markdown
 from ..survey.schedule import describe_schedule, next_fire_time
 from ..survey.scheduler import trigger_survey_now
+from ..survey.sources import live_repo_candidates
 from ..survey.workspace import delete_workspace, workspace_size_bytes
 from .auth import (
     IDENTITY_ADMIN,
@@ -99,13 +100,24 @@ def _stale_after() -> int:
     return int(load_storage_config()["stale_after_seconds"])
 
 
+# 各代码平台的展示名称、合并请求叫法与网页路由。界面文案按它显示平台名，不写死 GitLab；
+# 未知平台退回通用叫法且不生成链接，不能套用 GitLab 的路由
+_PLATFORMS = {
+    "gitlab": ("GitLab", "MR", "-/merge_requests"),
+    "github": ("GitHub", "PR", "pull"),
+}
+_UNKNOWN_PLATFORM = ("代码平台", "合并请求", "")
+
+
+def _platform() -> tuple:
+    """当前配置的代码平台：(展示名称, 合并请求叫法, 合并请求网页路由)。"""
+    return _PLATFORMS.get(load_gitlab_config().get("type", "gitlab"), _UNKNOWN_PLATFORM)
+
+
 def _add_change_links(runs: list[dict]) -> list[dict]:
     """按配置平台补充合并请求名称与网页地址；未知平台或缺失路径时不生成链接。"""
     config = load_gitlab_config()
-    platform = config.get("type", "gitlab")
-    label, route = {"gitlab": ("MR", "-/merge_requests"), "github": ("PR", "pull")}.get(
-        platform, ("合并请求", "")
-    )
+    _, label, route = _platform()
     base = urlsplit(str(config.get("url") or "").strip())
     # 链接只包含网页地址，不把配置中可能存在的凭据、查询参数带给浏览器。
     valid = base.scheme in {"http", "https"} and bool(base.netloc) and not base.username and not base.password
@@ -284,9 +296,9 @@ def api_retry_run(run_uid: str):
     except Exception:
         # 无法确认 MR 状态时不启动，原运行不受影响，也不向游客暴露上游错误中的凭据。
         logger.exception("重新触发前读取 MR 状态失败")
-        return jsonify({"error": "无法读取 MR 当前状态，请稍后重试"}), 502
+        return jsonify({"error": "无法读取合并请求当前状态，请稍后重试"}), 502
     if mr["state"] != "opened":
-        return jsonify({"error": "仅允许对仍处于 opened 状态的 MR 重新触发"}), 409
+        return jsonify({"error": "仅允许对仍处于打开状态的合并请求重新触发"}), 409
     try:
         mode, skill = resolve_review_options({}, default_skill="")
         params = repo.start_retry_run(run_uid, payload["scope"], mode, skill)
@@ -899,10 +911,37 @@ def api_survey_ignored_repos(survey_uid: str):
     """已忽略仓库，以及可供标记的候选仓库（最近一次运行展开出的清单）。与忽略清单同一档，不对 Guest 开放。"""
     if repo.get_survey(survey_uid) is None:
         return jsonify({"error": "巡检不存在"}), 404
+    candidates = repo.list_survey_repo_candidates(survey_uid)
     return jsonify({
         "items": repo.list_survey_ignored_repos(survey_uid),
-        "candidates": repo.list_survey_repo_candidates(survey_uid),
+        # 刷新按钮与说明里显示的平台名
+        "platform_name": _platform()[0],
+        "candidates": candidates["items"],
+        "candidates_run_uid": candidates["run_uid"],
+        "candidates_run_started_at": candidates["run_started_at"],
     })
+
+
+@admin_bp.route("/api/admin/surveys/<survey_uid>/ignored-repos/live-candidates", methods=["GET"])
+@require_admin
+def api_survey_live_repo_candidates(survey_uid: str):
+    """
+    按当前配置访问代码平台实时展开来源，返回候选仓库与展开失败的来源。只在管理员手动点刷新时调用。
+
+    结果不落库：它只是给管理员挑仓库用的清单，写进运行记录会冒充一次没发生过的巡检。
+    """
+    survey = repo.get_survey(survey_uid)
+    if survey is None:
+        return jsonify({"error": "巡检不存在"}), 404
+    try:
+        items, errors = live_repo_candidates(
+            survey["sources"], load_max_repos(), repo.list_survey_ignored_repo_slugs(survey_uid)
+        )
+    except Exception as e:
+        # 单个组织的失败已经在 errors 里了，走到这里是意料之外的错误；管理员可以改为手填地址
+        logger.exception("Live repo candidates failed: survey=%s", survey_uid)
+        return jsonify({"error": f"获取仓库清单失败：{e}"}), 502
+    return jsonify({"items": items, "errors": errors})
 
 
 @admin_bp.route("/api/admin/surveys/<survey_uid>/ignored-repos", methods=["POST"])

@@ -8,9 +8,10 @@
 """
 
 import logging
-from typing import Dict, List, NamedTuple, Optional, Set
+from typing import Dict, List, NamedTuple, Optional, Set, Tuple
 from urllib.parse import urlparse
 
+from ..review.config import load_gitlab_config
 from ..review.gitlab import get_group_full_path, list_group_projects, require_gitlab_config
 from ..storage.models import SOURCE_ORG, SOURCE_REPO
 from .common import (
@@ -139,6 +140,7 @@ def resolve_sources(
         if kind == SOURCE_ORG:
             patterns = parse_json_list(source.get("exclude_patterns"))
             try:
+                check_platform_ready()
                 expanded = expand_group(url, patterns)
                 logger.info("Group expanded: %s -> %s repos", url, len(expanded))
             except Exception as e:
@@ -170,6 +172,36 @@ def resolve_sources(
     return ResolvedSources(resolved, truncated, ignored)
 
 
+def live_repo_candidates(
+    sources: List[dict], max_repos: int, ignored_slugs: Set[str]
+) -> Tuple[List[Dict[str, str]], List[Dict[str, str]]]:
+    """
+    按当前配置实时展开来源，返回 (可供标记为已忽略的仓库, 展开失败的来源)。
+
+    走的是巡检执行时同一个 resolve_sources，所以清单与下一轮实际会处理的仓库一致：
+    超出上限会被截掉的仓库照样列出（仓库太多时最想剔除的就是它们），已忽略的不列。
+    展开失败的组织单独返回而不是混进候选 —— 它不是仓库，选中它会存下一个永远命中不了的 slug；
+    也不能直接丢掉，否则界面上只是少了一批候选，看不出是某个组织没展开。
+    """
+    resolved = resolve_sources(sources, max_repos, ignored_slugs)
+    candidates: List[Dict[str, str]] = []
+    errors: List[Dict[str, str]] = []
+    for target in resolved.targets + resolved.truncated:
+        if target.get("error"):
+            errors.append({"source": target["url"], "error": target["error"]})
+        else:
+            candidates.append({"repo_slug": target["slug"], "url": target["url"]})
+    return sorted(candidates, key=lambda c: c["repo_slug"]), errors
+
+
 def check_platform_ready() -> None:
-    """组织展开依赖 GitLab API，配置不完整时给出明确错误而不是等 HTTP 报错。"""
+    """
+    组织展开目前只实现了 GitLab 的 group，平台不是 GitLab、或配置不完整时给出明确错误。
+
+    不拦的话，按 GitLab 路由把请求发到别的平台，用户只会看到一个 404 或"无法读取组织信息"，
+    看不出原因是平台不支持。
+    """
+    platform = str(load_gitlab_config().get("type") or "gitlab").strip().lower()
+    if platform != "gitlab":
+        raise SurveyError(f"组织展开目前只支持 GitLab 的 group，当前代码平台为 {platform}；请逐个填写仓库地址")
     require_gitlab_config()

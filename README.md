@@ -436,6 +436,8 @@ Admin console → Surveys → Survey configuration → New survey. Four things m
 **Organisations are expanded at run time**, not when you save. Repositories added to the
 organisation are therefore picked up by the next run automatically. Only the organisation's own
 projects (including subgroups) are included; projects other groups share with it are not.
+Organisation expansion currently supports GitLab groups only; on other platforms, list
+repositories individually.
 Exclude patterns exist so a single large repository pushed into the organisation cannot add an
 hour to every run.
 
@@ -457,6 +459,8 @@ Matching is done on a fingerprint of `repository + file path + category`, and de
 it would mark every finding as new on every run.
 
 Findings you do not want to see again can be marked as known issues, optionally with a reason. Only that one issue is ignored: since line numbers and wording change from run to run, later runs ask the model, while inspecting that file, whether a new finding is the same issue, and hide it from reports if so (with a note of how many are hidden); other issues in the same file are still reported. The model can be wrong, so each survey's ignore list (the "Ignore list" action on the survey list) shows which finding each entry hid most recently; there you can also edit reasons or un-ignore entries, which brings the hidden findings back.
+
+When some repositories in an organisation are unmaintained or unimportant, exclude them by name under "Ignored repositories" in the same ignore list, with a reason. Ignored repositories are no longer fetched or analysed and do not count towards the per-run repository limit; run details still list them with the status "ignored", so it is clear they did not take part. Ledger rows of such a repository that are still "present" become "ignored"; existing reports are unaffected. Candidates in the add dialog come from the latest run's repository list (including repositories cut by the limit), so opening the page does not call the code platform; after changing sources, or when repositories were added to or removed from the organisation, click "按当前配置刷新" (refresh with current configuration) to expand the current configuration once (it only lists repositories: no cloning, no survey run), and organisations that failed to expand are listed with their errors. You can also type a repository URL or a "group/repo" path; the computed repository identifier is shown after adding so you can verify it. To exclude a whole class of repositories by rule (for example paths containing "archive"), use the exclude patterns on the organisation source.
 
 Reports can be exported as Markdown. The export renders the same data as the console, so a guest
 export contains no bodies either.

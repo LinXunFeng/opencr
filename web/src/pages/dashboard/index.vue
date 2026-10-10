@@ -128,10 +128,10 @@ onBeforeUnmount(() => {
             {{ row.project_path || row.project_id }}
           </template>
         </el-table-column>
-        <el-table-column label="MR" width="90">
+        <el-table-column label="合并请求" width="90">
           <template #default="{ row }">
             <el-link type="primary" @click="openRun(row.run_uid)">
-              !{{ row.mr_iid }}
+              #{{ row.mr_iid }}
             </el-link>
           </template>
         </el-table-column>

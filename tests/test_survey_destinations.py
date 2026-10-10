@@ -721,7 +721,7 @@ class IgnoredRepoTests(LedgerStorageTestCase):
 
     def test_candidates_come_from_latest_run_minus_ignored(self):
         uid = self.survey["survey_uid"]
-        self.assertEqual(self.repo.list_survey_repo_candidates(uid), [])
+        self.assertEqual(self.repo.list_survey_repo_candidates(uid), {"items": [], "run_uid": "", "run_started_at": ""})
         self._complete_run([], repos=(("g-a", "ok"),))
         self._complete_run([], repos=(("g-b", "ok"), ("g-c", "fetch_failed"), ("g-a", "ignored")))
         # 组织展开失败的行以组织地址充当 repo_slug，它不是仓库，不能当候选
@@ -729,7 +729,11 @@ class IgnoredRepoTests(LedgerStorageTestCase):
         self.repo.record_survey_repo(latest, "grp/sub", "grp/sub", status="fetch_failed", error_message="404")
         self.repo.add_survey_ignored_repo(uid, "g/a")
         self.repo.add_survey_ignored_repo(uid, "g/c")
-        self.assertEqual([c["repo_slug"] for c in self.repo.list_survey_repo_candidates(uid)], ["g-b"])
+        candidates = self.repo.list_survey_repo_candidates(uid)
+        self.assertEqual([c["repo_slug"] for c in candidates["items"]], ["g-b"])
+        # 清单来自哪一轮要带上，界面据此提示它可能过时
+        self.assertEqual(candidates["run_uid"], latest)
+        self.assertTrue(candidates["run_started_at"])
 
     def test_run_skips_ignored_repos_and_records_them(self):
         """全部仓库都被忽略时判失败并说清原因；被跳过的仓库留在运行记录里，而不是悄无声息地少了一个。"""
@@ -779,7 +783,7 @@ class IgnoredRepoRunTests(LedgerStorageTestCase):
             sorted((r["repo_slug"], r["status"]) for r in detail["repos"]),
             [("grp-r0", "ignored"), ("grp-r3", "truncated")],
         )
-        self.assertEqual([c["repo_slug"] for c in self.repo.list_survey_repo_candidates(uid)], ["grp-r3"])
+        self.assertEqual([c["repo_slug"] for c in self.repo.list_survey_repo_candidates(uid)["items"]], ["grp-r3"])
 
         from backend.survey.report import render_run_markdown
 
@@ -821,6 +825,67 @@ class IgnoredRepoRouteTests(LedgerStorageTestCase):
         self.addCleanup(patch.stop)
         self.base = f"/api/admin/surveys/{self.survey['survey_uid']}/ignored-repos"
 
+    def test_live_candidates_follow_current_config(self):
+        """
+        手动刷新按当前配置实时展开：与下一轮巡检会处理的仓库一致，截掉的照列、已忽略的不列，
+        展开失败的组织单独报出来而不是混进候选；结果不落库。
+        """
+        from backend.survey import sources
+
+        uid = self.survey["survey_uid"]
+        self.repo.update_survey(uid, {}, sources=[
+            {"kind": "repo", "url": "https://g.com/grp/kept.git"},
+            {"kind": "repo", "url": "https://g.com/grp/ignored.git"},
+            {"kind": "org", "url": "grp/broken"},
+            {"kind": "org", "url": "grp/team"},
+        ])
+        self.repo.add_survey_ignored_repo(uid, "grp/ignored")
+
+        def expand(path, patterns):
+            """grp/broken 展开失败，grp/team 下有两个仓库。"""
+            if path == "grp/broken":
+                raise RuntimeError("404 Group Not Found")
+            return [{"url": f"https://g.com/team/{n}.git", "branch": "", "path": f"team/{n}"} for n in ("b", "a")]
+
+        with self.client.session_transaction() as session:
+            session["identity"] = "admin"
+        with mock.patch.object(sources, "expand_group", side_effect=expand), \
+                mock.patch.object(sources, "check_platform_ready"), \
+                mock.patch("backend.admin.routes.load_max_repos", return_value=2):
+            result = self.client.get(f"{self.base}/live-candidates").json
+        self.assertEqual([c["repo_slug"] for c in result["items"]], ["grp-kept", "team-a", "team-b"])
+        self.assertEqual(result["errors"], [{"source": "grp/broken", "error": "404 Group Not Found"}])
+        self.assertEqual(self.repo.list_survey_runs(uid), [])
+
+        with mock.patch("backend.admin.routes.live_repo_candidates", side_effect=RuntimeError("boom")):
+            self.assertEqual(self.client.get(f"{self.base}/live-candidates").status_code, 502)
+        self.assertEqual(self.client.get("/api/admin/surveys/missing/ignored-repos/live-candidates").status_code, 404)
+
+    def test_platform_name_follows_config(self):
+        """项目不只对接 GitLab：刷新按钮与说明里的平台名按 code_platform.type 显示，未知平台用通用叫法。"""
+        with self.client.session_transaction() as session:
+            session["identity"] = "admin"
+        for platform, expected in (("gitlab", "GitLab"), ("github", "GitHub"), ("gitea", "代码平台")):
+            with mock.patch("backend.admin.routes.load_gitlab_config", return_value={"type": platform}):
+                self.assertEqual(self.client.get(self.base).json["platform_name"], expected, platform)
+
+    def test_org_sources_on_other_platforms_fail_clearly(self):
+        """组织展开只实现了 GitLab：别的平台要明说不支持，而不是按 GitLab 路由发请求、只报一个 404。"""
+        from backend.survey import sources
+
+        with mock.patch.object(sources, "load_gitlab_config", return_value={"type": "github"}), \
+                mock.patch.object(sources, "expand_group") as expand:
+            result = sources.resolve_sources(
+                [{"kind": "org", "url": "team"}, {"kind": "repo", "url": "https://github.com/team/app.git"}], 10
+            )
+        expand.assert_not_called()
+        self.assertIn("只支持 GitLab", result.targets[0]["error"])
+        self.assertEqual(result.targets[1]["slug"], "team-app")
+
+    def test_live_candidates_are_admin_only(self):
+        """实时展开会访问 GitLab 并列出组织下的全部仓库，与忽略清单同一档，Guest 不可调用。"""
+        self.assertEqual(self.client.get(f"{self.base}/live-candidates").status_code, 401)
+
     def test_admin_only_and_round_trip(self):
         self.repo.set_setting("guest_retry", "1")
         self.assertEqual(self.client.get(self.base).status_code, 401)
@@ -838,6 +903,8 @@ class IgnoredRepoRouteTests(LedgerStorageTestCase):
         listed = self.client.get(self.base).json
         self.assertEqual([i["repo_slug"] for i in listed["items"]], ["g-a"])
         self.assertEqual([c["repo_slug"] for c in listed["candidates"]], ["g-b"])
+        self.assertTrue(listed["candidates_run_uid"])
+        self.assertTrue(listed["candidates_run_started_at"])
 
         self.assertEqual(self.client.patch(f"{self.base}/{item_id}", json={"note": "x"}).status_code, 200)
         self.assertEqual(self.client.patch(f"{self.base}/999", json={"note": "x"}).status_code, 404)

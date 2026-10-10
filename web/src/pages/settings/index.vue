@@ -147,7 +147,7 @@ onMounted(load)
         <el-form-item label="游客重新触发">
           <el-switch v-model="guestRetry" :loading="saving" :disabled="saving || !guestRead" @change="toggleGuestRetry" />
           <div class="hint">
-            默认关闭。开启后，游客可重新触发失败的审查，消耗模型额度并向 MR 发布评论；仅在游客浏览也开启时生效。
+            默认关闭。开启后，游客可重新触发失败的审查，消耗模型额度并向合并请求发布评论；仅在游客浏览也开启时生效。
           </div>
         </el-form-item>
 
