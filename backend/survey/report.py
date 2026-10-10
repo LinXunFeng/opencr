@@ -234,6 +234,12 @@ def render_run_markdown(detail: dict) -> str:
     """把 get_survey_run_detail 的结果渲染成一篇完整报告。"""
     include_body = bool(detail.get("body_included", True))
     counts = detail.get("counts") or {}
+    # 文案与界面一致（web/src/common/constants/opencr.ts 的 SURVEY_NOTES.ignoredHidden）。
+    # 不注明的话，读者会拿它和上一份导出的数字对不上
+    ignored_note = (
+        f"本次运行另有 {counts['ignored']} 条发现已标记为不再提醒，未列出，不计入以上各项。"
+        if counts.get("ignored") else ""
+    )
     zone_name = detail.get("survey_timezone") or "UTC"
     lines: List[str] = [
         f"# 巡检报告：{detail.get('survey_name') or '未命名'}",
@@ -249,7 +255,7 @@ def render_run_markdown(detail: dict) -> str:
         f"新增 **{counts.get('new', 0)}**、"
         f"仍存在 **{counts.get('persisted', 0)}**、"
         f"较上次已消失 **{counts.get('resolved', 0)}**、"
-        f"本轮未复查 **{counts.get('unchecked', 0)}**。",
+        f"本轮未复查 **{counts.get('unchecked', 0)}**。{ignored_note}",
         "",
     ]
 

@@ -454,7 +454,7 @@ Matching is done on a fingerprint of `repository + file path + category`, and de
 **excludes the body text**: the model never words the same problem identically twice, so including
 it would mark every finding as new on every run.
 
-Findings you do not want to see again can be marked as known issues, optionally with a reason; later runs will not report them. Ignoring works on the fingerprint, so it also silences other findings of the same category in the same file. Each survey's ignore list is reachable from the "Ignore list" action on the survey list, where you can edit reasons or un-ignore entries.
+Findings you do not want to see again can be marked as known issues, optionally with a reason; later runs will not report them. Ignoring works on the fingerprint, so it also silences other findings of the same category in the same file; existing reports hide them too (with a note of how many are hidden) and show them again once un-ignored. Each survey's ignore list is reachable from the "Ignore list" action on the survey list, where you can edit reasons or un-ignore entries.
 
 Reports can be exported as Markdown. The export renders the same data as the console, so a guest
 export contains no bodies either.

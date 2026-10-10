@@ -100,7 +100,7 @@ async function ignore(finding: SurveyFinding) {
   let note: string
   try {
     const result = await ElMessageBox.prompt(
-      `${SURVEY_NOTES.ignoreScope}可以在巡检配置的「忽略清单」里查看与取消。`,
+      `${SURVEY_NOTES.ignoreScope}${SURVEY_NOTES.ignoreHidesReports}可以在巡检配置的「忽略清单」里查看与取消。`,
       "不再提醒",
       {
         type: "warning",
@@ -116,6 +116,8 @@ async function ignore(finding: SurveyFinding) {
   try {
     await addSurveyIgnoreApi(detail.value.survey_uid, finding.fingerprint, note)
     ElMessage.success("已加入忽略清单")
+    // 服务端在读取报告时隐藏忽略清单里的条目，重新拉取即可让它从各栏消失
+    await load(true)
   } catch (error) {
     ElMessage.error((error as Error).message)
   }
@@ -328,6 +330,19 @@ onMounted(() => load())
       <el-card shadow="never">
         <template #header>
           发现（共 {{ detail.counts.total }} 条）
+          <!-- 不注明的话，标记之后条数变少，看起来像数据丢了 -->
+          <span v-if="detail.counts.ignored" class="sub ml">
+            {{ SURVEY_NOTES.ignoredHidden(detail.counts.ignored) }}
+            <el-button
+              v-if="userStore.isAdmin && detail.survey_uid"
+              link
+              type="primary"
+              size="small"
+              @click="router.push({ name: 'SurveyIgnores', params: { surveyUid: detail.survey_uid } })"
+            >
+              查看忽略清单
+            </el-button>
+          </span>
         </template>
 
         <el-alert class="mb" type="info" :closable="false" show-icon :title="SURVEY_NOTES.stateDiff" />

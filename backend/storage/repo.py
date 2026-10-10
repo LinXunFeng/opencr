@@ -1375,7 +1375,6 @@ def record_survey_findings(run_uid: str, findings: List[dict]) -> Dict[str, int]
         FINDING_STATE_PERSISTED,
         LEDGER_PRESENT,
         SurveyFinding,
-        SurveyIgnore,
         SurveyLedgerEntry,
         SurveyRun,
     )
@@ -1389,11 +1388,7 @@ def record_survey_findings(run_uid: str, findings: List[dict]) -> Dict[str, int]
         if run is None:
             return counters
         survey_id = run.survey_id
-        ignored = set(
-            session.scalars(
-                select(SurveyIgnore.fingerprint).where(SurveyIgnore.survey_id == survey_id)
-            ).all()
-        )
+        ignored = _survey_ignored_set(session, survey_id)
         still_present = set(
             session.scalars(
                 select(SurveyLedgerEntry.fingerprint).where(
@@ -1612,11 +1607,42 @@ def _survey_finding_to_dict(finding: "SurveyFinding", include_body: bool) -> dic
     return item
 
 
+def _survey_ignored_set(session, survey_id: int) -> set:
+    """某个巡检当前忽略清单里的指纹集合（按 survey_id 查，供已持有 session 的调用方使用）。"""
+    from .models import SurveyIgnore
+
+    return set(
+        session.scalars(select(SurveyIgnore.fingerprint).where(SurveyIgnore.survey_id == survey_id)).all()
+    )
+
+
+def _survey_finding_not_ignored():
+    """
+    SurveyFinding 的查询条件：指纹不在所属巡检的**当前**忽略清单里。
+
+    已入库的条目被忽略后不删除，只在读取时剔除（取消忽略即恢复）；
+    按条数汇总 SurveyFinding 的地方都要带上它，否则数字会和报告列表对不上。
+    报告详情（get_survey_run_detail）用的是与它等价的 _survey_ignored_set 集合过滤：
+    它要算出被隐藏了几条，还要拿同一份集合过滤上一轮的发现。改判定条件时两处要同步。
+    """
+    from .models import SurveyFinding, SurveyIgnore
+
+    return ~(
+        select(SurveyIgnore.id)
+        .where(
+            SurveyIgnore.survey_id == SurveyFinding.survey_id,
+            SurveyIgnore.fingerprint == SurveyFinding.fingerprint,
+        )
+        .exists()
+    )
+
+
 def _survey_clue_counts(session, run_ids: List[int]) -> Dict[int, Dict[str, int]]:
     """
     按运行统计已落库 Finding 的线索来源分布：{run_id: {CLUE_SOURCES 的每个键, unknown}}。
 
     从 survey_finding 现算而不是读快照：被忽略的条目不入库，快照里的数字会比列表多。
+    同理，入库之后才被忽略的条目也不计入 —— 报告列表在读取时把它们藏掉了。
     unknown 是功能上线前的旧数据，单列出来，不并进任何一类。
     """
     from .models import CLUE_SOURCES, CLUE_UNKNOWN, SurveyFinding
@@ -1628,7 +1654,7 @@ def _survey_clue_counts(session, run_ids: List[int]) -> Dict[int, Dict[str, int]
         return result
     rows = session.execute(
         select(SurveyFinding.run_id, SurveyFinding.clue_source, func.count())
-        .where(SurveyFinding.run_id.in_(run_ids))
+        .where(SurveyFinding.run_id.in_(run_ids), _survey_finding_not_ignored())
         .group_by(SurveyFinding.run_id, SurveyFinding.clue_source)
     ).all()
     for run_id, source, count in rows:
@@ -1670,6 +1696,8 @@ def get_survey_run_detail(
     "已消失"不从库里读 —— 它没有对应的行（见 models 里 FINDING_STATE 的注释），
     是拿上一次的指纹集减去本次算出来的。差集里落在本轮没取证过的文件上的，
     单独列为"本轮未复查"（unchecked_findings），不算已消失。
+
+    命中**当前**忽略清单的发现不出现在任何一栏，也不计入 counts；隐藏的条数单独给出（counts.ignored）。
     """
     from .models import Survey, SurveyFinding, SurveyRun, SurveyRunRepo
 
@@ -1678,9 +1706,13 @@ def get_survey_run_detail(
         if run is None:
             return None
         survey = session.get(Survey, run.survey_id)
-        findings = session.scalars(
+        # 标记之前已经入库的条目在读取时过滤，而不是标记时删掉：删掉就回不来了，
+        # 取消忽略后历史报告应当原样恢复；也不改写 state，它记录的是当时的比对结论
+        ignored = _survey_ignored_set(session, run.survey_id)
+        all_findings = session.scalars(
             select(SurveyFinding).where(SurveyFinding.run_id == run.id).order_by(SurveyFinding.id.asc())
         ).all()
+        findings = [f for f in all_findings if f.fingerprint not in ignored]
         repos = session.scalars(
             select(SurveyRunRepo).where(SurveyRunRepo.run_id == run.id).order_by(SurveyRunRepo.id.asc())
         ).all()
@@ -1733,7 +1765,7 @@ def get_survey_run_detail(
                 select(SurveyFinding).where(SurveyFinding.run_id == prev_run_id)
             ).all()
             for f in prev_findings:
-                if f.fingerprint in current_fps:
+                if f.fingerprint in current_fps or f.fingerprint in ignored:
                     continue
                 item = _survey_finding_to_dict(f, include_body)
                 if inspected is None or (f.repo_slug, f.file_path or "") in inspected:
@@ -1748,6 +1780,7 @@ def get_survey_run_detail(
             "resolved": len(resolved),
             "unchecked": len(unchecked),
             "total": len(findings),
+            "ignored": len(all_findings) - len(findings),
         }
         return detail
 
@@ -1949,10 +1982,15 @@ def purge_all_survey_runs() -> int:
 
 
 def survey_dashboard_stats(days: int = 90) -> dict:
-    """巡检的聚合统计。不含任何正文，Guest 开关打开时可直接返回。"""
+    """
+    巡检的聚合统计。不含任何正文，Guest 开关打开时可直接返回。
+
+    发现的三项分布不计当前忽略清单里的条目，与报告列表口径一致；运行数与忽略无关，照常计。
+    """
     from .models import SurveyFinding, SurveyRun
 
     since = _window_start(days)
+    visible = (SurveyFinding.created_at >= since, _survey_finding_not_ignored())
     with session_scope() as session:
         by_status = dict(
             session.execute(
@@ -1964,21 +2002,21 @@ def survey_dashboard_stats(days: int = 90) -> dict:
         by_category = dict(
             session.execute(
                 select(SurveyFinding.category, func.count())
-                .where(SurveyFinding.created_at >= since)
+                .where(*visible)
                 .group_by(SurveyFinding.category)
             ).all()
         )
         by_severity = dict(
             session.execute(
                 select(SurveyFinding.severity, func.count())
-                .where(SurveyFinding.created_at >= since)
+                .where(*visible)
                 .group_by(SurveyFinding.severity)
             ).all()
         )
         by_state = dict(
             session.execute(
                 select(SurveyFinding.state, func.count())
-                .where(SurveyFinding.created_at >= since)
+                .where(*visible)
                 .group_by(SurveyFinding.state)
             ).all()
         )
@@ -2027,7 +2065,7 @@ def get_survey_run_ledger_inputs(run_uid: str) -> Optional[dict]:
 
     运行不存在时返回 None。
     """
-    from .models import SurveyFinding, SurveyIgnore, SurveyRun, SurveyRunRepo
+    from .models import SurveyFinding, SurveyRun, SurveyRunRepo
 
     with session_scope() as session:
         run = session.scalar(select(SurveyRun).where(SurveyRun.run_uid == run_uid))
@@ -2035,11 +2073,7 @@ def get_survey_run_ledger_inputs(run_uid: str) -> Optional[dict]:
             return None
         findings = session.scalars(select(SurveyFinding).where(SurveyFinding.run_id == run.id)).all()
         repos = session.scalars(select(SurveyRunRepo).where(SurveyRunRepo.run_id == run.id)).all()
-        ignored = set(
-            session.scalars(
-                select(SurveyIgnore.fingerprint).where(SurveyIgnore.survey_id == run.survey_id)
-            ).all()
-        )
+        ignored = _survey_ignored_set(session, run.survey_id)
         return {
             "survey_id": run.survey_id,
             "status": run.status,
