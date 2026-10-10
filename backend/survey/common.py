@@ -77,7 +77,7 @@ def repo_slug_from_url(url: str) -> str:
 
 def parse_repo_reference(raw: str) -> Tuple[str, str]:
     """
-    把用户填的仓库引用（仓库地址、浏览器地址栏里的页面地址、或 group/project）规整成 (地址, repo_slug)。
+    把用户填的仓库引用（仓库地址、浏览器地址栏里的页面地址、或"组织/仓库"路径）规整成 (地址, repo_slug)。
 
     不合法时抛 ValueError。浏览器地址常带 /-/tree/main 这类页面后缀，不剥掉的话 slug 会取成
     "tree-main"；只填项目名、或只有主机名的地址同理会算出别的 slug —— 这些忽略永远不会命中，
@@ -90,7 +90,7 @@ def parse_repo_reference(raw: str) -> Tuple[str, str]:
     path = re.sub(r"^[a-zA-Z][a-zA-Z0-9+.-]*://[^/]*", "", text)
     path = re.sub(r"^[^/@]*@[^/:]*:", "", path)
     if len([part for part in re.split(r"[/:]", path) if part]) < 2:
-        raise ValueError("请填写仓库地址或带组织的路径，例如 group/project")
+        raise ValueError("请填写仓库地址或带组织的路径，例如 team/app")
     return text, repo_slug_from_url(text)
 
 

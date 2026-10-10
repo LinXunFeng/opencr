@@ -1,9 +1,10 @@
 <script lang="ts" setup>
-import type { SurveyIgnore, SurveyIgnoredRepo, SurveyRepoCandidate } from "@@/apis/opencr"
+import type { SurveyIgnore, SurveyIgnoredRepo, SurveyRepoCandidate, SurveySourceError } from "@@/apis/opencr"
 import {
   addSurveyIgnoredRepoApi,
   getSurveyIgnoredReposApi,
   getSurveyIgnoresApi,
+  getSurveyLiveRepoCandidatesApi,
   removeSurveyIgnoreApi,
   removeSurveyIgnoredRepoApi,
   updateSurveyIgnoredRepoNoteApi,
@@ -32,6 +33,20 @@ const surveyName = ref("")
 const items = ref<SurveyIgnore[]>([])
 const repos = ref<SurveyIgnoredRepo[]>([])
 const candidates = ref<SurveyRepoCandidate[]>([])
+// 项目不只对接 GitLab，说明里要访问的平台按服务端配置的平台名显示；接口返回前先用通用叫法
+const platformName = ref("代码平台")
+/**
+ * 候选清单的出处：run = 最近一次运行的记录（可能过时），live = 刚从代码平台实时展开。
+ * 两种来源的可信度不同，弹窗里要分别说明，不能让人把过时的清单当成当前配置的结果。
+ */
+const candidateSource = reactive({
+  kind: "run" as "run" | "live",
+  runStartedAt: "",
+  // 实时清单不会自己过期，关掉弹窗再打开时仍在用；带上获取时刻，旧了一眼看得出
+  fetchedAt: "",
+  refreshing: false,
+  errors: [] as SurveySourceError[]
+})
 const repoDialog = reactive({ visible: false, saving: false, url: "", note: "" })
 
 const surveyUid = computed(() => String(route.params.surveyUid || ""))
@@ -46,7 +61,15 @@ async function load() {
     surveyName.value = result.survey_name
     items.value = result.items
     repos.value = repoResult.items
-    candidates.value = repoResult.candidates
+    platformName.value = repoResult.platform_name || "代码平台"
+    candidateSource.runStartedAt = repoResult.candidates_run_started_at
+    if (candidateSource.kind === "live") {
+      // 刷新过就沿用实时清单，只剔掉刚忽略的；换回运行记录等于把刚拿到的新清单又换成过时的
+      const ignored = new Set(repoResult.items.map(r => r.repo_slug))
+      candidates.value = candidates.value.filter(c => !ignored.has(c.repo_slug))
+    } else {
+      candidates.value = repoResult.candidates
+    }
   } catch (error) {
     ElMessage.error((error as Error).message)
   } finally {
@@ -97,6 +120,31 @@ async function unignore(row: any) {
     await load()
   } catch (error) {
     ElMessage.error((error as Error).message)
+  }
+}
+
+// 每次刷新的序号。取消忽略会让进行中的刷新作废：那次结果生成于取消之前，缺了刚放回来的仓库，
+// 晚到之后若照常采用，界面会把一份不完整的清单标成"与下一轮一致"
+let refreshSeq = 0
+
+async function refreshCandidates() {
+  const seq = ++refreshSeq
+  candidateSource.refreshing = true
+  try {
+    const result = await getSurveyLiveRepoCandidatesApi(surveyUid.value)
+    if (seq !== refreshSeq) return
+    // 刷新期间刚加入忽略的仓库可能还在返回结果里（请求先于添加发出），按当前清单再剔一遍
+    const ignored = new Set(repos.value.map(r => r.repo_slug))
+    candidates.value = result.items.filter(c => !ignored.has(c.repo_slug))
+    Object.assign(candidateSource, { kind: "live", fetchedAt: new Date().toISOString(), errors: result.errors })
+    ElMessage.success(`已按当前配置获取 ${candidates.value.length} 个候选仓库`)
+  } catch (error) {
+    if (seq !== refreshSeq) return
+    // 失败时保留原来的候选，手填地址不受影响。axios 超时没有响应，拦截器只会说"网络错误"，这里说清楚
+    const timedOut = (error as { code?: string }).code === "ECONNABORTED"
+    ElMessage.error(timedOut ? SURVEY_NOTES.candidatesRefreshTimeout(platformName.value) : (error as Error).message)
+  } finally {
+    if (seq === refreshSeq) candidateSource.refreshing = false
   }
 }
 
@@ -156,6 +204,10 @@ async function unignoreRepo(row: any) {
   try {
     await removeSurveyIgnoredRepoApi(surveyUid.value, item.id)
     ElMessage.success("已取消忽略")
+    // 实时清单里没有这个仓库（当时它被忽略了），继续标成"与下一轮一致"就不对了；
+    // 退回运行记录，说明文案随之变成"可能过时"，要最新的再点一次刷新
+    refreshSeq++
+    Object.assign(candidateSource, { kind: "run", refreshing: false, errors: [] })
     await load()
   } catch (error) {
     ElMessage.error((error as Error).message)
@@ -294,15 +346,36 @@ onMounted(load)
     <el-dialog v-model="repoDialog.visible" title="不再巡检的仓库" width="560px">
       <el-form label-width="70px">
         <el-form-item label="仓库">
-          <!-- 候选取自最近一次运行展开出的清单；不在里面的（例如还没跑过）可以直接填地址或 group/project -->
           <el-select
             v-model="repoDialog.url"
             filterable allow-create default-first-option clearable
-            placeholder="从最近一次巡检的仓库里选，或填地址 / group/project"
+            placeholder="从候选里选，或填仓库地址 / 组织/仓库路径"
             style="width: 100%"
           >
             <el-option v-for="c in candidates" :key="c.repo_slug" :label="c.url" :value="c.url" />
           </el-select>
+          <div class="candidate-source">
+            <span class="muted">
+              <template v-if="candidateSource.kind === 'live'">{{ SURVEY_NOTES.candidatesLive(formatTime(candidateSource.fetchedAt)) }}</template>
+              <template v-else-if="candidateSource.runStartedAt">
+                {{ SURVEY_NOTES.candidatesFromRun(formatTime(candidateSource.runStartedAt), platformName) }}
+              </template>
+              <template v-else>{{ SURVEY_NOTES.candidatesNoRun }}</template>
+            </span>
+            <el-tooltip :content="SURVEY_NOTES.candidatesRefreshTip(platformName)" placement="top">
+              <el-button link type="primary" size="small" :loading="candidateSource.refreshing" :disabled="repoDialog.saving" @click="refreshCandidates">
+                按当前配置刷新
+              </el-button>
+            </el-tooltip>
+          </div>
+          <el-alert
+            v-if="candidateSource.errors.length" class="candidate-errors" type="warning" :closable="false" show-icon
+            :title="SURVEY_NOTES.candidatesRefreshFailed(candidateSource.errors.length)"
+          >
+            <div v-for="e in candidateSource.errors" :key="e.source">
+              <code>{{ e.source }}</code>：{{ e.error }}
+            </div>
+          </el-alert>
         </el-form-item>
         <el-form-item label="理由">
           <el-input
@@ -315,7 +388,7 @@ onMounted(load)
         <el-button @click="repoDialog.visible = false">
           取消
         </el-button>
-        <el-button type="primary" :loading="repoDialog.saving" @click="addRepo">
+        <el-button type="primary" :loading="repoDialog.saving" :disabled="candidateSource.refreshing" @click="addRepo">
           加入忽略清单
         </el-button>
       </template>
@@ -345,6 +418,19 @@ onMounted(load)
 }
 .mt {
   margin-top: 12px;
+}
+.candidate-source {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+  margin-top: 4px;
+  font-size: 12px;
+  line-height: 1.6;
+}
+.candidate-errors {
+  margin-top: 6px;
 }
 .mr {
   margin-right: 4px;

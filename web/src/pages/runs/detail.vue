@@ -286,7 +286,7 @@ watch(() => route.params.runUid, load, { immediate: true })
         <p v-if="scope === 'all'" class="note">共 {{ historyTotal }} 个审查批次，每页最多 20 个批次。</p>
 
         <p class="note">
-          投递方式为「仅整体评论」或「降级为普通评论」的发现，走的是 GitLab 不可 resolve 的普通评论，
+          投递方式为「仅整体评论」或「降级为普通评论」的发现，走的是代码平台上不可 resolve 的普通评论，
           因此采纳结论恒为「不可追踪」，不计入采纳率分母。
         </p>
       </el-card>
@@ -299,7 +299,7 @@ watch(() => route.params.runUid, load, { immediate: true })
         <el-radio value="latest">最新全量</el-radio>
       </el-radio-group>
       <p v-if="!detail?.original_retry_available" class="note">原运行缺少完整范围或选择参数，仅支持最新全量。</p>
-      <p class="note">{{ retryScope === "original" ? "重新审查原运行的完整提交区间，技能按当前内容重新匹配。" : "审查当前 MR 的全部变更，使用当前默认审查设置。" }}</p>
+      <p class="note">{{ retryScope === "original" ? "重新审查原运行的完整提交区间，技能按当前内容重新匹配。" : "审查当前合并请求的全部变更，使用当前默认审查设置。" }}</p>
       <el-alert class="mt" type="warning" :closable="false" title="将创建新的审查运行，保留旧评论，可能产生重复评论。" />
       <el-alert v-if="retryError" class="mt" type="error" :closable="false" :title="retryError" />
       <el-link v-if="activeRunUid" class="mt" type="primary" @click="router.push(`/runs/detail/${activeRunUid}`)">查看正在运行的审查</el-link>

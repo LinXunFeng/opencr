@@ -554,16 +554,43 @@ export interface SurveyIgnoredRepo {
   created_at: string
 }
 
-/** 可供标记的候选仓库：最近一次运行展开出的清单，已去掉忽略过的 */
+/** 可供标记的候选仓库，已去掉忽略过的 */
 export interface SurveyRepoCandidate {
   repo_slug: string
   url: string
 }
 
+/**
+ * candidates 取自最近一次运行；candidates_run_* 说明是哪一轮，还没运行过时为空串。
+ * platform_name 是按 code_platform.type 显示的平台名（GitLab / GitHub，未知平台为「代码平台」）
+ */
 export function getSurveyIgnoredReposApi(surveyUid: string) {
-  return request<{ items: SurveyIgnoredRepo[], candidates: SurveyRepoCandidate[] }>({
+  return request<{
+    items: SurveyIgnoredRepo[]
+    platform_name: string
+    candidates: SurveyRepoCandidate[]
+    candidates_run_uid: string
+    candidates_run_started_at: string
+  }>({
     url: `surveys/${surveyUid}/ignored-repos`,
     method: "get"
+  })
+}
+
+/** 实时展开时失败的一个来源（组织），它下面的仓库不在候选里 */
+export interface SurveySourceError {
+  source: string
+  error: string
+}
+
+/** 按当前配置访问代码平台实时展开候选；errors 是展开失败的组织，不在 items 里 */
+export function getSurveyLiveRepoCandidatesApi(surveyUid: string) {
+  return request<{ items: SurveyRepoCandidate[], errors: SurveySourceError[] }>({
+    url: `surveys/${surveyUid}/ignored-repos/live-candidates`,
+    method: "get",
+    // 组织多、仓库多时要翻好几页，默认的 30 秒不够。不追平服务端（gunicorn 300 秒，代码平台单次请求 30 秒）的
+    // 最坏情况：让管理员对着转圈等五分钟不如早点告诉他超时、改为手填。超时文案见 SURVEY_NOTES.candidatesRefreshTimeout
+    timeout: 120000
   })
 }
 

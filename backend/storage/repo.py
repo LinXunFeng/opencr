@@ -131,7 +131,7 @@ def start_retry_run(source_uid: str, scope: str, review_mode: str, review_skill:
             ReviewRun.status == RUN_RUNNING).order_by(ReviewRun.started_at.desc()).limit(1))
         # Stale 没有终止保证，必须与正常 running 一样阻止重试。
         if active:
-            raise RetryRejected("该 MR 已有审查正在运行（含疑似中断），请查看运行记录", active_run_uid=active)
+            raise RetryRejected("该合并请求已有审查正在运行（含疑似中断），请查看运行记录", active_run_uid=active)
         if review_input is not None:
             review_mode = source.review_mode
             review_skill = review_input["review_skill"]
@@ -2056,39 +2056,48 @@ def list_survey_ignored_repos(survey_uid: str) -> List[dict]:
         ]
 
 
-def list_survey_repo_candidates(survey_uid: str) -> List[dict]:
+def list_survey_repo_candidates(survey_uid: str) -> dict:
     """
     可供标记为已忽略的仓库：最近一次记录了仓库清单的运行里出现的仓库，去掉已经忽略的。
 
-    取运行记录而不是实时展开组织：打开管理页不该触发一串 GitLab 请求，
-    而上一轮展开的清单就是用户在报告里看到、想要剔除的那一批。还没运行过的巡检返回空列表，界面上可以手填。
+    返回 {"items": [{"repo_slug", "url"}], "run_uid", "run_started_at"}，后两项说明清单来自哪一轮，
+    界面据此提示它可能过时；还没运行过的巡检 items 为空、后两项为空串。
+    默认取运行记录而不是实时展开组织：打开管理页不该触发一串 GitLab 请求，而上一轮展开的清单
+    就是用户在报告里看到、想要剔除的那一批。代价是配置或组织变了之后清单会过时，
+    所以另有手动刷新（survey.sources.live_repo_candidates）按当前配置实时展开。
     """
     from .models import Survey, SurveyIgnoredRepo, SurveyRun, SurveyRunRepo
 
+    empty = {"items": [], "run_uid": "", "run_started_at": ""}
     with session_scope() as session:
         survey_id = session.scalar(select(Survey.id).where(Survey.survey_uid == survey_uid))
         if survey_id is None:
-            return []
+            return empty
         latest_run_id = session.scalar(
             select(func.max(SurveyRunRepo.run_id))
             .join(SurveyRun, SurveyRun.id == SurveyRunRepo.run_id)
             .where(SurveyRun.survey_id == survey_id)
         )
         if latest_run_id is None:
-            return []
+            return empty
+        run = session.get(SurveyRun, latest_run_id)
         ignored = set(session.scalars(
             select(SurveyIgnoredRepo.repo_slug).where(SurveyIgnoredRepo.survey_id == survey_id)
         ).all())
         rows = session.scalars(
             select(SurveyRunRepo).where(SurveyRunRepo.run_id == latest_run_id).order_by(SurveyRunRepo.repo_slug)
         ).all()
-        return [
-            {"repo_slug": r.repo_slug, "url": r.url}
-            for r in rows
-            # 组织展开失败的行以组织地址充当 repo_slug（见 runner._prepare_workspaces），它不是仓库：
-            # 选中它会存下一个永远命中不了的 slug。拉取失败的真实仓库照常提供，它们正是常被剔除的那类
-            if r.repo_slug not in ignored and r.repo_slug != r.url
-        ]
+        return {
+            "items": [
+                {"repo_slug": r.repo_slug, "url": r.url}
+                for r in rows
+                # 组织展开失败的行以组织地址充当 repo_slug（见 runner._prepare_workspaces），它不是仓库：
+                # 选中它会存下一个永远命中不了的 slug。拉取失败的真实仓库照常提供，它们正是常被剔除的那类
+                if r.repo_slug not in ignored and r.repo_slug != r.url
+            ],
+            "run_uid": run.run_uid,
+            "run_started_at": run.started_at.isoformat() if run.started_at else "",
+        }
 
 
 def add_survey_ignored_repo(survey_uid: str, url: str, note: str = "") -> Optional[Tuple[int, str]]:

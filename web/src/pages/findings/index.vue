@@ -130,12 +130,12 @@ onMounted(async () => {
             {{ formatTime(row.created_at) }}
           </template>
         </el-table-column>
-        <el-table-column label="MR" width="80">
+        <el-table-column label="合并请求" width="90">
           <template #default="{ row }">
             <el-link v-if="row.run_uid" type="primary" @click="router.push(`/runs/detail/${row.run_uid}`)">
-              !{{ row.mr_iid }}
+              #{{ row.mr_iid }}
             </el-link>
-            <span v-else>!{{ row.mr_iid }}</span>
+            <span v-else>#{{ row.mr_iid }}</span>
           </template>
         </el-table-column>
         <el-table-column label="位置" min-width="240" show-overflow-tooltip>
