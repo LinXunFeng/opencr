@@ -20,6 +20,9 @@ from .models import (
     ERROR_UNEXPECTED,
     PHASE_DONE,
     REASON_NOT_TRACKABLE,
+    REPO_FETCH_FAILED,
+    REPO_IGNORED,
+    REPO_TRUNCATED,
     RUN_FAILED,
     RUN_RUNNING,
     RUN_SKIPPED,
@@ -1683,7 +1686,10 @@ def get_survey_run_detail(
 
     "已消失"不从库里读 —— 它没有对应的行（见 models 里 FINDING_STATE 的注释），
     是拿上一次的指纹集减去本次算出来的。差集里落在本轮没取证过的文件上的，
-    单独列为"本轮未复查"（unchecked_findings），不算已消失。
+    单独列为"本轮未复查"（unchecked_findings），不算已消失；其中所在仓库本轮没参与的
+    （超出上限、拉取失败）带上 repo_status 说明原因。
+    所在仓库本轮因为在忽略清单里而跳过的，再单独列为 ignored_repo_findings：它们不是没轮到检查，
+    而是用户说过不再看这个仓库，混在"本轮未复查"里会虚增它的条数，也会让人以为该去催一次复查。
 
     被已忽略问题隐藏的发现不出现在任何一栏，也不计入 counts；隐藏的条数单独给出（counts.ignored）。
     """
@@ -1748,6 +1754,9 @@ def get_survey_run_detail(
         inspected = _parse_inspected_files(run.inspected_files)
         resolved = []
         unchecked = []
+        ignored_repo = []
+        # 取本轮的仓库状态快照而不是当前的忽略清单：报告说的是这一轮发生了什么，之后取消忽略不该改写它
+        repo_status = {r.repo_slug: r.status for r in repos}
         if prev_run_id is not None:
             prev_findings = session.scalars(
                 select(SurveyFinding).where(SurveyFinding.run_id == prev_run_id)
@@ -1756,17 +1765,25 @@ def get_survey_run_detail(
                 if f.fingerprint in current_fps or f.ignore_id is not None:
                     continue
                 item = _survey_finding_to_dict(f, include_body)
-                if inspected is None or (f.repo_slug, f.file_path or "") in inspected:
+                status = repo_status.get(f.repo_slug, "")
+                if status == REPO_IGNORED:
+                    ignored_repo.append(item)
+                elif inspected is None or (f.repo_slug, f.file_path or "") in inspected:
                     resolved.append(item)
                 else:
+                    # 只标"整个仓库没参与"的两种状态，与 survey/report.py 的 UNCHECKED_REPO_LABELS 对应
+                    # （storage 不反向依赖 survey 层，所以在这里各列一遍）
+                    item["repo_status"] = status if status in (REPO_TRUNCATED, REPO_FETCH_FAILED) else ""
                     unchecked.append(item)
         detail["resolved_findings"] = resolved
         detail["unchecked_findings"] = unchecked
+        detail["ignored_repo_findings"] = ignored_repo
         detail["counts"] = {
             "new": sum(1 for f in findings if f.state == "new"),
             "persisted": sum(1 for f in findings if f.state == "persisted"),
             "resolved": len(resolved),
             "unchecked": len(unchecked),
+            "ignored_repo": len(ignored_repo),
             "total": len(findings),
             "ignored": len(all_findings) - len(findings),
         }
@@ -2337,7 +2354,7 @@ def get_survey_run_ledger_inputs(run_uid: str) -> Optional[dict]:
     台账据此标为已忽略，而不是本轮未发现。
     运行不存在时返回 None。
     """
-    from .models import REPO_IGNORED, SurveyFinding, SurveyIgnoredRepo, SurveyRun, SurveyRunRepo
+    from .models import SurveyFinding, SurveyIgnoredRepo, SurveyRun, SurveyRunRepo
 
     with session_scope() as session:
         run = session.scalar(select(SurveyRun).where(SurveyRun.run_uid == run_uid))

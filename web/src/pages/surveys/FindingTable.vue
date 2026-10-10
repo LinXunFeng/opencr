@@ -6,13 +6,14 @@ import {
   CLUE_SOURCE_LABEL,
   CLUE_SOURCE_TAG,
   SEVERITY_LABEL,
-  SEVERITY_TAG
+  SEVERITY_TAG,
+  SURVEY_UNCHECKED_REPO_LABEL
 } from "@@/constants/opencr"
 
 /**
  * 巡检发现列表。
  *
- * 「新增 / 仍存在 / 已消失」三个页签的表格结构完全一致，抽成组件避免三份拷贝逐渐漂移。
+ * 各个页签（新增、仍存在、已消失、本轮未复查、所在仓库已忽略）的表格结构完全一致，抽成组件避免多份拷贝逐渐漂移。
  * Guest 拿不到 title 与 body（服务端剔除，不是前端隐藏），这里显示占位而不是空白 ——
  * 空白会被误读成"这条发现没有内容"。
  */
@@ -77,6 +78,10 @@ function emitIgnore(row: any) {
     <el-table-column label="位置" min-width="280" show-overflow-tooltip>
       <template #default="{ row }">
         <code>{{ location(row) }}</code>
+        <!-- 只有「本轮未复查」的条目带这个字段：仓库整个没拉下来和文件没轮到取证，处理方式不一样 -->
+        <el-tag v-if="SURVEY_UNCHECKED_REPO_LABEL[row.repo_status]" size="small" type="warning" effect="plain" class="ml">
+          {{ SURVEY_UNCHECKED_REPO_LABEL[row.repo_status] }}
+        </el-tag>
       </template>
     </el-table-column>
     <el-table-column label="标题" min-width="240" show-overflow-tooltip>
@@ -106,5 +111,9 @@ function emitIgnore(row: any) {
 
 .muted {
   color: var(--el-text-color-secondary);
+}
+
+.ml {
+  margin-left: 6px;
 }
 </style>

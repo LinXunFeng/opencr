@@ -96,6 +96,7 @@ const newFindings = computed(() => (detail.value?.findings ?? []).filter(f => f.
 const persistedFindings = computed(() => (detail.value?.findings ?? []).filter(f => f.state === "persisted"))
 const resolvedFindings = computed(() => detail.value?.resolved_findings ?? [])
 const uncheckedFindings = computed(() => detail.value?.unchecked_findings ?? [])
+const ignoredRepoFindings = computed(() => detail.value?.ignored_repo_findings ?? [])
 
 /** 导出走服务端渲染，因此游客导出的报告同样不含正文——否则导出就成了绕过可见范围的后门 */
 function exportMarkdown() {
@@ -372,6 +373,11 @@ onMounted(() => load())
           <el-tab-pane :label="`本轮未复查 (${detail.counts.unchecked})`" name="unchecked">
             <el-alert class="mb" type="warning" :closable="false" show-icon :title="SURVEY_NOTES.uncheckedNotResolved" />
             <FindingTable :items="uncheckedFindings" :can-ignore="false" />
+          </el-tab-pane>
+          <!-- 只在忽略某个仓库之后的第一轮才有内容，平时不占位置 -->
+          <el-tab-pane v-if="detail.counts.ignored_repo" :label="`所在仓库已忽略 (${detail.counts.ignored_repo})`" name="ignored_repo">
+            <el-alert class="mb" type="info" :closable="false" show-icon :title="SURVEY_NOTES.ignoredRepoFindings" />
+            <FindingTable :items="ignoredRepoFindings" :can-ignore="false" />
           </el-tab-pane>
         </el-tabs>
       </el-card>

@@ -832,6 +832,41 @@ class IgnoredRepoRunTests(LedgerStorageTestCase):
         self.assertIn("grp-r3（超出单次巡检的仓库上限）", markdown)
         self.assertNotIn("| grp-r0 |", markdown)
 
+    def test_previous_findings_of_skipped_repos_are_grouped_by_reason(self):
+        """
+        上一轮的问题这一轮没再出现、所在仓库本轮没参与时：仓库在忽略清单里的单列为「所在仓库已忽略」，
+        不混进「本轮未复查」虚增它的条数；超出上限、拉取失败的仍算未复查，但注明原因。
+        """
+        from backend.survey.report import render_run_markdown
+
+        self._complete_run(
+            [_finding("lib/a.dart", repo="old"), _finding("lib/b.dart", repo="cut"),
+             _finding("lib/c.dart", repo="broken"), _finding("lib/d.dart"), _finding("lib/e.dart")],
+            repos=(("old", "ok"), ("cut", "ok"), ("broken", "ok"), ("app", "ok")),
+        )
+        run_uid = self._complete_run(
+            [], repos=(("old", "ignored"), ("cut", "truncated"), ("broken", "fetch_failed"), ("app", "ok")),
+            inspected=["lib/d.dart"],
+        )
+        detail = self.repo.get_survey_run_detail(run_uid)
+        self.assertEqual([f["repo_slug"] for f in detail["ignored_repo_findings"]], ["old"])
+        self.assertEqual(
+            sorted((f["repo_slug"], f["repo_status"]) for f in detail["unchecked_findings"]),
+            [("app", ""), ("broken", "fetch_failed"), ("cut", "truncated")],
+        )
+        self.assertEqual([f["file_path"] for f in detail["resolved_findings"]], ["lib/d.dart"])
+        self.assertEqual((detail["counts"]["unchecked"], detail["counts"]["ignored_repo"]), (3, 1))
+
+        markdown = render_run_markdown(detail)
+        self.assertIn("## 所在仓库已忽略", markdown)
+        self.assertIn("所在仓库已忽略 **1**", markdown)
+        self.assertIn("[仓库超出上限]", markdown)
+        self.assertIn("[仓库拉取失败]", markdown)
+
+        # 与其他分栏一样，Guest 看不到正文
+        guest = self.repo.get_survey_run_detail(run_uid, include_body=False)
+        self.assertNotIn("title", guest["ignored_repo_findings"][0])
+
     def test_ignoring_during_a_run_is_not_undone_by_it(self):
         """运行进行中才加入忽略的仓库已经被分析过了，那一轮收尾不能把刚转为已忽略的行写回存在。"""
         uid = self.survey["survey_uid"]

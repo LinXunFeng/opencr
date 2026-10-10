@@ -431,7 +431,7 @@ class SurveyFindingDiffTests(SurveyStorageTestCase):
         self.assertEqual(second, {"new": 1, "persisted": 1, "ignored": 0})
 
         detail = self.repo.get_survey_run_detail(run2)
-        self.assertEqual(detail["counts"], {"new": 1, "persisted": 1, "resolved": 1, "unchecked": 0, "total": 2, "ignored": 0})
+        self.assertEqual(detail["counts"], {"new": 1, "persisted": 1, "resolved": 1, "unchecked": 0, "ignored_repo": 0, "total": 2, "ignored": 0})
         self.assertEqual([f["file_path"] for f in detail["resolved_findings"]], ["lib/b.dart"])
 
     def test_run_that_failed_before_inspection_resolves_nothing(self):

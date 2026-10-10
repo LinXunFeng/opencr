@@ -201,6 +201,12 @@ export const SURVEY_REPO_STATUS_LABEL: Record<string, string> = {
   truncated: "超出上限"
 }
 
+/** 「本轮未复查」里所在仓库本轮没参与的原因，与服务端 report.UNCHECKED_REPO_LABELS 一致 */
+export const SURVEY_UNCHECKED_REPO_LABEL: Record<string, string> = {
+  truncated: "仓库超出上限",
+  fetch_failed: "仓库拉取失败"
+}
+
 /** 已忽略是用户的选择、超出上限是配置问题，都不是故障，不能和拉取失败一样标红 */
 export const SURVEY_REPO_STATUS_TAG: Record<string, TagType> = {
   ok: "success",
@@ -370,7 +376,9 @@ export const SURVEY_NOTES = {
   focusCapIncludesRecheck:
     "关注点上限同时也是每轮复核台账问题的文件数上限（另算），一轮最多取证两倍于此的文件。",
   uncheckedNotResolved:
-    "这些问题上一次巡检出现过、本次没有再报出，但所在文件本次没有得出可信结论（没轮到取证、文件超出读取上限只看了片段、源码读取或模型输出失败），既不能算仍存在，也不能算已消失。",
+    "这些问题上一次巡检出现过、本次没有再报出，但所在文件本次没有得出可信结论（没轮到取证、文件超出读取上限只看了片段、源码读取或模型输出失败，或所在仓库本次超出上限、拉取失败，位置旁会注明），既不能算仍存在，也不能算已消失。",
+  ignoredRepoFindings:
+    "这些问题上一次巡检出现过，所在仓库本次在忽略清单里，没有参与巡检。它们不是没轮到检查，也不说明已修复；取消忽略后，下一轮会重新复核。",
   guestScope:
     "游客能看到巡检的运行状态与聚合统计，但看不到发现正文与整体结论——巡检正文描述的是整个代码库的架构与弱点。",
   candidatePool:
