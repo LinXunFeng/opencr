@@ -368,6 +368,44 @@ class SurveyConfigTests(SurveyStorageTestCase):
         result = resolve_sources(sources, 5)
         self.assertEqual((len(result.targets), result.truncated), (5, []))
 
+    def test_group_expansion_keeps_only_the_groups_own_projects(self):
+        """
+        巡检范围以配置里写明的组织为准：其他组织共享进来的项目不算。
+
+        请求时要关掉 with_shared（GitLab 默认是 true），返回里混进来的再按组织当前的 full_path 前缀剔除；
+        子组织下的项目照常保留，大小写不同、改过名或填数字 id 的组织都要认。
+        """
+        from backend.review import gitlab
+        from backend.survey import sources
+        from backend.survey.common import SurveyError
+
+        def project(path):
+            """构造组织项目接口返回的一项。"""
+            return {"path_with_namespace": path, "http_url_to_repo": f"https://g.com/{path}.git"}
+
+        batch = [project("Mobile/app"), project("Mobile/sub/lib"), project("other/shared"),
+                 project("mobile-legacy/x")]
+        for configured in ("https://g.com/groups/mobile/-/shared", "42", "old-mobile-name"):
+            with mock.patch.object(sources, "get_group_full_path", return_value="Mobile") as lookup, \
+                    mock.patch.object(sources, "list_group_projects", return_value=batch):
+                repos = sources.expand_group(configured, [])
+            self.assertEqual([r["path"] for r in repos], ["Mobile/app", "Mobile/sub/lib"], configured)
+        self.assertEqual(lookup.call_args.args[0], "old-mobile-name")
+
+        # 读不到组织信息时宁可让这个来源失败（记拉取失败降级），也不能不加过滤地展开
+        with mock.patch.object(sources, "get_group_full_path", return_value=""), \
+                mock.patch.object(sources, "list_group_projects", return_value=batch):
+            with self.assertRaises(SurveyError):
+                sources.expand_group("mobile", [])
+
+        response = mock.Mock()
+        response.json.return_value = []
+        with mock.patch.object(gitlab, "_gitlab_get", return_value=response) as get:
+            gitlab.list_group_projects("mobile")
+        self.assertEqual(get.call_args.kwargs["params"]["with_shared"], "false")
+
+        self.assertEqual(sources.normalize_group_path("https://g.com/groups/a/b/-/shared"), "a/b")
+
     def test_resolve_sources_skips_ignored_repos_before_truncating(self):
         """已忽略仓库要在截断之前剔除，否则它们占着上限名额，把本该巡检的仓库挤出去。"""
         from backend.survey.common import repo_slug_from_url

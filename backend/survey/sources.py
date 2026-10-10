@@ -11,7 +11,7 @@ import logging
 from typing import Dict, List, NamedTuple, Optional, Set
 from urllib.parse import urlparse
 
-from ..review.gitlab import list_group_projects, require_gitlab_config
+from ..review.gitlab import get_group_full_path, list_group_projects, require_gitlab_config
 from ..storage.models import SOURCE_ORG, SOURCE_REPO
 from .common import (
     SurveyError,
@@ -43,6 +43,8 @@ def normalize_group_path(raw: str) -> str:
         # GitLab 的 group 页面路径可能带 /groups/ 前缀
         if text.startswith("groups/"):
             text = text[len("groups/"):]
+        # 从组织的子页面复制的地址带 /-/shared 这类页面后缀，不剥掉的话会被当成组织路径的一部分
+        text = text.split("/-/", 1)[0].strip("/")
 
     if not text:
         raise SurveyError(f"无法从地址中解析出组织路径：{raw}")
@@ -51,12 +53,21 @@ def normalize_group_path(raw: str) -> str:
 
 def expand_group(group_path: str, exclude_patterns: List[str]) -> List[Dict[str, str]]:
     """
-    列出组织（含子组）下的全部非归档项目。
+    列出组织（含子组）下的全部非归档项目，不含其他组织共享进来的项目。
 
     翻页上限的意义是别让一个指错的顶层 group 把整个实例的项目都拉回来；
     真正的裁剪交给单次巡检的仓库上限与排除清单。
     """
     normalized = normalize_group_path(group_path)
+    # 除了请求时关掉 with_shared，再按路径前缀兜一遍：巡检范围以配置里写明的组织为准，
+    # 不能押在某个 GitLab 版本一定支持这个参数上。
+    # 前缀取组织当前的 full_path 而不是用户填的：组织改名或转移后旧路径仍能访问，
+    # 拿填写值比较会把组织自己的项目全当成共享的剔掉，巡检静默变成零个仓库。
+    # 路径大小写不敏感，统一小写比较
+    full_path = get_group_full_path(normalized)
+    if not full_path:
+        raise SurveyError(f"无法读取组织信息：{normalized}")
+    own_prefix = full_path.lower() + "/"
     repos: List[Dict[str, str]] = []
 
     for page in range(1, MAX_GROUP_PAGES + 1):
@@ -67,19 +78,22 @@ def expand_group(group_path: str, exclude_patterns: List[str]) -> List[Dict[str,
         for item in batch:
             if not isinstance(item, dict):
                 continue
-            full_path = str(item.get("path_with_namespace") or "").strip()
+            project_path = str(item.get("path_with_namespace") or "").strip()
             url = str(item.get("http_url_to_repo") or "").strip()
             if not url:
                 continue
-            if matches_any_pattern(full_path, exclude_patterns):
-                logger.info("Repo excluded by pattern: %s", full_path)
+            if not project_path.lower().startswith(own_prefix):
+                logger.info("Shared project outside group skipped: %s (group %s)", project_path, full_path)
+                continue
+            if matches_any_pattern(project_path, exclude_patterns):
+                logger.info("Repo excluded by pattern: %s", project_path)
                 continue
             repos.append(
                 {
                     "url": url,
                     # 用各仓库自己的默认分支，不硬写 main —— 老仓库很多还是 master
                     "branch": str(item.get("default_branch") or "").strip(),
-                    "path": full_path,
+                    "path": project_path,
                 }
             )
 

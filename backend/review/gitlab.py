@@ -377,11 +377,26 @@ def _gitlab_get(path: str, params: dict = None, timeout: int = 30):
     return response
 
 
+def get_group_full_path(group_path: str) -> str:
+    """
+    读取组织当前的完整路径（full_path）。
+
+    组织改名或转移后，旧路径仍会被 GitLab 重定向到新组织，但返回的项目路径都是新路径；
+    填数字 id 时也只有这样才能拿到路径。拿不到时返回空串，由调用方决定如何处理。
+    """
+    encoded = quote(str(group_path or "").strip().strip("/"), safe="")
+    response = _gitlab_get(f"/groups/{encoded}", params={"with_projects": "false"})
+    data = response.json() or {}
+    return str(data.get("full_path") or "").strip() if isinstance(data, dict) else ""
+
+
 def list_group_projects(group_path: str, page: int = 1, per_page: int = 100) -> List[dict]:
     """
     列出某个组织（含子组）下的项目，一页一页取。
 
     归档项目由 API 侧过滤掉：它们按定义已经不再维护，对它们提问题没有收件人。
+    共享进来的项目同样由 API 侧过滤：with_shared 默认是 true，不显式关掉的话，
+    其他组织通过 "Share with group" 共享给它的项目也会被当成组织下的项目巡检。
     调用方负责翻页与去重——这里只做一次 HTTP，不替它决定翻几页。
     """
     encoded = quote(str(group_path or "").strip().strip("/"), safe="")
@@ -391,6 +406,7 @@ def list_group_projects(group_path: str, page: int = 1, per_page: int = 100) -> 
             "per_page": per_page,
             "page": page,
             "include_subgroups": "true",
+            "with_shared": "false",
             "archived": "false",
             "simple": "true",
         },

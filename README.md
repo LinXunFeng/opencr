@@ -434,8 +434,10 @@ Admin console → Surveys → Survey configuration → New survey. Four things m
 | Delete workspace afterwards | Off by default. Keeping it lets the next run fetch incrementally; deleting it means a full clone next time |
 
 **Organisations are expanded at run time**, not when you save. Repositories added to the
-organisation are therefore picked up by the next run automatically. Exclude patterns exist so a
-single large repository pushed into the organisation cannot add an hour to every run.
+organisation are therefore picked up by the next run automatically. Only the organisation's own
+projects (including subgroups) are included; projects other groups share with it are not.
+Exclude patterns exist so a single large repository pushed into the organisation cannot add an
+hour to every run.
 
 **Checking a skill defines the candidate pool, not the execution list.** Only checked skills are
 eligible, but the AI still matches them against each repository profile (languages and manifests).
