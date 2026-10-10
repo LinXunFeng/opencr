@@ -319,6 +319,14 @@ export const PUSH_STATUS_TAG: Record<string, TagType> = {
   failed: "danger"
 }
 
+/** 忽略理由的长度上限，与服务端 SURVEY_IGNORE_NOTE_MAX 一致；超出的部分服务端会静默截掉，所以前端先拦 */
+export const IGNORE_NOTE_MAX = 2000
+
+/** ElMessageBox.prompt 的忽略理由校验器，标记与编辑两处共用 */
+export function validateIgnoreNote(value: string): boolean | string {
+  return (value || "").length <= IGNORE_NOTE_MAX || `理由不能超过 ${IGNORE_NOTE_MAX} 字`
+}
+
 export const PUSH_TRIGGER_LABEL: Record<string, string> = {
   auto: "运行结束自动推送",
   manual: "手动推送"
@@ -367,6 +375,12 @@ export const SURVEY_NOTES = {
     "发现：线索来自 codegraph 的条数 / L1 点名产出的发现（不含台账复核）；连接：跨仓库接口连接数。",
   emptyExtraction:
     "建成了索引，但没有抽出任何接口与类型：可能是 codegraph 不支持该仓库的语言，也可能仓库里本来就没有。",
+  ignoreScope:
+    "忽略按指纹生效，指纹由「仓库 + 文件路径 + 问题类别」构成、不含正文：忽略的是这个文件里这一类的全部问题，之后在同一文件报出的同类新问题也不会再出现。",
+  ignoreRemove:
+    "取消忽略后，如果问题还在，下一轮巡检起会重新出现在报告里。台账里对应的行停在「已忽略」，等后续巡检复核出结论后才会变为「存在」或「本轮未发现」。",
+  ignoreNoIssue:
+    "台账与保留的运行记录里都找不到这个指纹对应的问题（运行记录已被清理），只能看到指纹与理由。",
   workspaceKept:
     "删除巡检不会连带删除本地工作区——那可能是几十 GB 代码，且删除不可逆。工作区清理是单独的动作。"
 }

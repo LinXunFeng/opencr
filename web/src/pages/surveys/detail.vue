@@ -13,7 +13,8 @@ import {
   SURVEY_NOTES,
   SURVEY_PHASE_LABEL,
   SURVEY_REPO_STATUS_LABEL,
-  SURVEY_TRIGGER_LABEL
+  SURVEY_TRIGGER_LABEL,
+  validateIgnoreNote
 } from "@@/constants/opencr"
 import { useUserStore } from "@/pinia/stores/user"
 import CodegraphCard from "./CodegraphCard.vue"
@@ -21,6 +22,7 @@ import FindingTable from "./FindingTable.vue"
 import ReachDetail from "./ReachDetail.vue"
 
 const route = useRoute()
+const router = useRouter()
 const userStore = useUserStore()
 const loading = ref(true)
 const detail = ref<SurveyRunDetail | null>(null)
@@ -95,17 +97,24 @@ function exportMarkdown() {
 
 async function ignore(finding: SurveyFinding) {
   if (!detail.value?.survey_uid) return
+  let note: string
   try {
-    await ElMessageBox.confirm(
-      "标记为已知问题后，后续巡检不会再产出这一条。",
+    const result = await ElMessageBox.prompt(
+      `${SURVEY_NOTES.ignoreScope}可以在巡检配置的「忽略清单」里查看与取消。`,
       "不再提醒",
-      { type: "warning" }
+      {
+        type: "warning",
+        inputType: "textarea",
+        inputPlaceholder: "理由（选填），例如：第三方 SDK 的代码，无法修改",
+        inputValidator: validateIgnoreNote
+      }
     )
+    note = (result.value || "").trim()
   } catch {
     return
   }
   try {
-    await addSurveyIgnoreApi(detail.value.survey_uid, finding.fingerprint)
+    await addSurveyIgnoreApi(detail.value.survey_uid, finding.fingerprint, note)
     ElMessage.success("已加入忽略清单")
   } catch (error) {
     ElMessage.error((error as Error).message)
@@ -122,9 +131,18 @@ onMounted(() => load())
         <template #header>
           <div class="header">
             <span>{{ detail.survey_name }} —— 巡检报告</span>
-            <el-button size="small" @click="exportMarkdown">
-              导出 Markdown
-            </el-button>
+            <span>
+              <el-button
+                v-if="userStore.isAdmin && detail.survey_uid"
+                size="small"
+                @click="router.push({ name: 'SurveyIgnores', params: { surveyUid: detail.survey_uid } })"
+              >
+                忽略清单
+              </el-button>
+              <el-button size="small" @click="exportMarkdown">
+                导出 Markdown
+              </el-button>
+            </span>
           </div>
         </template>
 
