@@ -463,6 +463,51 @@ def _previous_block(previous: List[dict]) -> str:
     )
 
 
+# 已忽略问题交给模型时的编号前缀。用带前缀的字符串而不是裸数字：
+# 模型很容易把裸数字和行号混起来，填进 ignore_ref 的会是一个行号
+IGNORE_REF_PREFIX = "I"
+# 交给模型的已忽略问题正文摘要长度：够它分辨"是不是同一个缺陷"即可，全文会挤占源码的上下文
+_IGNORED_BODY_CHARS = 300
+
+
+def _ignored_block(ignored: List[dict]) -> str:
+    """
+    取证时交给 L2 的"已被人工标记为不再提醒的问题"清单。
+
+    让模型照常输出、只是标上编号，而不是让它别输出：不输出的话，它认错了没人能发现；
+    标上编号的条目照常入库、在报告里隐藏，管理员能在忽略清单里核对它认成了哪条。
+    """
+    if not ignored:
+        return ""
+    rows = []
+    for item in ignored:
+        line = f"第 {item['line']} 行附近" if int(item.get("line") or 0) > 0 else "未定位到行"
+        summary = re.sub(r"\s+", " ", item.get("body") or "").strip()[:_IGNORED_BODY_CHARS]
+        rows.append(
+            f"- {IGNORE_REF_PREFIX}{item['id']} [{item.get('category')}] {line}：{item.get('title')}"
+            + (f" —— {summary}" if summary else "")
+        )
+    return (
+        "\n\n下面这些问题已被人工标记为「不再提醒」（已知问题）：\n"
+        + "\n".join(rows)
+        + "\n如果你要输出的某个问题与其中一条是**同一个问题**（同一处代码的同一个缺陷；行号移动、措辞不同都不影响），"
+        "仍然照常输出，并把 ignore_ref 填成那一条的编号（如 \"" + IGNORE_REF_PREFIX + "12\"）。"
+        "只是相似、同类或位于同一函数的其他问题**不算**同一个问题，不要填 ignore_ref。拿不准时不要填。\n"
+    )
+
+
+def _parse_ignore_ref(raw, offered: Dict[str, int]) -> Optional[int]:
+    """
+    把模型填的 ignore_ref 解析成已忽略问题的 id；不是本次交给它的编号一律视为没填。
+
+    只认交给过它的编号：模型偶尔会编一个编号，接受它就等于让模型去隐藏任意一个问题。
+    """
+    key = str(raw or "").strip().upper()
+    if key and not key.startswith(IGNORE_REF_PREFIX):
+        key = f"{IGNORE_REF_PREFIX}{key}"
+    return offered.get(key)
+
+
 def inspect_focus(
     focus: dict,
     repo_dir: Path,
@@ -497,7 +542,7 @@ def inspect_focus(
 怀疑理由：{reason}
 仓库：{focus['repo_slug']}
 文件：{focus['file_path']}
-{_previous_block(focus.get("previous") or [])}
+{_previous_block(focus.get("previous") or [])}{_ignored_block(focus.get("ignored") or [])}
 要求：
 1. **确认不了就返回空数组**。上一步只是怀疑，代码里没有实际问题时不要为了交差编一条。
 2. category 只能从这个闭集里选：{", ".join(SURVEY_CATEGORIES)}
@@ -505,6 +550,7 @@ def inspect_focus(
 4. line 填问题所在行号（从 1 开始）；只能定位到文件时填 0。
 5. 只输出 JSON 数组，每项形如：
    {{"line":12,"category":"...","severity":"...","title":"一句话标题","body":"问题描述与修复方案"}}
+   与已知问题是同一个问题时，再加一个字段 "ignore_ref":"I12"。
 {skill_block}{numbered_note}
 以下是源码：
 
@@ -517,6 +563,7 @@ def inspect_focus(
         logger.info("Focus produced unparseable output: %s/%s", focus["repo_slug"], focus["file_path"])
         return [], False
 
+    offered = {f"{IGNORE_REF_PREFIX}{i['id']}": i["id"] for i in focus.get("ignored") or []}
     findings: List[dict] = []
     for item in payload:
         if not isinstance(item, dict):
@@ -536,6 +583,7 @@ def inspect_focus(
                 "severity": severity if severity in _VALID_SEVERITIES else SEVERITY_UNKNOWN,
                 "title": str(item.get("title") or "").strip()[:500],
                 "body": str(item.get("body") or "").strip()[:8000],
+                "ignore_id": _parse_ignore_ref(item.get("ignore_ref"), offered),
             }
         )
     return findings, source.complete

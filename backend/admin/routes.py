@@ -853,7 +853,7 @@ def api_clear_workspace(survey_uid: str):
 @admin_bp.route("/api/admin/surveys/<survey_uid>/ignores", methods=["GET"])
 @require_admin
 def api_survey_ignores(survey_uid: str):
-    """忽略清单。含指纹、理由与问题标题，属于正文一侧，不对 Guest 开放。"""
+    """忽略清单。含问题标题、理由与命中记录，属于正文一侧，不对 Guest 开放。"""
     survey = repo.get_survey(survey_uid)
     if survey is None:
         return jsonify({"error": "巡检不存在"}), 404
@@ -863,30 +863,32 @@ def api_survey_ignores(survey_uid: str):
 @admin_bp.route("/api/admin/surveys/<survey_uid>/ignores", methods=["POST"])
 @require_admin
 def api_add_survey_ignore(survey_uid: str):
-    """把一条发现标记为已知问题，后续巡检不再产出它。"""
+    """把一条发现标记为已忽略问题：后续巡检由模型认出同一个问题并隐藏它，同一文件的其他问题照常报告。"""
     payload = request.get_json(silent=True) or {}
-    fingerprint = str(payload.get("fingerprint") or "").strip()
-    if not fingerprint:
-        return jsonify({"error": "fingerprint 不能为空"}), 400
-    if not repo.add_survey_ignore(survey_uid, fingerprint, str(payload.get("note") or "")):
-        return jsonify({"error": "巡检不存在"}), 404
-    return jsonify({"ignored": True}), 201
+    try:
+        finding_id = int(payload.get("finding_id"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "finding_id 不能为空"}), 400
+    ignore_id = repo.add_survey_ignore(survey_uid, finding_id, str(payload.get("note") or ""))
+    if ignore_id is None:
+        return jsonify({"error": "巡检或发现不存在"}), 404
+    return jsonify({"id": ignore_id}), 201
 
 
-@admin_bp.route("/api/admin/surveys/<survey_uid>/ignores/<fingerprint>", methods=["DELETE"])
+@admin_bp.route("/api/admin/surveys/<survey_uid>/ignores/<int:ignore_id>", methods=["DELETE"])
 @require_admin
-def api_remove_survey_ignore(survey_uid: str, fingerprint: str):
-    """取消忽略。"""
-    removed = repo.remove_survey_ignore(survey_uid, fingerprint)
+def api_remove_survey_ignore(survey_uid: str, ignore_id: int):
+    """取消忽略。被它隐藏的历史发现恢复显示。"""
+    removed = repo.remove_survey_ignore(survey_uid, ignore_id)
     return jsonify({"removed": removed})
 
 
-@admin_bp.route("/api/admin/surveys/<survey_uid>/ignores/<fingerprint>", methods=["PATCH"])
+@admin_bp.route("/api/admin/surveys/<survey_uid>/ignores/<int:ignore_id>", methods=["PATCH"])
 @require_admin
-def api_update_survey_ignore(survey_uid: str, fingerprint: str):
+def api_update_survey_ignore(survey_uid: str, ignore_id: int):
     """修改忽略理由。"""
     payload = request.get_json(silent=True) or {}
-    if not repo.update_survey_ignore_note(survey_uid, fingerprint, str(payload.get("note") or "")):
+    if not repo.update_survey_ignore_note(survey_uid, ignore_id, str(payload.get("note") or "")):
         return jsonify({"error": "忽略记录不存在"}), 404
     return jsonify({"updated": True})
 

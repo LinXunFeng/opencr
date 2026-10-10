@@ -116,6 +116,7 @@ backend/                # 后端 Python 包
 │   ├── clues.py        # 线索来源判定与 codegraph 本轮快照；纯函数，不碰数据库
 │   ├── report.py       # Markdown 报告渲染（渲染产物，不是存储真相）
 │   ├── ledger.py       # Ledger 状态判定与镜像行生成；判定逻辑是纯函数
+│   ├── ignores.py      # 已忽略问题分发到取证文件、按标题兜底命中；纯函数，"是不是同一个问题"由 L2 模型判断
 │   ├── push.py         # Push 的唯一执行入口（自动推送与手动重推都走这里）
 │   └── destinations/   # Destination 插件：base.py 定义接口，__init__.py 显式注册；
 │                       # google_transport.py 是 Google Sheet 两种鉴权方式各自发请求的传输层
@@ -203,5 +204,8 @@ pnpm build    # 构建到 backend/admin/static/（产物不进 Git）
   升级 Dockerfile 里的 `GOGCLI_VERSION` 前先复核 `google_transport.py`，理由见 `docs/adr/0005-google-sheet-via-gogcli.md`。
 - **Ledger 系统列的表头文案发布后不要改。** 插件按表头名称定位列，改名后已有表格里的旧列会变成人工列，
   下次推送再补出一个新列。
+- **「不再提醒」按问题忽略，不要改回按指纹，也不要让模型命中的发现直接丢弃。** 按指纹会吞掉同一文件同类的其他问题；
+  丢弃会让模型认错时一个新问题被静默吞掉。命中的发现照常入库、关联 `ignore_id`、读取时隐藏。
+  动这块之前读 `docs/adr/0006-survey-ignore-per-issue.md`。
 - 新增巡检链路的代码放 `backend/survey/`，**不要**写进 `backend/review/`。两条链路唯一的
   共用物是 skill 加载与模型配置，其余一律分开。

@@ -114,7 +114,7 @@ async function ignore(finding: SurveyFinding) {
     return
   }
   try {
-    await addSurveyIgnoreApi(detail.value.survey_uid, finding.fingerprint, note)
+    await addSurveyIgnoreApi(detail.value.survey_uid, finding.id, note)
     ElMessage.success("已加入忽略清单")
     // 服务端在读取报告时隐藏忽略清单里的条目，重新拉取即可让它从各栏消失
     await load(true)

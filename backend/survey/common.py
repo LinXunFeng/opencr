@@ -86,6 +86,16 @@ def normalize_category(value: str) -> str:
     return raw if raw in SURVEY_CATEGORIES else CATEGORY_CORRECTNESS
 
 
+def normalize_title(title) -> str:
+    """
+    Finding 标题的比对形式：折叠空白、去首尾空白、转小写。
+
+    用于认出"同一个问题被原样报了两遍"（见 ignores.match_by_title 与 repo.add_survey_ignore），
+    只认这一层差异：再宽松一点，同一文件里换了个说法的另一个问题也会被当成同一个。
+    """
+    return re.sub(r"\s+", " ", str(title or "")).strip().lower()
+
+
 def finding_fingerprint(repo_slug: str, file_path: str, category: str) -> str:
     """
     Finding 的跨轮次身份。
