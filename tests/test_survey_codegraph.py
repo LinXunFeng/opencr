@@ -447,6 +447,12 @@ class CodegraphStorageTests(unittest.TestCase):
         listed = self.repo.list_survey_runs(self.survey["survey_uid"])
         self.assertEqual(listed[0]["clue_counts"], expected)
 
+        # 入库之后才被忽略的条目同样不计入，与报告列表在读取时隐藏它们保持一致
+        self.repo.add_survey_ignore(self.survey["survey_uid"], self._finding("b.go", "codegraph")["fingerprint"])
+        expected["codegraph"] = 0
+        self.assertEqual(self.repo.get_survey_run_detail(run_uid)["clue_counts"], expected)
+        self.assertEqual(self.repo.list_survey_runs(self.survey["survey_uid"])[0]["clue_counts"], expected)
+
     def test_guest_does_not_see_raw_repo_errors(self):
         """codegraph / git 的原始输出可能带出路径与代码片段，与推送错误同等对待。"""
         run_uid = self._start()
