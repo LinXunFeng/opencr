@@ -428,11 +428,15 @@ class CodegraphStorageTests(unittest.TestCase):
                          {"status": "enabled", "focus": None})
 
     def test_clue_counts_exclude_ignored_findings_and_separate_old_rows(self):
+        """被隐藏的发现不计入线索来源；旧数据没有线索来源，单列为 unknown。"""
+        earlier = self._start()
+        self.repo.record_survey_findings(earlier, [self._finding("a.go", "codegraph")])
+        [known] = self.repo.get_survey_run_detail(earlier)["findings"]
+        ignore_id = self.repo.add_survey_ignore(self.survey["survey_uid"], known["id"])
+
         run_uid = self._start()
-        ignored = self._finding("a.go", "codegraph")
-        self.repo.add_survey_ignore(self.survey["survey_uid"], ignored["fingerprint"])
         self.repo.record_survey_findings(run_uid, [
-            ignored,
+            {**self._finding("a.go", "codegraph"), "ignore_id": ignore_id},
             self._finding("b.go", "codegraph"),
             self._finding("c.go", "baseline"),
             self._finding("d.go", ""),
@@ -444,14 +448,19 @@ class CodegraphStorageTests(unittest.TestCase):
         # 线索来源是标签不是正文，Guest 视角同样可见
         self.assertEqual([f["clue_source"] for f in detail["findings"]], ["codegraph", "baseline", ""])
 
-        listed = self.repo.list_survey_runs(self.survey["survey_uid"])
-        self.assertEqual(listed[0]["clue_counts"], expected)
+        def listed_counts():
+            """运行列表里这次运行的线索来源计数。"""
+            runs = self.repo.list_survey_runs(self.survey["survey_uid"])
+            return next(r["clue_counts"] for r in runs if r["run_uid"] == run_uid)
+
+        self.assertEqual(listed_counts(), expected)
 
         # 入库之后才被忽略的条目同样不计入，与报告列表在读取时隐藏它们保持一致
-        self.repo.add_survey_ignore(self.survey["survey_uid"], self._finding("b.go", "codegraph")["fingerprint"])
+        b_go = next(f for f in detail["findings"] if f["file_path"] == "b.go")
+        self.repo.add_survey_ignore(self.survey["survey_uid"], b_go["id"])
         expected["codegraph"] = 0
         self.assertEqual(self.repo.get_survey_run_detail(run_uid)["clue_counts"], expected)
-        self.assertEqual(self.repo.list_survey_runs(self.survey["survey_uid"])[0]["clue_counts"], expected)
+        self.assertEqual(listed_counts(), expected)
 
     def test_guest_does_not_see_raw_repo_errors(self):
         """codegraph / git 的原始输出可能带出路径与代码片段，与推送错误同等对待。"""

@@ -457,172 +457,184 @@ class SurveyFindingDiffTests(SurveyStorageTestCase):
         # 本轮未发现之后又出现，对读报告的人来说就是新问题
         self.assertEqual(counters["new"], 1)
 
-    def test_ignored_findings_are_never_stored(self):
-        """入库再过滤的话，"本次 80 条"会一直包含用户说过不想再看的条目。"""
-        from backend.survey.common import finding_fingerprint
-
-        self.repo.add_survey_ignore(
-            self.survey["survey_uid"], finding_fingerprint("app", "lib/a.dart", "security"), "已知"
-        )
-        run_uid, counters = self._run([("lib/a.dart", "security"), ("lib/d.dart", "dependency")])
-        self.assertEqual(counters, {"new": 1, "persisted": 0, "ignored": 1})
-        detail = self.repo.get_survey_run_detail(run_uid)
-        self.assertEqual([f["file_path"] for f in detail["findings"]], ["lib/d.dart"])
-
-    def test_removing_ignore_lets_finding_return(self):
-        from backend.survey.common import finding_fingerprint
-
-        fingerprint = finding_fingerprint("app", "lib/a.dart", "security")
-        self.repo.add_survey_ignore(self.survey["survey_uid"], fingerprint)
-        self.assertTrue(self.repo.remove_survey_ignore(self.survey["survey_uid"], fingerprint))
-        _, counters = self._run([("lib/a.dart", "security")])
-        self.assertEqual(counters["ignored"], 0)
-
 
 class SurveyIgnoreListTests(SurveyStorageTestCase):
-    def test_list_describes_issue_from_ledger(self):
-        """指纹是哈希，清单不带上问题描述的话，没人判断得了该不该取消。"""
+    """按问题忽略（ADR-0006）：标记、命中关联、报告隐藏、统计口径与管理接口。"""
+
+    def _store(self, items, inspected=None):
+        """
+        跑一轮并落库；items 是 (file_path, line, title) 或带 ignore_id 的四元组，类别统一为 correctness。
+
+        返回 (run_uid, {title: finding_id})，finding_id 从库里直接读，被隐藏的条目也在内。
+        """
+        from sqlalchemy import select
+
+        from backend.storage.db import session_scope
+        from backend.storage.models import RUN_SUCCEEDED, SurveyFinding
         from backend.survey.common import finding_fingerprint
 
-        fingerprint = finding_fingerprint("app", "lib/a.dart", "security")
-        run_uid, _ = self._run([("lib/a.dart", "security")])
-        self.repo.upsert_survey_ledger(self._survey_id(), [{
-            "fingerprint": fingerprint, "repo_slug": "app", "file_path": "lib/a.dart",
-            "category": "security", "severity": "critical", "title": "台账标题",
-            "state": "present", "last_run_uid": run_uid,
-        }])
-        self.repo.add_survey_ignore(self.survey["survey_uid"], fingerprint, "第三方 SDK，改不了")
+        run_uid = self.repo.start_survey_run(self.survey["survey_uid"], "schedule")
+        findings = []
+        for entry in items:
+            path, line, title = entry[:3]
+            findings.append({
+                "repo_slug": "app", "file_path": path, "line": line, "category": "correctness",
+                "severity": "warning", "title": title, "body": f"{title}的详情",
+                "fingerprint": finding_fingerprint("app", path, "correctness"),
+                "ignore_id": entry[3] if len(entry) > 3 else None,
+            })
+        self.repo.record_survey_findings(run_uid, findings)
+        if inspected is not None:
+            self.repo.record_survey_inspected_files(
+                run_uid, [{"repo_slug": "app", "file_path": p, "conclusive": True} for p in inspected]
+            )
+        self.repo.finish_survey_run(run_uid, RUN_SUCCEEDED, summary="整体结论")
+        with session_scope() as session:
+            rows = session.execute(
+                select(SurveyFinding.title, SurveyFinding.id)
+                .join(SurveyFinding.run)
+                .where(SurveyFinding.run.has(run_uid=run_uid))
+            ).all()
+        return run_uid, dict(rows)
 
-        [item] = self.repo.list_survey_ignores(self.survey["survey_uid"])
-        self.assertEqual(item["note"], "第三方 SDK，改不了")
-        self.assertEqual((item["file_path"], item["title"], item["severity"]), ("lib/a.dart", "台账标题", "critical"))
-        self.assertEqual(item["last_run_uid"], run_uid)
-
-    def test_list_falls_back_to_latest_finding_without_ledger_row(self):
-        from backend.survey.common import finding_fingerprint
-
-        fingerprint = finding_fingerprint("app", "lib/a.dart", "security")
-        self._run([("lib/a.dart", "security")])
-        self.repo.add_survey_ignore(self.survey["survey_uid"], fingerprint)
-
-        [item] = self.repo.list_survey_ignores(self.survey["survey_uid"])
-        self.assertEqual((item["file_path"], item["title"]), ("lib/a.dart", "问题 lib/a.dart"))
-        self.assertEqual(item["last_run_uid"], "")
-
-    def test_list_keeps_entries_whose_issue_is_gone(self):
-        """相关运行被清理后仍要列出来，否则这条忽略就再也取消不了。"""
-        self.repo.add_survey_ignore(self.survey["survey_uid"], "f" * 64, "历史遗留")
-        [item] = self.repo.list_survey_ignores(self.survey["survey_uid"])
-        self.assertEqual((item["fingerprint"], item["note"], item["file_path"]), ("f" * 64, "历史遗留", ""))
-
-    def test_update_note(self):
+    def test_marking_ignores_only_that_issue(self):
+        """用户撞到的那次：点了两条，结果同一文件同类别的三轮 11 条全被藏掉了。"""
         uid = self.survey["survey_uid"]
-        self.repo.add_survey_ignore(uid, "f" * 64)
-        self.assertTrue(self.repo.update_survey_ignore_note(uid, "f" * 64, "补一个理由"))
-        self.assertEqual(self.repo.list_survey_ignores(uid)[0]["note"], "补一个理由")
-        self.assertTrue(self.repo.update_survey_ignore_note(uid, "f" * 64, ""))
-        self.assertEqual(self.repo.list_survey_ignores(uid)[0]["note"], "")
-        self.assertFalse(self.repo.update_survey_ignore_note(uid, "e" * 64, "x"))
-        self.assertFalse(self.repo.update_survey_ignore_note("missing", "f" * 64, "x"))
+        older, _ = self._store([("a.dart", 48, "强制解包空返回值"), ("a.dart", 179, "日志级别未返回")])
+        run_uid, ids = self._store([("a.dart", 47, "强制解包空返回值"), ("a.dart", 225, "可选参数被强制解包"),
+                                    ("a.dart", 300, "另一个问题")])
+        first = self.repo.add_survey_ignore(uid, ids["强制解包空返回值"], "SDK 约定")
+        second = self.repo.add_survey_ignore(uid, ids["可选参数被强制解包"])
+        self.assertNotEqual(first, second)
 
-    def test_blank_note_is_stored_as_missing(self):
-        """一串空白占住理由的话，之后重复标记时再也补不上。"""
+        detail = self.repo.get_survey_run_detail(run_uid)
+        self.assertEqual([f["title"] for f in detail["findings"]], ["另一个问题"])
+        self.assertEqual(detail["counts"]["ignored"], 2)
+        # 更早运行里原样报过的同一个问题一起隐藏；同一文件同类的其他问题不受影响
+        self.assertEqual([f["title"] for f in self.repo.get_survey_run_detail(older)["findings"]], ["日志级别未返回"])
+
+        items = {i["title"]: i for i in self.repo.list_survey_ignores(uid)}
+        self.assertEqual(set(items), {"强制解包空返回值", "可选参数被强制解包"})
+        self.assertEqual(items["强制解包空返回值"]["note"], "SDK 约定")
+        self.assertEqual(items["强制解包空返回值"]["line"], 47)
+        self.assertTrue(items["强制解包空返回值"]["active"])
+        self.assertEqual(items["强制解包空返回值"]["last_match"]["run_uid"], run_uid)
+
+    def test_marking_same_issue_again_reuses_it(self):
+        """同一次运行里模型把同一个问题报了两遍、或在另一轮再点一次，都不该多出一条忽略。"""
         uid = self.survey["survey_uid"]
-        self.repo.add_survey_ignore(uid, "f" * 64, "   ")
-        self.repo.add_survey_ignore(uid, "f" * 64, "  真正的理由 ")
-        self.assertEqual(self.repo.list_survey_ignores(uid)[0]["note"], "真正的理由")
-        self.repo.update_survey_ignore_note(uid, "f" * 64, " \n ")
-        self.assertEqual(self.repo.list_survey_ignores(uid)[0]["note"], "")
-
-    def test_link_to_purged_run_is_dropped(self):
-        """台账的 last_run_uid 不做外键，运行被清理后给出去就是 404。"""
-        self.repo.upsert_survey_ledger(self._survey_id(), [{
-            "fingerprint": "f" * 64, "repo_slug": "app", "file_path": "lib/a.dart",
-            "state": "present", "last_run_uid": "purged-run",
-        }])
-        self.repo.add_survey_ignore(self.survey["survey_uid"], "f" * 64)
-        [item] = self.repo.list_survey_ignores(self.survey["survey_uid"])
-        self.assertEqual((item["file_path"], item["last_run_uid"]), ("lib/a.dart", ""))
-
-    def test_ignored_fingerprints_for_the_survey_only(self):
-        other = self.repo.create_survey(
-            name="另一个巡检", slug="other",
-            schedule_kind="weekly", schedule_expr="1 09:00", timezone_name="Asia/Shanghai",
-            sources=[], next_run_at=datetime(2026, 9, 14, 1, 0),
-        )
-        self.repo.add_survey_ignore(self.survey["survey_uid"], "f" * 64)
-        self.repo.add_survey_ignore(other["survey_uid"], "e" * 64)
-        self.assertEqual(self.repo.survey_ignored_fingerprints(self.survey["survey_uid"]), {"f" * 64})
-        self.assertEqual(self.repo.survey_ignored_fingerprints("missing"), set())
-
-    def test_marking_again_fills_missing_note_but_never_overwrites(self):
-        """同一文件同一类别的多条发现共享指纹，会被重复标记。"""
-        uid = self.survey["survey_uid"]
-        self.repo.add_survey_ignore(uid, "f" * 64)
-        self.repo.add_survey_ignore(uid, "f" * 64, "第二次才填")
-        self.repo.add_survey_ignore(uid, "f" * 64, "第三次")
+        run_uid, _ = self._store([("a.dart", 47, "强制解包"), ("a.dart", 90, "强制解包 ")])
+        ids = [f["id"] for f in self.repo.get_survey_run_detail(run_uid)["findings"]]
+        first = self.repo.add_survey_ignore(uid, ids[0])
+        self.assertEqual(self.repo.get_survey_run_detail(run_uid)["counts"]["ignored"], 2)
+        later, later_ids = self._store([("a.dart", 50, "强制解包")])
+        self.assertEqual(self.repo.add_survey_ignore(uid, later_ids["强制解包"], "补理由"), first)
+        self.repo.add_survey_ignore(uid, later_ids["强制解包"], "不会覆盖")
         [item] = self.repo.list_survey_ignores(uid)
-        self.assertEqual(item["note"], "第二次才填")
+        self.assertEqual(item["note"], "补理由")
+        self.assertEqual(item["hidden_count"], 3)
+        self.assertEqual(item["last_match"]["run_uid"], later)
 
-    def test_report_hides_findings_ignored_after_they_were_stored(self):
-        """忽略之前就已入库的条目也要从报告里消失，取消忽略后原样恢复。"""
+    def test_matched_findings_are_stored_but_hidden(self):
+        """命中的照常入库：丢弃的话，模型认错了也没人能发现。"""
+        uid = self.survey["survey_uid"]
+        _, ids = self._store([("a.dart", 47, "强制解包")])
+        ignore_id = self.repo.add_survey_ignore(uid, ids["强制解包"])
+        run_uid, _ = self._store([("a.dart", 52, "回调里强制解包", ignore_id), ("a.dart", 9, "新问题"),
+                                  ("a.dart", 1, "别的巡检的编号", 99999)])
+        detail = self.repo.get_survey_run_detail(run_uid)
+        # 不属于本巡检的编号不认
+        self.assertEqual(sorted(f["title"] for f in detail["findings"]), ["别的巡检的编号", "新问题"])
+        self.assertEqual(detail["counts"]["ignored"], 1)
+        [item] = self.repo.list_survey_ignores(uid)
+        self.assertEqual((item["last_match"]["line"], item["last_match"]["title"]), (52, "回调里强制解包"))
+
+    def test_report_sections_and_export_hide_ignored(self):
+        """四栏、计数与导出都不含被隐藏的条目；取消忽略后原样恢复。"""
         from backend.survey import report
-        from backend.survey.common import finding_fingerprint
 
         uid = self.survey["survey_uid"]
-        fingerprint = finding_fingerprint("app", "lib/a.dart", "security")
-        first, _ = self._run([("lib/a.dart", "security"), ("lib/b.dart", "security")])
-        second, _ = self._run([("lib/a.dart", "security"), ("lib/c.dart", "security")], inspected=["lib/b.dart"])
-        self.repo.add_survey_ignore(uid, fingerprint)
-
+        self._store([("a.dart", 1, "A"), ("b.dart", 1, "B")])
+        second, ids = self._store([("a.dart", 1, "A"), ("c.dart", 1, "C")], inspected=["b.dart"])
+        ignore_id = self.repo.add_survey_ignore(uid, ids["A"])
         detail = self.repo.get_survey_run_detail(second)
-        self.assertEqual([f["file_path"] for f in detail["findings"]], ["lib/c.dart"])
-        self.assertEqual(detail["counts"]["total"], 1)
-        self.assertEqual(detail["counts"]["persisted"], 0)
-        self.assertEqual(detail["counts"]["ignored"], 1)
-        self.assertEqual([f["file_path"] for f in detail["resolved_findings"]], ["lib/b.dart"])
+        self.assertEqual([f["title"] for f in detail["findings"]], ["C"])
+        self.assertEqual([f["title"] for f in detail["resolved_findings"]], ["B"])
         self.assertIn("本次运行另有 1 条发现已标记为不再提醒", report.render_run_markdown(detail))
-        # 上一轮里有、这一轮被忽略的，不能借"已消失"一栏冒出来
-        third, _ = self._run([], inspected=["lib/a.dart", "lib/c.dart"])
-        self.assertEqual(
-            [f["file_path"] for f in self.repo.get_survey_run_detail(third)["resolved_findings"]], ["lib/c.dart"]
-        )
-        self.assertEqual(self.repo.get_survey_run_detail(first)["counts"]["ignored"], 1)
 
-        self.repo.remove_survey_ignore(uid, fingerprint)
+        # 下一轮 A 被认出、c.dart 没再报：被隐藏的 A 所在指纹仍然出现了，上一轮的 A 不能借"已消失"冒出来
+        third, _ = self._store([("a.dart", 3, "A 换了说法", ignore_id)], inspected=["c.dart"])
+        self.assertEqual(
+            [f["title"] for f in self.repo.get_survey_run_detail(third)["resolved_findings"]], ["C"]
+        )
+
+        self.repo.remove_survey_ignore(uid, ignore_id)
         restored = self.repo.get_survey_run_detail(second)
-        self.assertEqual([f["file_path"] for f in restored["findings"]], ["lib/a.dart", "lib/c.dart"])
+        self.assertEqual([f["title"] for f in restored["findings"]], ["A", "C"])
         self.assertEqual(restored["counts"]["ignored"], 0)
         self.assertNotIn("不再提醒", report.render_run_markdown(restored))
+        self.assertEqual(self.repo.list_survey_ignores(uid), [])
 
-    def test_dashboard_stats_skip_ignored_findings_of_that_survey_only(self):
-        """统计与报告同一口径；忽略清单按 Survey 维护，别的巡检里同一指纹照常计。"""
-        from backend.survey.common import finding_fingerprint
+    def test_untitled_finding_still_yields_an_active_ignore(self):
+        """模型偶尔给出空标题；快照标题空着的话，这条忽略从创建起就不生效。"""
+        uid = self.survey["survey_uid"]
+        _, ids = self._store([("a.dart", 7, "")])
+        self.repo.add_survey_ignore(uid, ids[None])
+        [item] = self.repo.list_survey_ignores(uid)
+        self.assertTrue(item["active"])
+        self.assertEqual(item["title"], "的详情")
 
-        fingerprint = finding_fingerprint("app", "lib/a.dart", "security")
-        self._run([("lib/a.dart", "security"), ("lib/d.dart", "dependency")])
+    def test_dashboard_stats_skip_ignored_findings(self):
+        """统计与报告同一口径：被隐藏的不计数，运行数与忽略无关。"""
+        uid = self.survey["survey_uid"]
+        _, ids = self._store([("a.dart", 1, "A"), ("a.dart", 2, "B")])
+        self.assertEqual(self.repo.survey_dashboard_stats()["by_category"], {"correctness": 2})
+        ignore_id = self.repo.add_survey_ignore(uid, ids["A"])
+        stats = self.repo.survey_dashboard_stats()
+        self.assertEqual(stats["by_category"], {"correctness": 1})
+        self.assertEqual(sum(stats["by_severity"].values()), 1)
+        self.assertEqual(stats["total_runs"], 1)
+        self.repo.remove_survey_ignore(uid, ignore_id)
+        self.assertEqual(self.repo.survey_dashboard_stats()["by_category"], {"correctness": 2})
+
+    def test_notes_are_trimmed_and_editable(self):
+        """一串空白占住理由的话，界面上会显示一段空白而不是"未填写"。"""
+        uid = self.survey["survey_uid"]
+        _, ids = self._store([("a.dart", 1, "A")])
+        ignore_id = self.repo.add_survey_ignore(uid, ids["A"], "   ")
+        self.assertEqual(self.repo.list_survey_ignores(uid)[0]["note"], "")
+        self.assertTrue(self.repo.update_survey_ignore_note(uid, ignore_id, "  理由 "))
+        self.assertEqual(self.repo.list_survey_ignores(uid)[0]["note"], "理由")
+        self.assertFalse(self.repo.update_survey_ignore_note(uid, ignore_id + 1, "x"))
+        self.assertFalse(self.repo.update_survey_ignore_note("missing", ignore_id, "x"))
+
+    def test_marking_rejects_findings_of_other_surveys(self):
+        """忽略清单按 Survey 维护，拿别的巡检的发现或编号来操作一律无效。"""
         other = self.repo.create_survey(
             name="另一个巡检", slug="other",
             schedule_kind="weekly", schedule_expr="1 09:00", timezone_name="Asia/Shanghai",
             sources=[], next_run_at=datetime(2026, 9, 14, 1, 0),
         )
-        other_run = self.repo.start_survey_run(other["survey_uid"], "manual")
-        self.repo.record_survey_findings(other_run, [{
-            "repo_slug": "app", "file_path": "lib/a.dart", "line": 1, "category": "security",
-            "severity": "warning", "title": "t", "body": "b", "fingerprint": fingerprint,
-        }])
-        self.assertEqual(self.repo.survey_dashboard_stats()["by_category"], {"security": 2, "dependency": 1})
+        _, ids = self._store([("a.dart", 1, "A")])
+        self.assertIsNone(self.repo.add_survey_ignore(other["survey_uid"], ids["A"]))
+        self.assertIsNone(self.repo.add_survey_ignore(self.survey["survey_uid"], 99999))
+        ignore_id = self.repo.add_survey_ignore(self.survey["survey_uid"], ids["A"])
+        self.assertFalse(self.repo.remove_survey_ignore(other["survey_uid"], ignore_id))
 
-        self.repo.add_survey_ignore(self.survey["survey_uid"], fingerprint)
-        stats = self.repo.survey_dashboard_stats()
-        self.assertEqual(stats["by_category"], {"security": 1, "dependency": 1})
-        self.assertEqual(sum(stats["by_severity"].values()), 2)
-        self.assertEqual(sum(stats["by_state"].values()), 2)
-        # 运行数与忽略无关
-        self.assertEqual(stats["total_runs"], 2)
+    def test_active_ignores_skip_untitled_legacy_entries(self):
+        """旧版本迁移过来、找不到原问题的条目无法交给模型比对，不能装作还在生效。"""
+        from backend.storage.db import session_scope
+        from backend.storage.models import SurveyIgnore
 
-        self.repo.remove_survey_ignore(self.survey["survey_uid"], fingerprint)
-        self.assertEqual(self.repo.survey_dashboard_stats()["by_category"], {"security": 2, "dependency": 1})
+        _, ids = self._store([("a.dart", 1, "A")])
+        self.repo.add_survey_ignore(self.survey["survey_uid"], ids["A"])
+        with session_scope() as session:
+            session.add(SurveyIgnore(survey_id=self._survey_id(), fingerprint="f" * 64, title=None))
+        active = self.repo.list_survey_active_ignores(self.survey["survey_uid"])
+        self.assertEqual([i["title"] for i in active], ["A"])
+        listed = {i["fingerprint"]: i for i in self.repo.list_survey_ignores(self.survey["survey_uid"])}
+        self.assertFalse(listed["f" * 64]["active"])
+        self.assertIsNone(listed["f" * 64]["last_match"])
 
     def test_api_is_admin_only_and_round_trips(self):
         """清单含问题标题与理由，属于正文一侧，Guest 拿不到。"""
@@ -631,25 +643,31 @@ class SurveyIgnoreListTests(SurveyStorageTestCase):
         from backend.admin import auth, routes
 
         uid = self.survey["survey_uid"]
+        _, ids = self._store([("a.dart", 1, "A")])
         app = Flask(__name__)
         app.register_blueprint(routes.admin_bp)
         available = mock.patch.object(auth, "load_admin_config", return_value={"enabled": True, "bind_local_only": False})
         with available, app.test_client() as client:
             self.assertEqual(client.get(f"/api/admin/surveys/{uid}/ignores").status_code, 401)
-            self.assertEqual(
-                client.patch(f"/api/admin/surveys/{uid}/ignores/{'f' * 64}", json={"note": "x"}).status_code, 401
-            )
+            self.assertEqual(client.post(f"/api/admin/surveys/{uid}/ignores", json={"finding_id": ids["A"]}).status_code, 401)
             with mock.patch.object(auth, "is_admin", return_value=True):
-                created = client.post(f"/api/admin/surveys/{uid}/ignores", json={"fingerprint": "f" * 64, "note": "初始"})
+                self.assertEqual(client.post(f"/api/admin/surveys/{uid}/ignores", json={}).status_code, 400)
+                self.assertEqual(
+                    client.post(f"/api/admin/surveys/{uid}/ignores", json={"finding_id": 99999}).status_code, 404
+                )
+                created = client.post(f"/api/admin/surveys/{uid}/ignores", json={"finding_id": ids["A"], "note": "初始"})
                 self.assertEqual(created.status_code, 201)
-                patched = client.patch(f"/api/admin/surveys/{uid}/ignores/{'f' * 64}", json={"note": "改过"})
+                ignore_id = created.get_json()["id"]
+                patched = client.patch(f"/api/admin/surveys/{uid}/ignores/{ignore_id}", json={"note": "改过"})
                 self.assertEqual(patched.status_code, 200)
                 listing = client.get(f"/api/admin/surveys/{uid}/ignores").get_json()
                 self.assertEqual(listing["survey_name"], "移动端周巡检")
                 self.assertEqual(listing["items"][0]["note"], "改过")
                 self.assertEqual(
-                    client.patch(f"/api/admin/surveys/{uid}/ignores/{'e' * 64}", json={"note": "x"}).status_code, 404
+                    client.patch(f"/api/admin/surveys/{uid}/ignores/{ignore_id + 1}", json={"note": "x"}).status_code, 404
                 )
+                removed = client.delete(f"/api/admin/surveys/{uid}/ignores/{ignore_id}").get_json()
+                self.assertTrue(removed["removed"])
                 self.assertEqual(client.get("/api/admin/surveys/missing/ignores").status_code, 404)
 
 

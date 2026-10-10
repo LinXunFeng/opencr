@@ -494,17 +494,24 @@ export function clearSurveyWorkspaceApi(surveyUid: string) {
   return request<{ removed: boolean }>({ url: `surveys/${surveyUid}/workspace`, method: "delete" })
 }
 
-/** 忽略清单的一项。问题描述字段取自台账或最近一条发现，两处都没有时为空串 */
+/** 忽略清单的一项：一个已忽略问题。快照字段来自标记时的那条发现 */
 export interface SurveyIgnore {
+  id: number
   fingerprint: string
-  note: string
-  created_at: string
   repo_slug: string
   file_path: string
   category: string
+  line: number
   severity: string
   title: string
-  last_run_uid: string
+  note: string
+  created_at: string
+  /** false = 旧版本迁移过来、找不到原问题的条目，无法交给模型比对，不再生效 */
+  active: boolean
+  /** 仍保留的运行里被它隐藏的发现条数 */
+  hidden_count: number
+  /** 最近一次被它隐藏的发现；运行被清理后为 null */
+  last_match: { run_uid: string, line: number, title: string, created_at: string } | null
 }
 
 export function getSurveyIgnoresApi(surveyUid: string) {
@@ -514,25 +521,25 @@ export function getSurveyIgnoresApi(surveyUid: string) {
   })
 }
 
-export function updateSurveyIgnoreNoteApi(surveyUid: string, fingerprint: string, note: string) {
+export function addSurveyIgnoreApi(surveyUid: string, findingId: number, note = "") {
+  return request<{ id: number }>({
+    url: `surveys/${surveyUid}/ignores`,
+    method: "post",
+    data: { finding_id: findingId, note }
+  })
+}
+
+export function updateSurveyIgnoreNoteApi(surveyUid: string, ignoreId: number, note: string) {
   return request<{ updated: boolean }>({
-    url: `surveys/${surveyUid}/ignores/${fingerprint}`,
+    url: `surveys/${surveyUid}/ignores/${ignoreId}`,
     method: "patch",
     data: { note }
   })
 }
 
-export function addSurveyIgnoreApi(surveyUid: string, fingerprint: string, note = "") {
-  return request<{ ignored: boolean }>({
-    url: `surveys/${surveyUid}/ignores`,
-    method: "post",
-    data: { fingerprint, note }
-  })
-}
-
-export function removeSurveyIgnoreApi(surveyUid: string, fingerprint: string) {
+export function removeSurveyIgnoreApi(surveyUid: string, ignoreId: number) {
   return request<{ removed: boolean }>({
-    url: `surveys/${surveyUid}/ignores/${fingerprint}`,
+    url: `surveys/${surveyUid}/ignores/${ignoreId}`,
     method: "delete"
   })
 }

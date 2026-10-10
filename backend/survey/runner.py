@@ -42,6 +42,7 @@ from .clues import annotate_focuses, summarize_codegraph
 from .common import SurveyError, finding_fingerprint
 from .config import load_max_repos, load_survey_config, resolve_budget
 from .crossrepo import build_cross_repo_map, render_cross_repo_map
+from .ignores import attach_ignored, match_by_title
 from .ledger import plan_rechecks, update_ledger_for_run
 from .profile import build_profile, codegraph_status, save_profile
 from .reach import collect_reach
@@ -272,13 +273,15 @@ def execute_survey_run(survey_uid: str, trigger: str) -> Optional[str]:
         # 共用一个上限的话，台账一大，新问题就再也进不了取证。
         # 不单独开配置项，是因为它和 l2_max_focus 控制的是同一种成本（L2 调用次数）
         prepared_slugs = {item["slug"] for item in prepared}
+        ignores = repo.list_survey_active_ignores(survey_uid)
         # 本轮没拉到的仓库复核不了，先剔除再截名额，否则它们会白占名额
         rechecks, pending = plan_rechecks(
             [e for e in repo.list_survey_ledger_by_uid(survey_uid) if e["repo_slug"] in prepared_slugs],
             budget.l2_max_focus,
-            ignored=repo.survey_ignored_fingerprints(survey_uid),
+            ignored={item["fingerprint"] for item in ignores},
         )
         focuses = merge_focuses(rechecks, planned, pending)
+        attach_ignored(focuses, ignores)
         # 在合并之后标注：合并会把 L1 与复核对同一文件的点名并成一条，标注要落在实际取证的那一条上
         annotate_focuses(focuses, profiles, named_by_l1={focus_key(f) for f in planned})
         _record_codegraph_stats(run_uid, profiles, cross_map, focuses)
@@ -291,10 +294,13 @@ def execute_survey_run(survey_uid: str, trigger: str) -> Optional[str]:
             item["fingerprint"] = finding_fingerprint(
                 item["repo_slug"], item["file_path"], item["category"]
             )
+        # 模型漏标 ignore_ref 时的兜底，必须在算出指纹之后
+        match_by_title(raw_findings, ignores)
         counters = repo.record_survey_findings(run_uid, raw_findings)
 
         repo.update_survey_progress(run_uid, phase=SURVEY_PHASE_SUMMARIZING)
-        summary = summarize(raw_findings, cross_map, budget)
+        # 整体结论只写仍要跟进的问题：用户说过不再提醒的写进去，等于在报告顶部又提醒了一遍
+        summary = summarize([f for f in raw_findings if not f.get("ignore_id")], cross_map, budget)
 
         repo.finish_survey_run(run_uid, RUN_SUCCEEDED, summary=summary)
         succeeded = True

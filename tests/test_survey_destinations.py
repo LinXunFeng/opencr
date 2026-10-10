@@ -358,11 +358,72 @@ class InspectFocusTests(unittest.TestCase):
         self.assertIn("硬编码密钥", prompt)
         self.assertIn("沿用", prompt)
 
+    def test_ignored_issues_are_offered_and_only_offered_refs_are_accepted(self):
+        """模型偶尔会编一个编号；接受它就等于让模型去隐藏任意一个问题。"""
+        focus = {"repo_slug": "app", "file_path": "a.dart", "category": "correctness", "reason": "",
+                 "ignored": [{"id": 7, "category": "correctness", "line": 1, "title": "强制解包", "body": "回调里 x!"}]}
+        reply = (
+            '[{"line":1,"category":"correctness","severity":"warning","title":"同一个","body":"b","ignore_ref":"I7"},'
+            '{"line":1,"category":"correctness","severity":"warning","title":"裸数字","body":"b","ignore_ref":"7"},'
+            '{"line":1,"category":"correctness","severity":"warning","title":"编出来的","body":"b","ignore_ref":"I8"},'
+            '{"line":1,"category":"correctness","severity":"warning","title":"新问题","body":"b"}]'
+        )
+        (findings, _), call = self._inspect(reply, focus)
+        prompt = call.call_args[0][0]
+        self.assertIn("I7", prompt)
+        self.assertIn("强制解包", prompt)
+        self.assertEqual({f["title"]: f["ignore_id"] for f in findings},
+                         {"同一个": 7, "裸数字": 7, "编出来的": None, "新问题": None})
+
+    def test_prompt_has_no_ignored_block_without_ignores(self):
+        """没有已忽略问题时不该多出一段让模型困惑的说明。"""
+        _, call = self._inspect("[]")
+        self.assertNotIn("ignore_ref 填成", call.call_args[0][0])
+
     def test_deleted_file_needs_no_model_call(self):
         focus = {"repo_slug": "app", "file_path": "gone.dart", "category": "security", "reason": ""}
         (findings, conclusive), call = self._inspect("[]", focus)
         self.assertEqual((findings, conclusive), ([], True))
         call.assert_not_called()
+
+
+class IgnoreMatchingTests(unittest.TestCase):
+    """已忽略问题的分发与按标题兜底（survey/ignores.py）。"""
+
+    def _ignore(self, id_, path="lib/a.dart", title="强制解包", category="correctness"):
+        """构造一条生效的已忽略问题。"""
+        from backend.survey.common import finding_fingerprint
+
+        return {"id": id_, "repo_slug": "app", "file_path": path, "category": category, "line": 1,
+                "title": title, "body": "", "fingerprint": finding_fingerprint("app", path, category)}
+
+    def test_attach_matches_files_by_normalized_path_and_caps_count(self):
+        """路径写法不同也要挂到同一个文件上；一个文件交给模型的条数有上限。"""
+        from backend.survey.ignores import MAX_IGNORED_PER_FOCUS, attach_ignored
+
+        focuses = [{"repo_slug": "app", "file_path": "./lib/a.dart"}, {"repo_slug": "app", "file_path": "lib/b.dart"}]
+        ignores = [self._ignore(i) for i in range(1, MAX_IGNORED_PER_FOCUS + 3)]
+        attach_ignored(focuses, ignores)
+        ids = [i["id"] for i in focuses[0]["ignored"]]
+        # 超出上限时保留最新标记的
+        self.assertEqual(len(ids), MAX_IGNORED_PER_FOCUS)
+        self.assertEqual(ids[0], MAX_IGNORED_PER_FOCUS + 2)
+        self.assertEqual(focuses[1]["ignored"], [])
+
+    def test_title_fallback_needs_same_fingerprint_and_same_title(self):
+        """相似就算命中的话，同一文件里换了个说法的另一个问题也会被吞掉。"""
+        from backend.survey.common import finding_fingerprint
+        from backend.survey.ignores import match_by_title
+
+        fp = finding_fingerprint("app", "lib/a.dart", "correctness")
+        findings = [
+            {"fingerprint": fp, "title": " 强制解包 "},
+            {"fingerprint": fp, "title": "强制解包空返回值"},
+            {"fingerprint": "other", "title": "强制解包"},
+            {"fingerprint": fp, "title": "强制解包", "ignore_id": 5},
+        ]
+        self.assertEqual(match_by_title(findings, [self._ignore(3)]), 1)
+        self.assertEqual([f.get("ignore_id") for f in findings], [3, None, None, 5])
 
 
 class CollectFindingsTests(unittest.TestCase):
@@ -530,14 +591,53 @@ class LedgerStorageTests(LedgerStorageTestCase):
         self._complete_run([], status="failed")
         self.assertEqual(self._ledger()["lib/a.dart"]["state"], "present")
 
-    def test_ignore_flips_ledger_row_immediately(self):
-        """忽略之后手动重推一次，表里就应该看到变化，而不是等下一轮巡检。"""
-        item = _finding("lib/a.dart")
-        self._complete_run([item])
-        self.repo.add_survey_ignore(self.survey["survey_uid"], item["fingerprint"])
+    def _finding_ids(self, run_uid):
+        """某次运行里可见发现的 {标题: id}。"""
+        return {f["title"]: f["id"] for f in self.repo.get_survey_run_detail(run_uid)["findings"]}
+
+    def test_ignore_flips_ledger_row_once_every_issue_of_it_is_ignored(self):
+        """
+        台账一行是一个指纹，可能合并了好几个问题：还剩没被忽略的，这一行就仍然存在。
+        全部忽略后立刻转为已忽略 —— 手动重推一次，表里就应该看到变化，而不是等下一轮巡检。
+        """
+        uid = self.survey["survey_uid"]
+        run_uid = self._complete_run([_finding("lib/a.dart", line=1, title="A"), _finding("lib/a.dart", line=9, title="B")])
+        ids = self._finding_ids(run_uid)
+        self.repo.add_survey_ignore(uid, ids["A"])
+        self.assertEqual(self._ledger()["lib/a.dart"]["state"], "present")
+        ignore_b = self.repo.add_survey_ignore(uid, ids["B"])
         self.assertEqual(self._ledger()["lib/a.dart"]["state"], "ignored")
         # 取消忽略不会凭空改回存在
-        self.repo.remove_survey_ignore(self.survey["survey_uid"], item["fingerprint"])
+        self.repo.remove_survey_ignore(uid, ignore_b)
+        self.assertEqual(self._ledger()["lib/a.dart"]["state"], "ignored")
+
+    def test_ledger_state_follows_the_rows_latest_run(self):
+        """
+        台账行按它最近一次出现的那轮判断：在旧报告里点，原样报过的同一个问题一起隐藏、行随之转为已忽略；
+        最近一轮换了说法、模型还没认出来的，行仍然存在。
+        """
+        first = self._complete_run([_finding("lib/a.dart", title="A")])
+        self._complete_run([_finding("lib/a.dart", title="A")])
+        self.repo.add_survey_ignore(self.survey["survey_uid"], self._finding_ids(first)["A"])
+        self.assertEqual(self._ledger()["lib/a.dart"]["state"], "ignored")
+
+        second = self._complete_run([_finding("lib/b.dart", title="B")])
+        self._complete_run([_finding("lib/b.dart", title="B 换了说法")])
+        self.repo.add_survey_ignore(self.survey["survey_uid"], self._finding_ids(second)["B"])
+        self.assertEqual(self._ledger()["lib/b.dart"]["state"], "present")
+
+    def test_ledger_skips_ignored_issues_and_marks_fully_ignored_rows(self):
+        """被认出的已知问题不进台账正文与条数；一行里只剩已知问题时是已忽略，而不是本轮未发现。"""
+        uid = self.survey["survey_uid"]
+        first = self._complete_run([_finding("lib/a.dart", title="A")])
+        ignore_id = self.repo.add_survey_ignore(uid, self._finding_ids(first)["A"])
+
+        known = {**_finding("lib/a.dart", line=4, title="A 换了说法"), "ignore_id": ignore_id}
+        self._complete_run([known, _finding("lib/a.dart", line=20, title="新问题")])
+        row = self._ledger()["lib/a.dart"]
+        self.assertEqual((row["state"], row["finding_count"], row["title"]), ("present", 1, "新问题"))
+
+        self._complete_run([{**known}])
         self.assertEqual(self._ledger()["lib/a.dart"]["state"], "ignored")
 
     def test_ledger_outlives_run_retention(self):

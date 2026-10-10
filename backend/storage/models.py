@@ -566,6 +566,11 @@ class SurveyFinding(Base):
     state: Mapped[str] = mapped_column(String(16), nullable=False, default=FINDING_STATE_NEW)
     # 继承自产出它的关注点；旧数据为 NULL。不进指纹 —— 同一位置换了线索来源仍是同一个问题。
     clue_source: Mapped[Optional[str]] = mapped_column(String(16))
+    # 被哪条已忽略问题隐藏。标记时关联被点的那条；之后的运行里模型认出同一个问题时也关联上。
+    # 隐藏而不删除：取消忽略后历史报告要原样恢复，模型认错了也要能在忽略清单里看到它认成了哪条
+    ignore_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("survey_ignore.id", ondelete="SET NULL")
+    )
 
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=utcnow)
 
@@ -575,11 +580,18 @@ class SurveyFinding(Base):
         Index("ix_survey_finding_run", "run_id"),
         Index("ix_survey_finding_survey_fp", "survey_id", "fingerprint"),
         Index("ix_survey_finding_survey_created", "survey_id", "created_at"),
+        Index("ix_survey_finding_ignore", "ignore_id"),
     )
 
 
 class SurveyIgnore(Base):
-    """人工标记为"已知问题、不再提醒"的指纹。命中的 Finding 不再入库。"""
+    """
+    IgnoredIssue（已忽略问题）：人工标记为"已知问题、不再提醒"的**一个问题**，见 ADR-0006。
+
+    不按指纹忽略：指纹是"仓库 + 文件 + 类别"，按它忽略会把同一文件里同类的其他问题一并吞掉。
+    行号与措辞每轮都会变，没有稳定的键能认出"还是那个问题"，所以由 L2 取证时让模型判断；
+    快照字段就是交给模型比对的那份描述，运行记录被清理后它仍然在。
+    """
 
     __tablename__ = "survey_ignore"
 
@@ -587,13 +599,25 @@ class SurveyIgnore(Base):
     survey_id: Mapped[int] = mapped_column(
         ForeignKey("survey.id", ondelete="CASCADE"), nullable=False
     )
+    # 问题所在的指纹，用来把它分发到对应文件的取证上，不是忽略的单位：同一指纹下可以有多条
     fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+
+    # 标记时那条发现的快照。旧版本的指纹级忽略迁移时找不到任何发现与台账行的，title 为 NULL，
+    # 这样的条目无法交给模型比对，不再生效（见迁移 b7e4c1a9d2f0）
+    repo_slug: Mapped[str] = mapped_column(String(128), nullable=False, default="")
+    file_path: Mapped[Optional[str]] = mapped_column(String(1024))
+    category: Mapped[str] = mapped_column(String(24), nullable=False, default=CATEGORY_CORRECTNESS)
+    line: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    severity: Mapped[str] = mapped_column(String(16), nullable=False, default=SEVERITY_UNKNOWN)
+    title: Mapped[Optional[str]] = mapped_column(String(512))
+    body: Mapped[Optional[str]] = mapped_column(Text)
+
     # 留痕用：忽略一条问题的理由，半年后没人记得为什么
     note: Mapped[Optional[str]] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=utcnow)
 
     __table_args__ = (
-        Index("ux_survey_ignore", "survey_id", "fingerprint", unique=True),
+        Index("ix_survey_ignore_survey_fp", "survey_id", "fingerprint"),
     )
 
 

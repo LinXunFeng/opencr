@@ -454,7 +454,7 @@ Matching is done on a fingerprint of `repository + file path + category`, and de
 **excludes the body text**: the model never words the same problem identically twice, so including
 it would mark every finding as new on every run.
 
-Findings you do not want to see again can be marked as known issues, optionally with a reason; later runs will not report them. Ignoring works on the fingerprint, so it also silences other findings of the same category in the same file; existing reports hide them too (with a note of how many are hidden) and show them again once un-ignored. Each survey's ignore list is reachable from the "Ignore list" action on the survey list, where you can edit reasons or un-ignore entries.
+Findings you do not want to see again can be marked as known issues, optionally with a reason. Only that one issue is ignored: since line numbers and wording change from run to run, later runs ask the model, while inspecting that file, whether a new finding is the same issue, and hide it from reports if so (with a note of how many are hidden); other issues in the same file are still reported. The model can be wrong, so each survey's ignore list (the "Ignore list" action on the survey list) shows which finding each entry hid most recently; there you can also edit reasons or un-ignore entries, which brings the hidden findings back.
 
 Reports can be exported as Markdown. The export renders the same data as the console, so a guest
 export contains no bodies either.
@@ -534,7 +534,7 @@ Rules worth knowing:
 - **"Not seen this run" does not mean fixed.** It only says the file was inspected this run and the model did not report the issue again. Besides the focus points the model selects, every run re-inspects the files holding still-present ledger issues (least recently re-checked first, capped at the focus-point limit, counted separately). Files that were not re-inspected — cap reached, budget exhausted, repository fetch failed, file longer than the per-focus read limit, source unreadable or model output unparseable — keep their previous state.
 - **Findings sharing a fingerprint in one run become one row**: highest severity, all line numbers, bodies concatenated and truncated at the 50,000-character cell limit.
 - **Deleted rows.** A row whose state is still "present" is restored if you delete it, otherwise a live problem would silently vanish; "not seen" and "ignored" rows stay deleted. The first push to a newly bound sheet writes the full ledger.
-- **Marking a finding as a known issue** flips its ledger row to "ignored" immediately; the next push updates the sheet without deleting the row.
+- **Marking a finding as a known issue** flips its ledger row to "ignored" immediately once every issue in that row is ignored; the next push updates the sheet without deleting the row. A row that still holds other issues stays "present".
 - Values are written as raw text, so a body starting with `=` is never evaluated as a formula.
 - Appending rows is retried on server 5xx errors; if the failed request had in fact been applied, the sheet gets a duplicate row with the same key. The impact is limited: the next push updates both rows, the data stays correct, and the extra row can be deleted by hand.
 - **Pushing hands over control of who can read finding bodies**: that is decided by the spreadsheet's sharing settings, not by the guest switches. Guests in the console see push status but not the target location or error messages.
