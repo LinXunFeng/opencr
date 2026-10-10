@@ -262,6 +262,11 @@ SURVEY_PHASE_DONE = "done"
 REPO_OK = "ok"
 REPO_FETCH_FAILED = "fetch_failed"
 REPO_INDEX_FAILED = "index_failed"
+# 在忽略清单里、本轮跳过的仓库。仍记一行是为了让运行详情能看出它没参与，而不是悄无声息地少了一个仓库
+REPO_IGNORED = "ignored"
+# 超出单次巡检仓库上限、本轮被截掉的仓库。记下来既是为了看得出少了谁，也让它能在忽略清单里被选中 ——
+# 仓库太多时最想剔除的恰恰是这一批
+REPO_TRUNCATED = "truncated"
 
 # --- SurveyRunRepo.profile_kind ------------------------------------------
 PROFILE_CODEGRAPH = "codegraph"
@@ -618,6 +623,35 @@ class SurveyIgnore(Base):
 
     __table_args__ = (
         Index("ix_survey_ignore_survey_fp", "survey_id", "fingerprint"),
+    )
+
+
+class SurveyIgnoredRepo(Base):
+    """
+    IgnoredRepo（已忽略仓库）：人工标记为"不再巡检"的一个仓库。
+
+    按 repo_slug 认仓库：工作区目录、来源去重、台账与运行记录都以它为仓库身份，
+    换成完整路径的话，同一个仓库手填地址和从组织展开会对不上。
+    代价是 slug 只取最后两段路径，a-b/c 与 a/b-c 会撞成同一个；来源去重本来就会把它们当成一个仓库，
+    忽略沿用同一身份才不会出现"去重认为是一个、忽略认为是两个"的分裂。
+    与组织来源上的 exclude_patterns 并存：那是挡掉一类仓库的规则，这里是点名的某一个，并附理由。
+    """
+
+    __tablename__ = "survey_ignored_repo"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    survey_id: Mapped[int] = mapped_column(
+        ForeignKey("survey.id", ondelete="CASCADE"), nullable=False
+    )
+    repo_slug: Mapped[str] = mapped_column(String(128), nullable=False)
+    # 标记时的仓库地址或路径，只用于展示：slug 是"组-项目"拼出来的，看不出完整的组织层级
+    url: Mapped[str] = mapped_column(String(1024), nullable=False, default="")
+    # 留痕用：半年后没人记得这个仓库为什么不巡检了
+    note: Mapped[Optional[str]] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=utcnow)
+
+    __table_args__ = (
+        Index("ux_survey_ignored_repo", "survey_id", "repo_slug", unique=True),
     )
 
 

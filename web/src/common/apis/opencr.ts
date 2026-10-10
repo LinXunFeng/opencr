@@ -544,6 +544,53 @@ export function removeSurveyIgnoreApi(surveyUid: string, ignoreId: number) {
   })
 }
 
+/** 忽略清单里的一个已忽略仓库：之后的巡检不拉取、不分析它 */
+export interface SurveyIgnoredRepo {
+  id: number
+  repo_slug: string
+  /** 标记时填的仓库地址或路径，只用于展示 */
+  url: string
+  note: string
+  created_at: string
+}
+
+/** 可供标记的候选仓库：最近一次运行展开出的清单，已去掉忽略过的 */
+export interface SurveyRepoCandidate {
+  repo_slug: string
+  url: string
+}
+
+export function getSurveyIgnoredReposApi(surveyUid: string) {
+  return request<{ items: SurveyIgnoredRepo[], candidates: SurveyRepoCandidate[] }>({
+    url: `surveys/${surveyUid}/ignored-repos`,
+    method: "get"
+  })
+}
+
+export function addSurveyIgnoredRepoApi(surveyUid: string, url: string, note = "") {
+  /** repo_slug 是服务端换算出的仓库身份，手填地址时用来让管理员核对 */
+  return request<{ id: number, repo_slug: string }>({
+    url: `surveys/${surveyUid}/ignored-repos`,
+    method: "post",
+    data: { url, note }
+  })
+}
+
+export function updateSurveyIgnoredRepoNoteApi(surveyUid: string, itemId: number, note: string) {
+  return request<{ updated: boolean }>({
+    url: `surveys/${surveyUid}/ignored-repos/${itemId}`,
+    method: "patch",
+    data: { note }
+  })
+}
+
+export function removeSurveyIgnoredRepoApi(surveyUid: string, itemId: number) {
+  return request<{ removed: boolean }>({
+    url: `surveys/${surveyUid}/ignored-repos/${itemId}`,
+    method: "delete"
+  })
+}
+
 export function getSurveyRunsApi(params: { survey_uid?: string, limit?: number } = {}) {
   return request<{ items: SurveyRun[] }>({ url: "survey-runs", method: "get", params })
 }

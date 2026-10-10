@@ -893,6 +893,52 @@ def api_update_survey_ignore(survey_uid: str, ignore_id: int):
     return jsonify({"updated": True})
 
 
+@admin_bp.route("/api/admin/surveys/<survey_uid>/ignored-repos", methods=["GET"])
+@require_admin
+def api_survey_ignored_repos(survey_uid: str):
+    """已忽略仓库，以及可供标记的候选仓库（最近一次运行展开出的清单）。与忽略清单同一档，不对 Guest 开放。"""
+    if repo.get_survey(survey_uid) is None:
+        return jsonify({"error": "巡检不存在"}), 404
+    return jsonify({
+        "items": repo.list_survey_ignored_repos(survey_uid),
+        "candidates": repo.list_survey_repo_candidates(survey_uid),
+    })
+
+
+@admin_bp.route("/api/admin/surveys/<survey_uid>/ignored-repos", methods=["POST"])
+@require_admin
+def api_add_survey_ignored_repo(survey_uid: str):
+    """把一个仓库标记为不再巡检：下一轮起不拉取、不分析，台账里这个仓库的行转为已忽略。"""
+    payload = request.get_json(silent=True) or {}
+    try:
+        added = repo.add_survey_ignored_repo(
+            survey_uid, str(payload.get("url") or ""), str(payload.get("note") or "")
+        )
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    if added is None:
+        return jsonify({"error": "巡检不存在"}), 404
+    # 回传换算出的仓库身份：手填地址时，管理员要能当场核对它是不是报告里的那个仓库
+    return jsonify({"id": added[0], "repo_slug": added[1]}), 201
+
+
+@admin_bp.route("/api/admin/surveys/<survey_uid>/ignored-repos/<int:item_id>", methods=["DELETE"])
+@require_admin
+def api_remove_survey_ignored_repo(survey_uid: str, item_id: int):
+    """取消忽略一个仓库，下一轮起它重新参与巡检。"""
+    return jsonify({"removed": repo.remove_survey_ignored_repo(survey_uid, item_id)})
+
+
+@admin_bp.route("/api/admin/surveys/<survey_uid>/ignored-repos/<int:item_id>", methods=["PATCH"])
+@require_admin
+def api_update_survey_ignored_repo(survey_uid: str, item_id: int):
+    """修改已忽略仓库的理由。"""
+    payload = request.get_json(silent=True) or {}
+    if not repo.update_survey_ignored_repo_note(survey_uid, item_id, str(payload.get("note") or "")):
+        return jsonify({"error": "忽略记录不存在"}), 404
+    return jsonify({"updated": True})
+
+
 @admin_bp.route("/api/admin/survey-runs", methods=["GET"])
 @require_survey_viewer
 def api_survey_runs():

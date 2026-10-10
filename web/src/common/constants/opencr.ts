@@ -196,8 +196,20 @@ export const FINDING_STATE_TAG: Record<string, TagType> = {
 export const SURVEY_REPO_STATUS_LABEL: Record<string, string> = {
   ok: "正常",
   fetch_failed: "拉取失败",
-  index_failed: "索引失败"
+  index_failed: "索引失败",
+  ignored: "已忽略",
+  truncated: "超出上限"
 }
+
+/** 已忽略是用户的选择、超出上限是配置问题，都不是故障，不能和拉取失败一样标红 */
+export const SURVEY_REPO_STATUS_TAG: Record<string, TagType> = {
+  ok: "success",
+  ignored: "info",
+  truncated: "warning"
+}
+
+/** 没有参与分析的仓库状态：运行记录里仍列出（看得出少了谁），但不算「覆盖的仓库」 */
+export const SURVEY_REPO_SKIPPED_STATUSES = ["ignored", "truncated"]
 
 /** Reach 里画像中出现文件的来源 */
 export const REACH_SOURCE_LABEL: Record<string, string> = {
@@ -387,6 +399,18 @@ export const SURVEY_NOTES = {
     "最近一次被这条忽略隐藏的发现：标记时被点的那条，或之后的巡检里模型认出的同一个问题。如果这里显示的明显是另一个问题，说明模型认错了，请取消这条忽略后重新标记。",
   ignoreInactive:
     "旧版本按「文件 + 类别」整体忽略，升级时找不到这条忽略对应的具体问题（相关运行已被清理），它已不再生效，可以直接取消。",
+  ignoreRepoScope:
+    "已忽略的仓库之后不再拉取、不再分析，也不占单次巡检的仓库上限；不论它是手填的还是从组织里展开出来的。候选列表取自最近一次巡检的仓库清单（含超出上限被截掉的），也可以直接填仓库地址或 group/project。台账里这个仓库的行转为「已忽略」，已有报告不受影响。要按规则挡掉一类仓库（例如路径里带 archive 的），用组织来源上的排除模式。",
+  ignoreRepoRemove:
+    "取消后，下一轮巡检起这个仓库重新参与。它在台账里的行会停在「已忽略」，等后续巡检复核出结论后才会变为「存在」或「本轮未发现」。",
+  ignoreRepoNotePrompt:
+    "为什么不再巡检这个仓库？半年后这里是唯一的线索。",
+  ignoreRepoNotePlaceholder:
+    "例如：已停止维护，代码迁到了新仓库",
+  repoSkipped:
+    "这个仓库本轮没有参与分析：它在忽略清单里，或超出了单次巡检的仓库上限。没有拉取，也就没有统计。",
+  skippedRepos: (count: number) =>
+    `另有 ${count} 个仓库未参与（在忽略清单里，或超出单次巡检的仓库上限），见状态列`,
   workspaceKept:
     "删除巡检不会连带删除本地工作区——那可能是几十 GB 代码，且删除不可逆。工作区清理是单独的动作。"
 }
