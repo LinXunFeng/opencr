@@ -1,7 +1,7 @@
 <script lang="ts" setup>
 import type { SurveyIgnore, SurveyIgnoredRepo, SurveyRepoCandidate, SurveySourceError } from "@@/apis/opencr"
 import {
-  addSurveyIgnoredRepoApi,
+  addSurveyIgnoredReposApi,
   getSurveyIgnoredReposApi,
   getSurveyIgnoresApi,
   getSurveyLiveRepoCandidatesApi,
@@ -14,6 +14,7 @@ import {
   CATEGORY_LABEL,
   formatTime,
   IGNORE_NOTE_MAX,
+  IGNORE_REPO_BATCH_MAX,
   SEVERITY_LABEL,
   SEVERITY_TAG,
   SURVEY_NOTES,
@@ -47,7 +48,39 @@ const candidateSource = reactive({
   refreshing: false,
   errors: [] as SurveySourceError[]
 })
-const repoDialog = reactive({ visible: false, saving: false, url: "", note: "" })
+const repoDialog = reactive({
+  visible: false,
+  saving: false,
+  urls: [] as string[],
+  keyword: "",
+  // 批量粘贴的原文。不能直接粘进选择框：它的输入框是单行的，浏览器会吞掉换行，几个地址拼成一个
+  pasted: "",
+  showPaste: false,
+  note: ""
+})
+
+/** 候选里匹配关键字的仓库地址（不区分大小写），供「选中匹配的」一次选上一批 */
+const keywordMatches = computed(() => {
+  const keyword = repoDialog.keyword.trim().toLowerCase()
+  if (!keyword) return []
+  return candidates.value
+    .filter(c => c.url.toLowerCase().includes(keyword) || c.repo_slug.toLowerCase().includes(keyword))
+    .map(c => c.url)
+})
+
+function selectKeywordMatches() {
+  // 叠加而不是替换：先选 legacy、再选 archive，两批都要留着
+  repoDialog.urls = [...new Set([...repoDialog.urls, ...keywordMatches.value])]
+}
+
+/** 粘贴框里拆出来的地址：按换行、逗号（含全角）、空白分隔 */
+const pastedUrls = computed(() => repoDialog.pasted.split(/[\s,，]+/).map(u => u.trim()).filter(Boolean))
+
+function addPasted() {
+  // 同样是叠加；地址是否合法留给服务端统一校验，不合法的会在提交时一次列出来
+  repoDialog.urls = [...new Set([...repoDialog.urls, ...pastedUrls.value])]
+  Object.assign(repoDialog, { pasted: "", showPaste: false })
+}
 
 const surveyUid = computed(() => String(route.params.surveyUid || ""))
 
@@ -149,19 +182,26 @@ async function refreshCandidates() {
 }
 
 function openRepoDialog() {
-  Object.assign(repoDialog, { visible: true, saving: false, url: "", note: "" })
+  Object.assign(repoDialog, { visible: true, saving: false, urls: [], keyword: "", pasted: "", showPaste: false, note: "" })
 }
 
 async function addRepo() {
-  const url = repoDialog.url.trim()
-  if (!url) {
+  const urls = repoDialog.urls.map(u => u.trim()).filter(Boolean)
+  if (!urls.length) {
     ElMessage.warning("请选择或填写仓库")
+    return
+  }
+  if (urls.length > IGNORE_REPO_BATCH_MAX) {
+    ElMessage.warning(`一次最多添加 ${IGNORE_REPO_BATCH_MAX} 个仓库，当前选了 ${urls.length} 个`)
     return
   }
   repoDialog.saving = true
   try {
-    const result = await addSurveyIgnoredRepoApi(surveyUid.value, url, repoDialog.note.trim())
-    ElMessage.success(`已加入忽略清单（仓库标识 ${result.repo_slug}），下一轮巡检起生效`)
+    const { items: added } = await addSurveyIgnoredReposApi(surveyUid.value, urls, repoDialog.note.trim())
+    const created = added.filter(i => i.created).length
+    // 数量少时带上换算出的仓库标识：手填的地址要能当场核对是不是想忽略的那个
+    const slugs = added.length <= 5 ? `（仓库标识：${added.map(i => i.repo_slug).join("、")}）` : ""
+    ElMessage.success(`${SURVEY_NOTES.ignoreRepoAdded(created, added.length - created)}${slugs}`)
     repoDialog.visible = false
     await load()
   } catch (error) {
@@ -347,13 +387,37 @@ onMounted(load)
       <el-form label-width="70px">
         <el-form-item label="仓库">
           <el-select
-            v-model="repoDialog.url"
-            filterable allow-create default-first-option clearable
-            placeholder="从候选里选，或填仓库地址 / 组织/仓库路径"
+            v-model="repoDialog.urls"
+            multiple filterable allow-create default-first-option clearable
+            collapse-tags collapse-tags-tooltip :max-collapse-tags="5"
+            placeholder="从候选里选（可多选），或填仓库地址 / 组织/仓库路径后回车"
             style="width: 100%"
           >
             <el-option v-for="c in candidates" :key="c.repo_slug" :label="c.url" :value="c.url" />
           </el-select>
+          <div class="batch-select">
+            <el-input v-model="repoDialog.keyword" size="small" clearable placeholder="关键字，如 legacy" style="width: 200px" />
+            <el-tooltip :content="SURVEY_NOTES.ignoreRepoBatchSelect" placement="top">
+              <el-button size="small" :disabled="!keywordMatches.length" @click="selectKeywordMatches">
+                选中匹配的 {{ keywordMatches.length }} 个
+              </el-button>
+            </el-tooltip>
+            <el-button size="small" link @click="repoDialog.showPaste = !repoDialog.showPaste">
+              批量粘贴
+            </el-button>
+            <el-button size="small" link :disabled="!repoDialog.urls.length" @click="repoDialog.urls = []">
+              清空已选（{{ repoDialog.urls.length }}）
+            </el-button>
+          </div>
+          <div v-if="repoDialog.showPaste" class="paste-box">
+            <el-input
+              v-model="repoDialog.pasted" type="textarea" :rows="4"
+              :placeholder="SURVEY_NOTES.ignoreRepoPastePlaceholder"
+            />
+            <el-button size="small" :disabled="!pastedUrls.length" @click="addPasted">
+              加入已选（{{ pastedUrls.length }} 个）
+            </el-button>
+          </div>
           <div class="candidate-source">
             <span class="muted">
               <template v-if="candidateSource.kind === 'live'">{{ SURVEY_NOTES.candidatesLive(formatTime(candidateSource.fetchedAt)) }}</template>
@@ -428,6 +492,21 @@ onMounted(load)
   margin-top: 4px;
   font-size: 12px;
   line-height: 1.6;
+}
+.paste-box {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 6px;
+  width: 100%;
+  margin-top: 6px;
+}
+.batch-select {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  margin-top: 6px;
 }
 .candidate-errors {
   margin-top: 6px;

@@ -947,18 +947,26 @@ def api_survey_live_repo_candidates(survey_uid: str):
 @admin_bp.route("/api/admin/surveys/<survey_uid>/ignored-repos", methods=["POST"])
 @require_admin
 def api_add_survey_ignored_repo(survey_uid: str):
-    """把一个仓库标记为不再巡检：下一轮起不拉取、不分析，台账里这个仓库的行转为已忽略。"""
+    """
+    把仓库标记为不再巡检：下一轮起不拉取、不分析，台账里这些仓库的行转为已忽略。
+
+    接收 urls（数组，一批共用一条理由）或单个 url。任何一个不合法时整批都不写入，返回 400。
+    """
     payload = request.get_json(silent=True) or {}
+    urls = payload.get("urls")
+    if urls is None:
+        urls = [payload.get("url")]
+    if not isinstance(urls, list):
+        return jsonify({"error": "urls 必须是数组"}), 400
     try:
-        added = repo.add_survey_ignored_repo(
-            survey_uid, str(payload.get("url") or ""), str(payload.get("note") or "")
-        )
+        added = repo.add_survey_ignored_repos(survey_uid, urls, str(payload.get("note") or ""))
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
     if added is None:
         return jsonify({"error": "巡检不存在"}), 404
-    # 回传换算出的仓库身份：手填地址时，管理员要能当场核对它是不是报告里的那个仓库
-    return jsonify({"id": added[0], "repo_slug": added[1]}), 201
+    # 回传换算出的仓库身份：手填地址时，管理员要能当场核对它是不是报告里的那个仓库。
+    # 单个添加时 id / repo_slug 沿用旧的响应字段
+    return jsonify({"id": added[0]["id"], "repo_slug": added[0]["repo_slug"], "items": added}), 201
 
 
 @admin_bp.route("/api/admin/surveys/<survey_uid>/ignored-repos/<int:item_id>", methods=["DELETE"])

@@ -674,7 +674,7 @@ class IgnoredRepoTests(LedgerStorageTestCase):
         self._complete_run([_finding("lib/a.dart", repo="group-old"), _finding("lib/b.dart")],
                            repos=(("group-old", "ok"), ("app", "ok")))
         # 仓库地址按 repo_slug_from_url 换算成仓库身份，与组织展开出来的仓库一致
-        self.repo.add_survey_ignored_repo(uid, "https://g.com/top/group/old.git", "没人维护了")
+        self.repo.add_survey_ignored_repos(uid, ["https://g.com/top/group/old.git"], "没人维护了")
         self.assertEqual(self.repo.list_survey_ignored_repo_slugs(uid), {"group-old"})
         ledger = self._ledger()
         self.assertEqual(ledger["lib/a.dart"]["state"], "ignored")
@@ -696,13 +696,14 @@ class IgnoredRepoTests(LedgerStorageTestCase):
         uid = self.survey["survey_uid"]
         self._complete_run([_finding("lib/a.dart", repo="g-old")], repos=(("g-old", "ok"),))
         self._complete_run([], repos=(("g-old", "ok"),), inspected=[])
-        first, slug = self.repo.add_survey_ignored_repo(uid, "g/old")
-        self.assertEqual(slug, "g-old")
+        [first] = self.repo.add_survey_ignored_repos(uid, ["g/old"])
+        self.assertEqual(first["repo_slug"], "g-old")
+        first = first["id"]
         self.assertEqual(self._ledger()["lib/a.dart"]["state"], "ignored")
 
-        again = self.repo.add_survey_ignored_repo(uid, "https://x.com/g/old.git", "迁移到新仓库了")
-        self.assertEqual(again, (first, "g-old"))
-        self.repo.add_survey_ignored_repo(uid, "g/old", "另一个理由")
+        [again] = self.repo.add_survey_ignored_repos(uid, ["https://x.com/g/old.git"], "迁移到新仓库了")
+        self.assertEqual((again["id"], again["created"]), (first, False))
+        self.repo.add_survey_ignored_repos(uid, ["g/old"], "另一个理由")
         items = self.repo.list_survey_ignored_repos(uid)
         self.assertEqual([(i["repo_slug"], i["note"]) for i in items], [("g-old", "迁移到新仓库了")])
 
@@ -712,12 +713,51 @@ class IgnoredRepoTests(LedgerStorageTestCase):
         self.assertTrue(self.repo.remove_survey_ignored_repo(uid, first))
         self.assertEqual(self.repo.list_survey_ignored_repos(uid), [])
 
+    def test_batch_add_is_all_or_nothing_and_deduplicated(self):
+        """
+        一次加入多个仓库：共用一条理由、同一仓库换了写法只算一次、原本就在清单里的标出来；
+        任何一个不合法时整批都不写入，并把不合法的一次列全。
+        """
+        uid = self.survey["survey_uid"]
+        self._complete_run([_finding("lib/a.dart", repo="g-a"), _finding("lib/b.dart", repo="g-b")],
+                           repos=(("g-a", "ok"), ("g-b", "ok")))
+        self.repo.add_survey_ignored_repos(uid, ["g/a"], "早先的理由")
+
+        with self.assertRaises(ValueError) as ctx:
+            self.repo.add_survey_ignored_repos(uid, ["g/b", "oops", "https://g.com"], "不维护")
+        self.assertIn("oops", str(ctx.exception))
+        self.assertIn("https://g.com", str(ctx.exception))
+        self.assertEqual(self.repo.list_survey_ignored_repo_slugs(uid), {"g-a"})
+
+        added = self.repo.add_survey_ignored_repos(
+            uid, ["g/b", "https://g.com/g/b.git", " ", "g/a", "g/c"], "不维护"
+        )
+        self.assertEqual([(i["repo_slug"], i["created"]) for i in added],
+                         [("g-b", True), ("g-a", False), ("g-c", True)])
+        notes = {i["repo_slug"]: i["note"] for i in self.repo.list_survey_ignored_repos(uid)}
+        self.assertEqual(notes, {"g-a": "早先的理由", "g-b": "不维护", "g-c": "不维护"})
+        ledger = self._ledger()
+        self.assertEqual((ledger["lib/a.dart"]["state"], ledger["lib/b.dart"]["state"]), ("ignored", "ignored"))
+
+        with self.assertRaises(ValueError):
+            self.repo.add_survey_ignored_repos(uid, [])
+        with self.assertRaises(ValueError):
+            self.repo.add_survey_ignored_repos(uid, [f"g/r{i}" for i in range(1001)])
+        self.assertIsNone(self.repo.add_survey_ignored_repos("missing", ["g/x"]))
+
+    def test_batch_add_at_the_limit(self):
+        """上限内的一整批（1000 个）要能一次写完，台账更新不能撞上 SQLite 的参数个数上限。"""
+        uid = self.survey["survey_uid"]
+        added = self.repo.add_survey_ignored_repos(uid, [f"g/r{i}" for i in range(1000)])
+        self.assertEqual(len(added), 1000)
+        self.assertEqual(len(self.repo.list_survey_ignored_repo_slugs(uid)), 1000)
+
     def test_bare_project_name_is_rejected(self):
         """只填项目名算出的 slug 少了组织一段，这条忽略永远不会命中，宁可当场拒绝。"""
         for bad in ("", "  ", "old", "/old/"):
             with self.assertRaises(ValueError):
-                self.repo.add_survey_ignored_repo(self.survey["survey_uid"], bad)
-        self.assertIsNone(self.repo.add_survey_ignored_repo("missing", "g/old"))
+                self.repo.add_survey_ignored_repos(self.survey["survey_uid"], [bad])
+        self.assertIsNone(self.repo.add_survey_ignored_repos("missing", ["g/old"]))
 
     def test_candidates_come_from_latest_run_minus_ignored(self):
         uid = self.survey["survey_uid"]
@@ -727,8 +767,8 @@ class IgnoredRepoTests(LedgerStorageTestCase):
         # 组织展开失败的行以组织地址充当 repo_slug，它不是仓库，不能当候选
         latest = self.repo.list_survey_runs(uid)[0]["run_uid"]
         self.repo.record_survey_repo(latest, "grp/sub", "grp/sub", status="fetch_failed", error_message="404")
-        self.repo.add_survey_ignored_repo(uid, "g/a")
-        self.repo.add_survey_ignored_repo(uid, "g/c")
+        self.repo.add_survey_ignored_repos(uid, ["g/a"])
+        self.repo.add_survey_ignored_repos(uid, ["g/c"])
         candidates = self.repo.list_survey_repo_candidates(uid)
         self.assertEqual([c["repo_slug"] for c in candidates["items"]], ["g-b"])
         # 清单来自哪一轮要带上，界面据此提示它可能过时
@@ -740,7 +780,7 @@ class IgnoredRepoTests(LedgerStorageTestCase):
         from backend.survey import runner
 
         uid = self.survey["survey_uid"]
-        self.repo.add_survey_ignored_repo(uid, "https://g.com/a/app.git", "")
+        self.repo.add_survey_ignored_repos(uid, ["https://g.com/a/app.git"], "")
         with mock.patch.object(runner, "_prepare_workspaces") as prepare, \
                 mock.patch.object(runner, "_cleanup"):
             run_uid = runner.execute_survey_run(uid, "manual")
@@ -773,7 +813,7 @@ class IgnoredRepoRunTests(LedgerStorageTestCase):
         self.repo.update_survey(uid, {}, sources=[
             {"kind": "repo", "url": f"https://g.com/grp/r{i}.git"} for i in range(4)
         ])
-        self.repo.add_survey_ignored_repo(uid, "grp/r0")
+        self.repo.add_survey_ignored_repos(uid, ["grp/r0"])
         with mock.patch.object(runner, "load_max_repos", return_value=2), \
                 mock.patch.object(runner, "_prepare_workspaces", return_value=[]), \
                 mock.patch.object(runner, "_cleanup"):
@@ -799,7 +839,7 @@ class IgnoredRepoRunTests(LedgerStorageTestCase):
         run_uid = self.repo.start_survey_run(uid, "schedule")
         self.repo.record_survey_repo(run_uid, "grp-old", "https://g.com/grp/old.git", status="ok")
         self.repo.record_survey_findings(run_uid, [_finding("lib/a.dart", repo="grp-old", title="新说法")])
-        self.repo.add_survey_ignored_repo(uid, "grp/old")
+        self.repo.add_survey_ignored_repos(uid, ["grp/old"])
         self.repo.finish_survey_run(run_uid, "succeeded")
 
         from backend.survey.ledger import update_ledger_for_run
@@ -839,7 +879,7 @@ class IgnoredRepoRouteTests(LedgerStorageTestCase):
             {"kind": "org", "url": "grp/broken"},
             {"kind": "org", "url": "grp/team"},
         ])
-        self.repo.add_survey_ignored_repo(uid, "grp/ignored")
+        self.repo.add_survey_ignored_repos(uid, ["grp/ignored"])
 
         def expand(path, patterns):
             """grp/broken 展开失败，grp/team 下有两个仓库。"""
@@ -905,6 +945,13 @@ class IgnoredRepoRouteTests(LedgerStorageTestCase):
         self.assertEqual([c["repo_slug"] for c in listed["candidates"]], ["g-b"])
         self.assertTrue(listed["candidates_run_uid"])
         self.assertTrue(listed["candidates_run_started_at"])
+
+        batch = self.client.post(self.base, json={"urls": ["g/b", "g/c"], "note": "批量"})
+        self.assertEqual(batch.status_code, 201)
+        self.assertEqual([i["repo_slug"] for i in batch.json["items"]], ["g-b", "g-c"])
+        self.assertEqual(self.client.post(self.base, json={"urls": ["g/d", "bad"]}).status_code, 400)
+        self.assertEqual(self.client.post(self.base, json={"urls": "g/d"}).status_code, 400)
+        self.assertNotIn("g-d", self.repo.list_survey_ignored_repo_slugs(self.survey["survey_uid"]))
 
         self.assertEqual(self.client.patch(f"{self.base}/{item_id}", json={"note": "x"}).status_code, 200)
         self.assertEqual(self.client.patch(f"{self.base}/999", json={"note": "x"}).status_code, 404)
