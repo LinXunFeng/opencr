@@ -334,6 +334,9 @@ export const PUSH_STATUS_TAG: Record<string, TagType> = {
 /** 忽略理由的长度上限，与服务端 SURVEY_IGNORE_NOTE_MAX 一致；超出的部分服务端会静默截掉，所以前端先拦 */
 export const IGNORE_NOTE_MAX = 2000
 
+/** 一次最多加入多少个已忽略仓库，与服务端的上限（单次巡检仓库上限的最大值 MAX_REPOS_UPPER_BOUND）一致 */
+export const IGNORE_REPO_BATCH_MAX = 1000
+
 /** ElMessageBox.prompt 的忽略理由校验器，标记与编辑两处共用 */
 export function validateIgnoreNote(value: string): boolean | string {
   return (value || "").length <= IGNORE_NOTE_MAX || `理由不能超过 ${IGNORE_NOTE_MAX} 字`
@@ -423,6 +426,12 @@ export const SURVEY_NOTES = {
     `获取仓库清单超时（等待超过 2 分钟），可能是组织太多或${spacedPlatform(platform)}响应慢。原有候选保持不变，也可以直接填写仓库地址。`,
   candidatesRefreshFailed: (count: number) =>
     `有 ${count} 个组织展开失败，它们下面的仓库不在候选里：`,
+  ignoreRepoBatchSelect:
+    "按关键字选中所有匹配的候选：匹配仓库地址或仓库标识里的任意片段，不区分大小写，可多次叠加。只选当前候选清单里的仓库，手填的照常保留；不在候选里的仓库可以用「批量粘贴」。",
+  ignoreRepoPastePlaceholder:
+    "每行一个仓库地址或「组织/仓库」路径，也可以用逗号、空格分隔。加入已选后可以在上面的选择框里核对，无法识别的地址会在提交时一次列出。",
+  ignoreRepoAdded: (created: number, existing: number) =>
+    `已加入 ${created} 个仓库${existing ? `，另有 ${existing} 个原本就在清单里` : ""}，下一轮巡检起生效`,
   ignoreRepoNotePrompt:
     "为什么不再巡检这个仓库？半年后这里是唯一的线索。",
   ignoreRepoNotePlaceholder:

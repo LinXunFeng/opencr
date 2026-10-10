@@ -594,12 +594,21 @@ export function getSurveyLiveRepoCandidatesApi(surveyUid: string) {
   })
 }
 
-export function addSurveyIgnoredRepoApi(surveyUid: string, url: string, note = "") {
-  /** repo_slug 是服务端换算出的仓库身份，手填地址时用来让管理员核对 */
-  return request<{ id: number, repo_slug: string }>({
+/** 一次加入的仓库之一；created 为 false 表示它原本就在清单里 */
+export interface SurveyIgnoredRepoAdded {
+  id: number
+  /** 服务端换算出的仓库身份，手填地址时用来让管理员核对 */
+  repo_slug: string
+  url: string
+  created: boolean
+}
+
+/** 一次加入一批仓库，共用一条理由；任何一个地址不合法时整批都不写入 */
+export function addSurveyIgnoredReposApi(surveyUid: string, urls: string[], note = "") {
+  return request<{ items: SurveyIgnoredRepoAdded[] }>({
     url: `surveys/${surveyUid}/ignored-repos`,
     method: "post",
-    data: { url, note }
+    data: { urls, note }
   })
 }
 

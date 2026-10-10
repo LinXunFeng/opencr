@@ -9,7 +9,7 @@ import json
 import logging
 import uuid
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set
 
 from sqlalchemy import delete, func, select, text, update
 
@@ -2100,48 +2100,85 @@ def list_survey_repo_candidates(survey_uid: str) -> dict:
         }
 
 
-def add_survey_ignored_repo(survey_uid: str, url: str, note: str = "") -> Optional[Tuple[int, str]]:
+def add_survey_ignored_repos(survey_uid: str, urls: List[str], note: str = "") -> Optional[List[dict]]:
     """
-    把一个仓库标记为已忽略仓库（"不再巡检"），返回 (id, 换算出的 repo_slug)；巡检不存在时返回 None。
+    把一批仓库标记为已忽略仓库（"不再巡检"），共用一条理由；巡检不存在时返回 None。
 
-    url 可以是仓库地址、浏览器里的页面地址，也可以是 GitLab 的项目路径，按 parse_repo_reference 换算成仓库身份；
-    不合法时抛 ValueError。
+    返回每个仓库一项 {"id", "repo_slug", "url", "created"}，按输入顺序、同一仓库只出现一次；
+    created 为 False 表示它原本就在清单里。
+    url 可以是仓库地址、浏览器里的页面地址，也可以是"组织/仓库"路径，按 parse_repo_reference 换算成仓库身份。
+    任何一个不合法时抛 ValueError，列出全部不合法的输入，整批都不写入。
     同一仓库已在清单里时复用原记录，只补上此前没填的理由，与已忽略问题的重复标记口径一致。
-    台账里这个仓库仍存在的行立即转为已忽略：之后的运行都不会再拉取它，不在这里改的话，
+    台账里这些仓库仍存在的行立即转为已忽略：之后的运行都不会再拉取它们，不在这里改的话，
     这些行要等到下一轮跑完才变，期间手动重推出去的镜像仍然显示"存在"。这里不主动推送，与已忽略问题一致。
     """
-    from ..survey.common import parse_repo_reference
+    from ..survey.common import MAX_REPOS_UPPER_BOUND, parse_repo_reference
     from .models import LEDGER_IGNORED, LEDGER_PRESENT, Survey, SurveyIgnoredRepo, SurveyLedgerEntry
 
-    url, slug = parse_repo_reference(url)
+    raw = [str(u or "").strip() for u in urls or [] if str(u or "").strip()]
+    if not raw:
+        raise ValueError("仓库地址不能为空")
+    if len(raw) > MAX_REPOS_UPPER_BOUND:
+        # 与单次巡检仓库上限的最大值一致：超出它的批量只可能是误操作，一次写这么多行也会长时间占着 SQLite 写锁
+        raise ValueError(f"一次最多添加 {MAX_REPOS_UPPER_BOUND} 个仓库")
+
+    # 先全部校验再写入：部分成功的话，管理员很难分清哪些加上了、哪些没有
+    parsed: Dict[str, str] = {}
+    invalid: List[str] = []
+    for entry in raw:
+        try:
+            url, slug = parse_repo_reference(entry)
+        except ValueError:
+            invalid.append(entry)
+            continue
+        # 同一批里换了写法的同一个仓库只算一次，保留第一次出现的写法
+        parsed.setdefault(slug, url)
+    if invalid:
+        # 一批最多上千条，全列出来提示框装不下；列前 10 个与总数，够管理员定位是哪一类写法出了问题
+        shown = "、".join(invalid[:10]) + (f" 等 {len(invalid)} 个" if len(invalid) > 10 else "")
+        raise ValueError(f"以下地址无法识别为仓库（请填写仓库地址或「组织/仓库」路径）：{shown}")
+
     note = _clean_ignore_note(note)
     with session_scope() as session:
         survey_id = session.scalar(select(Survey.id).where(Survey.survey_uid == survey_uid))
         if survey_id is None:
             return None
-        item = session.scalar(
-            select(SurveyIgnoredRepo).where(
-                SurveyIgnoredRepo.survey_id == survey_id, SurveyIgnoredRepo.repo_slug == slug
-            )
-        )
-        if item is None:
-            item = SurveyIgnoredRepo(survey_id=survey_id, repo_slug=slug, url=url[:1024], note=note)
-            session.add(item)
-            session.flush()
-        elif note and not item.note:
-            item.note = note
+        # 一个巡检的忽略清单很小，整份读出来比拼一个最多上千项的 IN 更省事
+        existing = {
+            item.repo_slug: item
+            for item in session.scalars(
+                select(SurveyIgnoredRepo).where(SurveyIgnoredRepo.survey_id == survey_id)
+            ).all()
+        }
+        results = []
+        for slug, url in parsed.items():
+            item = existing.get(slug)
+            created = item is None
+            if created:
+                item = SurveyIgnoredRepo(survey_id=survey_id, repo_slug=slug, url=url[:1024], note=note)
+                session.add(item)
+            elif note and not item.note:
+                item.note = note
+            results.append((item, created))
+        session.flush()
 
-        session.execute(
-            update(SurveyLedgerEntry)
-            .where(
-                SurveyLedgerEntry.survey_id == survey_id,
-                SurveyLedgerEntry.repo_slug == slug,
-                # 只转仍存在的行，与 plan_ledger_update 口径一致（理由见那里）
-                SurveyLedgerEntry.state == LEDGER_PRESENT,
+        slugs = list(parsed)
+        # 分段：旧版 SQLite 单条语句默认最多 999 个参数，一批最多有 1000 个仓库
+        for offset in range(0, len(slugs), 500):
+            session.execute(
+                update(SurveyLedgerEntry)
+                .where(
+                    SurveyLedgerEntry.survey_id == survey_id,
+                    SurveyLedgerEntry.repo_slug.in_(slugs[offset:offset + 500]),
+                    # 只转仍存在的行，与 plan_ledger_update 口径一致（理由见那里）
+                    SurveyLedgerEntry.state == LEDGER_PRESENT,
+                )
+                .values(state=LEDGER_IGNORED, updated_at=utcnow())
             )
-            .values(state=LEDGER_IGNORED, updated_at=utcnow())
-        )
-        return item.id, slug
+        return [
+            {"id": item.id, "repo_slug": item.repo_slug, "url": item.url, "created": created}
+            for item, created in results
+        ]
 
 
 def remove_survey_ignored_repo(survey_uid: str, item_id: int) -> bool:
