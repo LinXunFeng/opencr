@@ -8,7 +8,7 @@
 """
 
 import logging
-from typing import Dict, List, Tuple
+from typing import Dict, List, NamedTuple, Optional, Set
 from urllib.parse import urlparse
 
 from ..review.gitlab import list_group_projects, require_gitlab_config
@@ -89,17 +89,31 @@ def expand_group(group_path: str, exclude_patterns: List[str]) -> List[Dict[str,
     return repos
 
 
-def resolve_sources(sources: List[dict], max_repos: int) -> Tuple[List[Dict[str, str]], int]:
+class ResolvedSources(NamedTuple):
     """
-    把 Survey 的来源清单展开成去重后的仓库列表，超出 max_repos 的部分截掉。
+    来源展开的结果：本轮要处理的仓库，以及没参与的两类仓库。
 
-    返回 (仓库列表, 被截掉的仓库数)。截断数交给调用方记降级 ——
-    只写日志的话，被截掉的仓库会悄无声息地退出巡检，报告看起来完全正常。
+    后两类都要交给调用方记到运行记录上 —— 只写日志的话，它们会悄无声息地退出巡检，报告看起来完全正常。
+    截掉的另记降级；被忽略的是用户的选择，不是降级。
+    """
+
+    targets: List[Dict[str, str]]
+    truncated: List[Dict[str, str]]
+    ignored: List[Dict[str, str]]
+
+
+def resolve_sources(
+    sources: List[dict], max_repos: int, ignored_slugs: Optional[Set[str]] = None
+) -> ResolvedSources:
+    """
+    把 Survey 的来源清单展开成去重后的仓库列表，剔除已忽略仓库，超出 max_repos 的部分截掉。
 
     单个来源展开失败不会让整轮直接失败 —— 由调用方按"部分失败记降级、
     全部失败才判失败"处理，所以这里把错误随条目一起返回而不是抛出去。
     """
     resolved: List[Dict[str, str]] = []
+    ignored: List[Dict[str, str]] = []
+    ignored_slugs = ignored_slugs or set()
     seen_slugs = set()
 
     for source in sources or []:
@@ -127,14 +141,19 @@ def resolve_sources(sources: List[dict], max_repos: int) -> Tuple[List[Dict[str,
                 logger.info("Duplicate repo skipped: %s", item["url"])
                 continue
             seen_slugs.add(slug)
+            if slug in ignored_slugs:
+                # 在截断之前剔除：被忽略的仓库占着上限名额，会把本该巡检的仓库挤出去
+                logger.info("Ignored repo skipped: %s", item["url"])
+                ignored.append({**item, "slug": slug})
+                continue
             resolved.append({**item, "slug": slug})
 
-    truncated = max(len(resolved) - max_repos, 0)
+    truncated = resolved[max_repos:]
     if truncated:
         logger.warning("Repo count %s exceeds limit %s, truncating", len(resolved), max_repos)
         resolved = resolved[:max_repos]
 
-    return resolved, truncated
+    return ResolvedSources(resolved, truncated, ignored)
 
 
 def check_platform_ready() -> None:

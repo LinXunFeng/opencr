@@ -8,7 +8,7 @@
 import hashlib
 import re
 import unicodedata
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from ..storage.models import SURVEY_CATEGORIES, CATEGORY_CORRECTNESS
 
@@ -73,6 +73,25 @@ def repo_slug_from_url(url: str) -> str:
     parts = [p for p in cleaned.split("/") if p]
     tail = parts[-2:] if len(parts) >= 2 else parts[-1:]
     return slugify("-".join(tail)) or "repo"
+
+
+def parse_repo_reference(raw: str) -> Tuple[str, str]:
+    """
+    把用户填的仓库引用（仓库地址、浏览器地址栏里的页面地址、或 group/project）规整成 (地址, repo_slug)。
+
+    不合法时抛 ValueError。浏览器地址常带 /-/tree/main 这类页面后缀，不剥掉的话 slug 会取成
+    "tree-main"；只填项目名、或只有主机名的地址同理会算出别的 slug —— 这些忽略永远不会命中，
+    而且不会有任何提示，所以宁可当场拒绝。没有协议的 host.com/project 与 group/project 无法区分
+    （组名也可以带点），这种写法照常接受，靠添加后回显的仓库标识让管理员核对。
+    """
+    text = re.split(r"[?#]", str(raw or "").strip(), maxsplit=1)[0]
+    text = re.sub(r"/-(/.*)?$", "", text).rstrip("/")
+    # 去掉协议与主机；scp 风格（git@host:group/project）的主机在冒号之前
+    path = re.sub(r"^[a-zA-Z][a-zA-Z0-9+.-]*://[^/]*", "", text)
+    path = re.sub(r"^[^/@]*@[^/:]*:", "", path)
+    if len([part for part in re.split(r"[/:]", path) if part]) < 2:
+        raise ValueError("请填写仓库地址或带组织的路径，例如 group/project")
+    return text, repo_slug_from_url(text)
 
 
 def normalize_category(value: str) -> str:

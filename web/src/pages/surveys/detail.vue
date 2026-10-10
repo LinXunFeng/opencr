@@ -12,7 +12,9 @@ import {
   SURVEY_DEGRADATION_LABEL,
   SURVEY_NOTES,
   SURVEY_PHASE_LABEL,
+  SURVEY_REPO_SKIPPED_STATUSES,
   SURVEY_REPO_STATUS_LABEL,
+  SURVEY_REPO_STATUS_TAG,
   SURVEY_TRIGGER_LABEL,
   validateIgnoreNote
 } from "@@/constants/opencr"
@@ -30,6 +32,11 @@ const detail = ref<SurveyRunDetail | null>(null)
 const activeTab = ref("new")
 
 const runUid = computed(() => String(route.params.runUid || ""))
+
+const skippedRepoCount = computed(
+  () => detail.value?.repos.filter(r => SURVEY_REPO_SKIPPED_STATUSES.includes(r.status)).length ?? 0
+)
+const coveredRepoCount = computed(() => (detail.value?.repos.length ?? 0) - skippedRepoCount.value)
 
 async function load(silent = false) {
   if (!silent) loading.value = true
@@ -263,12 +270,16 @@ onMounted(() => load())
 
       <el-card shadow="never" class="mb">
         <template #header>
-          覆盖的仓库（{{ detail.repos.length }}）
+          覆盖的仓库（{{ coveredRepoCount }}）
+          <span v-if="skippedRepoCount" class="sub ml">{{ SURVEY_NOTES.skippedRepos(skippedRepoCount) }}</span>
         </template>
         <el-table :data="detail.repos" size="small">
           <el-table-column type="expand">
             <template #default="{ row }">
-              <ReachDetail :reach="row.reach" />
+              <div v-if="SURVEY_REPO_SKIPPED_STATUSES.includes(row.status)" class="sub">
+                {{ SURVEY_NOTES.repoSkipped }}
+              </div>
+              <ReachDetail v-else :reach="row.reach" />
             </template>
           </el-table-column>
           <el-table-column prop="repo_slug" label="仓库" min-width="160" />
@@ -284,7 +295,7 @@ onMounted(() => load())
           </el-table-column>
           <el-table-column label="状态" width="110">
             <template #default="{ row }">
-              <el-tag size="small" :type="row.status === 'ok' ? 'success' : 'danger'">
+              <el-tag size="small" :type="SURVEY_REPO_STATUS_TAG[row.status] || 'danger'">
                 {{ SURVEY_REPO_STATUS_LABEL[row.status] || row.status }}
               </el-tag>
             </template>

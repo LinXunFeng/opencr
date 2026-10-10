@@ -29,6 +29,8 @@ from ..storage.models import (
     INDEX_MODE_FAILED,
     INDEX_MODE_INIT,
     INDEX_MODE_SYNC,
+    REPO_IGNORED,
+    REPO_TRUNCATED,
     SEVERITY_ADVICE,
     SEVERITY_CRITICAL,
     SEVERITY_UNKNOWN,
@@ -60,6 +62,13 @@ DEGRADATION_LABELS: Dict[str, str] = {
     "budget_exhausted": "预算耗尽，提前收工（部分关注点未取证）",
     "profile_fallback": "codegraph 不可用，全部画像退化为依赖清单级",
     "repos_truncated": "仓库数超过单次巡检上限，超出的仓库未参与本次分析",
+}
+
+# 没有参与分析的仓库状态。运行记录里仍留一行，是为了看得出少了谁、为什么。
+# 导出报告里没有状态列可对照，所以比前端 SURVEY_REPO_STATUS_LABEL 的短标签多说半句原因
+SKIPPED_REPO_LABELS: Dict[str, str] = {
+    REPO_IGNORED: "在忽略清单里",
+    REPO_TRUNCATED: "超出单次巡检的仓库上限",
 }
 
 # 以下文案与 web/src/common/constants/opencr.ts 的同名映射是两份拷贝（跨语言无法共用），改一边要同步另一边
@@ -271,7 +280,10 @@ def render_run_markdown(detail: dict) -> str:
             lines.append(f"- {label} ×{item.get('count', 0)}")
         lines.append("")
 
-    repos = detail.get("repos") or []
+    all_repos = detail.get("repos") or []
+    # 被忽略、被截掉的仓库没有参与分析，列进"覆盖的仓库"会让人以为它们被看过
+    repos = [r for r in all_repos if r.get("status") not in SKIPPED_REPO_LABELS]
+    skipped = [r for r in all_repos if r.get("status") in SKIPPED_REPO_LABELS]
     if repos:
         lines.append("## 覆盖的仓库")
         lines.append("")
@@ -288,6 +300,12 @@ def render_run_markdown(detail: dict) -> str:
             "_L1 可达：整合分析能点名取证的源码文件占比。只有在画像里带完整路径的文件"
             "（路由、类型骨架、接口调用、依赖清单、根目录文件）才可能被点名。_"
         )
+        lines.append("")
+    if skipped:
+        lines.append("## 未参与的仓库")
+        lines.append("")
+        for r in skipped:
+            lines.append(f"- {r.get('repo_slug', '')}（{SKIPPED_REPO_LABELS[r['status']]}）")
         lines.append("")
 
     lines.extend(_render_codegraph(detail))

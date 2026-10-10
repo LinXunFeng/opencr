@@ -361,12 +361,24 @@ class SurveyConfigTests(SurveyStorageTestCase):
         from backend.survey.sources import resolve_sources
 
         sources = [{"kind": "repo", "url": f"https://g.com/a/r{i}.git"} for i in range(5)]
-        targets, truncated = resolve_sources(sources, 3)
-        self.assertEqual(len(targets), 3)
-        self.assertEqual(truncated, 2)
+        result = resolve_sources(sources, 3)
+        self.assertEqual(len(result.targets), 3)
+        self.assertEqual([t["slug"] for t in result.truncated], ["a-r3", "a-r4"])
 
-        targets, truncated = resolve_sources(sources, 5)
-        self.assertEqual((len(targets), truncated), (5, 0))
+        result = resolve_sources(sources, 5)
+        self.assertEqual((len(result.targets), result.truncated), (5, []))
+
+    def test_resolve_sources_skips_ignored_repos_before_truncating(self):
+        """已忽略仓库要在截断之前剔除，否则它们占着上限名额，把本该巡检的仓库挤出去。"""
+        from backend.survey.common import repo_slug_from_url
+        from backend.survey.sources import resolve_sources
+
+        sources = [{"kind": "repo", "url": f"https://g.com/a/r{i}.git"} for i in range(5)]
+        ignored_slugs = {repo_slug_from_url("https://g.com/a/r0.git"), repo_slug_from_url("https://g.com/a/r1")}
+        result = resolve_sources(sources, 3, ignored_slugs)
+        self.assertEqual([t["url"] for t in result.targets], [f"https://g.com/a/r{i}.git" for i in (2, 3, 4)])
+        self.assertEqual(result.truncated, [])
+        self.assertEqual([t["slug"] for t in result.ignored], ["a-r0", "a-r1"])
 
 
 class SurveyFindingDiffTests(SurveyStorageTestCase):

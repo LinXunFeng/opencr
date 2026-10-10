@@ -131,6 +131,7 @@ def plan_ledger_update(
     run_uid: str,
     now: datetime,
     attempted: Optional[Set[Tuple[str, str]]] = None,
+    ignored_repos: Optional[Set[str]] = None,
 ) -> List[dict]:
     """
     算出本轮要写入 Ledger 的变更，返回待 upsert 的条目列表（只含发生变化的字段）。
@@ -140,10 +141,12 @@ def plan_ledger_update(
 
     - 本轮出现：状态置为存在，刷新聚合内容与最近发现；新指纹的首次发现取库里仍保留的最早记录。
     - 本轮没出现、但出现过被已忽略问题隐藏的发现（ignored，见 get_survey_run_ledger_inputs）：已忽略。
+    - 所在仓库在忽略清单里（ignored_repos）、且这一行仍存在：已忽略。
     - 其余没出现的：所在文件本轮被取证过时标为本轮未发现，否则保持原状态不动 ——
       包括"已忽略后又取消忽略"的行，它会停在已忽略，直到某一轮取证过它的文件（Q25 的推导，不做特殊处理）。
     """
     attempted = set(attempted or ()) | set(inspected)
+    ignored_repos = ignored_repos or set()
     changes: List[dict] = []
 
     for fingerprint, item in aggregated.items():
@@ -155,7 +158,8 @@ def plan_ledger_update(
         changes.append({
             **item,
             "lines": json.dumps(item["lines"]),
-            "state": LEDGER_PRESENT,
+            # 只有运行进行中才加入忽略的仓库会走到这里：它在本轮已经被分析过，内容照常刷新，状态尊重用户的选择
+            "state": LEDGER_IGNORED if item["repo_slug"] in ignored_repos else LEDGER_PRESENT,
             "first_seen_at": first_seen,
             "last_seen_at": now,
             "last_run_uid": run_uid,
@@ -169,6 +173,10 @@ def plan_ledger_update(
         change: dict = {}
         if fingerprint in ignored:
             target = LEDGER_IGNORED
+        elif file_key[0] in ignored_repos:
+            # 只转仍存在的行。本轮未发现的行已经有过结论，转成已忽略后，取消忽略时会被
+            # plan_rechecks 当成"取消了忽略"拉去复核，白占名额
+            target = LEDGER_IGNORED if current.get("state") == LEDGER_PRESENT else None
         elif file_key in inspected:
             # 按文件而不是按仓库判定：仓库拉取成功只说明文件"可以被看"，
             # L1 每轮点名的文件都不一样，没被点名的文件本来就不可能出现
@@ -274,6 +282,7 @@ def update_ledger_for_run(run_uid: str) -> Optional[dict]:
         inspected=inputs["inspected"],
         attempted=inputs["attempted"],
         ignored=inputs["ignored"],
+        ignored_repos=inputs["ignored_repos"],
         first_seen_lookup=repo.earliest_survey_finding_times(inputs["survey_id"], new_fingerprints),
         run_uid=run_uid,
         now=utcnow(),

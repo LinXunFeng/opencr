@@ -23,8 +23,10 @@ from ..storage.models import (
     PROFILE_MANIFEST,
     PUSH_TRIGGER_AUTO,
     REPO_FETCH_FAILED,
+    REPO_IGNORED,
     REPO_INDEX_FAILED,
     REPO_OK,
+    REPO_TRUNCATED,
     RUN_FAILED,
     RUN_SUCCEEDED,
     SURVEY_PHASE_FETCHING,
@@ -241,11 +243,35 @@ def execute_survey_run(survey_uid: str, trigger: str) -> Optional[str]:
 
     try:
         repo.update_survey_progress(run_uid, phase=SURVEY_PHASE_FETCHING)
-        targets, truncated = resolve_sources(survey["sources"], load_max_repos())
+        resolved = resolve_sources(
+            survey["sources"], load_max_repos(), repo.list_survey_ignored_repo_slugs(survey_uid)
+        )
+        targets = resolved.targets
+        # 被忽略的不记降级：跳过它是用户的选择，产出质量没有受损。但两类都要在运行记录里留一行，
+        # 否则看报告的人只会发现仓库少了几个，不知道是被忽略、被截掉还是展开出了问题
+        for target in resolved.ignored:
+            repo.record_survey_repo(
+                run_uid, target["slug"], target["url"], target.get("branch", ""), status=REPO_IGNORED
+            )
+        for target in resolved.truncated:
+            if target.get("error"):
+                # 展开失败的组织恰好落在截断线之外：它的问题是展开失败，记成超出上限会掩盖这一点
+                repo.record_survey_repo(
+                    run_uid, target["url"], target["url"], status=REPO_FETCH_FAILED, error_message=target["error"]
+                )
+                repo.add_survey_degradation(run_uid, DEGRADE_REPO_FETCH_FAILED)
+                continue
+            repo.record_survey_repo(
+                run_uid, target["slug"], target["url"], target.get("branch", ""), status=REPO_TRUNCATED
+            )
         if not targets:
+            if resolved.ignored:
+                raise SurveyError(f"全部 {len(resolved.ignored)} 个仓库都在忽略清单里")
             raise SurveyError("巡检没有任何可用的仓库来源")
-        if truncated:
-            repo.add_survey_degradation(run_uid, DEGRADE_REPOS_TRUNCATED, count=truncated)
+        # 展开失败的组织已经记过拉取失败，不再重复算进截断数
+        truncated_repos = [t for t in resolved.truncated if not t.get("error")]
+        if truncated_repos:
+            repo.add_survey_degradation(run_uid, DEGRADE_REPOS_TRUNCATED, count=len(truncated_repos))
         repo.update_survey_progress(run_uid, repos_total=len(targets))
 
         prepared = _prepare_workspaces(survey, run_uid, targets, budget_cfg)

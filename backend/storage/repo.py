@@ -9,7 +9,7 @@ import json
 import logging
 import uuid
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set, Tuple
 
 from sqlalchemy import delete, func, select, text, update
 
@@ -2021,6 +2021,154 @@ def list_survey_ignores(survey_uid: str) -> List[dict]:
         return items
 
 
+def list_survey_ignored_repo_slugs(survey_uid: str) -> Set[str]:
+    """某个巡检的已忽略仓库的 repo_slug 集合，供来源展开时剔除。"""
+    from .models import Survey, SurveyIgnoredRepo
+
+    with session_scope() as session:
+        return set(session.scalars(
+            select(SurveyIgnoredRepo.repo_slug)
+            .join(Survey, Survey.id == SurveyIgnoredRepo.survey_id)
+            .where(Survey.survey_uid == survey_uid)
+        ).all())
+
+
+def list_survey_ignored_repos(survey_uid: str) -> List[dict]:
+    """某个巡检的已忽略仓库，最近标记的在前；巡检不存在时返回空列表。"""
+    from .models import Survey, SurveyIgnoredRepo
+
+    with session_scope() as session:
+        rows = session.scalars(
+            select(SurveyIgnoredRepo)
+            .join(Survey, Survey.id == SurveyIgnoredRepo.survey_id)
+            .where(Survey.survey_uid == survey_uid)
+            .order_by(SurveyIgnoredRepo.id.desc())
+        ).all()
+        return [
+            {
+                "id": r.id,
+                "repo_slug": r.repo_slug,
+                "url": r.url,
+                "note": r.note or "",
+                "created_at": r.created_at.isoformat() if r.created_at else "",
+            }
+            for r in rows
+        ]
+
+
+def list_survey_repo_candidates(survey_uid: str) -> List[dict]:
+    """
+    可供标记为已忽略的仓库：最近一次记录了仓库清单的运行里出现的仓库，去掉已经忽略的。
+
+    取运行记录而不是实时展开组织：打开管理页不该触发一串 GitLab 请求，
+    而上一轮展开的清单就是用户在报告里看到、想要剔除的那一批。还没运行过的巡检返回空列表，界面上可以手填。
+    """
+    from .models import Survey, SurveyIgnoredRepo, SurveyRun, SurveyRunRepo
+
+    with session_scope() as session:
+        survey_id = session.scalar(select(Survey.id).where(Survey.survey_uid == survey_uid))
+        if survey_id is None:
+            return []
+        latest_run_id = session.scalar(
+            select(func.max(SurveyRunRepo.run_id))
+            .join(SurveyRun, SurveyRun.id == SurveyRunRepo.run_id)
+            .where(SurveyRun.survey_id == survey_id)
+        )
+        if latest_run_id is None:
+            return []
+        ignored = set(session.scalars(
+            select(SurveyIgnoredRepo.repo_slug).where(SurveyIgnoredRepo.survey_id == survey_id)
+        ).all())
+        rows = session.scalars(
+            select(SurveyRunRepo).where(SurveyRunRepo.run_id == latest_run_id).order_by(SurveyRunRepo.repo_slug)
+        ).all()
+        return [
+            {"repo_slug": r.repo_slug, "url": r.url}
+            for r in rows
+            # 组织展开失败的行以组织地址充当 repo_slug（见 runner._prepare_workspaces），它不是仓库：
+            # 选中它会存下一个永远命中不了的 slug。拉取失败的真实仓库照常提供，它们正是常被剔除的那类
+            if r.repo_slug not in ignored and r.repo_slug != r.url
+        ]
+
+
+def add_survey_ignored_repo(survey_uid: str, url: str, note: str = "") -> Optional[Tuple[int, str]]:
+    """
+    把一个仓库标记为已忽略仓库（"不再巡检"），返回 (id, 换算出的 repo_slug)；巡检不存在时返回 None。
+
+    url 可以是仓库地址、浏览器里的页面地址，也可以是 GitLab 的项目路径，按 parse_repo_reference 换算成仓库身份；
+    不合法时抛 ValueError。
+    同一仓库已在清单里时复用原记录，只补上此前没填的理由，与已忽略问题的重复标记口径一致。
+    台账里这个仓库仍存在的行立即转为已忽略：之后的运行都不会再拉取它，不在这里改的话，
+    这些行要等到下一轮跑完才变，期间手动重推出去的镜像仍然显示"存在"。这里不主动推送，与已忽略问题一致。
+    """
+    from ..survey.common import parse_repo_reference
+    from .models import LEDGER_IGNORED, LEDGER_PRESENT, Survey, SurveyIgnoredRepo, SurveyLedgerEntry
+
+    url, slug = parse_repo_reference(url)
+    note = _clean_ignore_note(note)
+    with session_scope() as session:
+        survey_id = session.scalar(select(Survey.id).where(Survey.survey_uid == survey_uid))
+        if survey_id is None:
+            return None
+        item = session.scalar(
+            select(SurveyIgnoredRepo).where(
+                SurveyIgnoredRepo.survey_id == survey_id, SurveyIgnoredRepo.repo_slug == slug
+            )
+        )
+        if item is None:
+            item = SurveyIgnoredRepo(survey_id=survey_id, repo_slug=slug, url=url[:1024], note=note)
+            session.add(item)
+            session.flush()
+        elif note and not item.note:
+            item.note = note
+
+        session.execute(
+            update(SurveyLedgerEntry)
+            .where(
+                SurveyLedgerEntry.survey_id == survey_id,
+                SurveyLedgerEntry.repo_slug == slug,
+                # 只转仍存在的行，与 plan_ledger_update 口径一致（理由见那里）
+                SurveyLedgerEntry.state == LEDGER_PRESENT,
+            )
+            .values(state=LEDGER_IGNORED, updated_at=utcnow())
+        )
+        return item.id, slug
+
+
+def remove_survey_ignored_repo(survey_uid: str, item_id: int) -> bool:
+    """
+    取消忽略一个仓库，下一轮起它重新参与巡检。
+
+    台账状态不在这里改回，理由同 remove_survey_ignore：这个仓库很久没被看过，
+    凭空把它的行改回"存在"是没有证据的判断；下一轮复核取证后自然会得出结论。
+    """
+    from .models import Survey, SurveyIgnoredRepo
+
+    with session_scope() as session:
+        survey_id = session.scalar(select(Survey.id).where(Survey.survey_uid == survey_uid))
+        item = session.get(SurveyIgnoredRepo, int(item_id))
+        if survey_id is None or item is None or item.survey_id != survey_id:
+            return False
+        session.delete(item)
+        return True
+
+
+def update_survey_ignored_repo_note(survey_uid: str, item_id: int, note: str) -> bool:
+    """修改已忽略仓库的理由。巡检或记录不存在时返回 False。"""
+    from .models import Survey, SurveyIgnoredRepo
+
+    with session_scope() as session:
+        survey_id = session.scalar(select(Survey.id).where(Survey.survey_uid == survey_uid))
+        if survey_id is None:
+            return False
+        result = session.execute(
+            update(SurveyIgnoredRepo)
+            .where(SurveyIgnoredRepo.survey_id == survey_id, SurveyIgnoredRepo.id == int(item_id))
+            .values(note=_clean_ignore_note(note))
+        )
+        return (result.rowcount or 0) > 0
+
+
 def purge_survey_runs(survey_id: int, retention_runs: int) -> int:
     """
     按次数清理巡检运行记录，返回删除条数。
@@ -2136,14 +2284,14 @@ PUSH_STALE_SECONDS = 900
 def get_survey_run_ledger_inputs(run_uid: str) -> Optional[dict]:
     """
     更新 Ledger 所需的一次运行的全部输入：运行状态、逐条发现（含正文）、仓库处理结果、降级、
-    本轮被忽略的指纹 ignored，以及本轮得出结论的文件 inspected 与交给过 L2 的文件 attempted（都是 {(repo_slug, file_path)}）。
+    本轮被忽略的指纹 ignored、本轮被跳过的已忽略仓库 ignored_repos，以及本轮得出结论的文件 inspected 与交给过 L2 的文件 attempted（都是 {(repo_slug, file_path)}）。
 
     findings 只含没被忽略的发现：台账一行聚合的是一个指纹下仍要跟进的问题，被忽略的不该进正文与条数。
     ignored 是本轮出现过、但被已忽略问题隐藏的发现的指纹 —— 这些指纹本轮"看到了、是已知问题"，
     台账据此标为已忽略，而不是本轮未发现。
     运行不存在时返回 None。
     """
-    from .models import SurveyFinding, SurveyRun, SurveyRunRepo
+    from .models import REPO_IGNORED, SurveyFinding, SurveyIgnoredRepo, SurveyRun, SurveyRunRepo
 
     with session_scope() as session:
         run = session.scalar(select(SurveyRun).where(SurveyRun.run_uid == run_uid))
@@ -2172,6 +2320,11 @@ def get_survey_run_ledger_inputs(run_uid: str) -> Optional[dict]:
             ],
             "repos": [{"repo_slug": r.repo_slug, "status": r.status} for r in repos],
             "ignored": ignored,
+            # 本轮被跳过的仓库，加上此刻在忽略清单里的：运行进行中才加入忽略的仓库已经被分析过了，
+            # 只看本轮快照的话，这一轮收尾会把标记时刚转为已忽略的行又写回存在
+            "ignored_repos": {r.repo_slug for r in repos if r.status == REPO_IGNORED} | set(session.scalars(
+                select(SurveyIgnoredRepo.repo_slug).where(SurveyIgnoredRepo.survey_id == run.survey_id)
+            ).all()),
             # 台账只为运行结束时更新一次，不会碰到早于该字段的运行；真遇到 NULL 也按"一个都没看"处理
             "inspected": _parse_inspected_files(run.inspected_files) or set(),
             "attempted": _parse_inspected_files(run.inspected_files, conclusive_only=False) or set(),
