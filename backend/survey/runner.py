@@ -227,6 +227,8 @@ def execute_survey_run(survey_uid: str, trigger: str) -> Optional[str]:
     if run_uid is None:
         return None
     succeeded = False
+    # 是否由本次执行收尾。False 说明这条运行已被确认中断，工作区可能已经归新一轮所有
+    closed = False
 
     cfg = load_survey_config()
     budget_cfg = resolve_budget(survey)
@@ -328,20 +330,26 @@ def execute_survey_run(survey_uid: str, trigger: str) -> Optional[str]:
         # 整体结论只写仍要跟进的问题：用户说过不再提醒的写进去，等于在报告顶部又提醒了一遍
         summary = summarize([f for f in raw_findings if not f.get("ignore_id")], cross_map, budget)
 
-        repo.finish_survey_run(run_uid, RUN_SUCCEEDED, summary=summary)
-        succeeded = True
-        logger.info(
-            "SurveyRun finished: survey=%s run=%s repos=%s findings=%s",
-            survey["slug"], run_uid, len(prepared), counters,
-        )
+        # 已被确认中断的运行即使跑完也不能发布：同一 Survey 可能已经有更新的一轮写过台账
+        succeeded = closed = repo.finish_survey_run(run_uid, RUN_SUCCEEDED, summary=summary)
+        if succeeded:
+            logger.info(
+                "SurveyRun finished: survey=%s run=%s repos=%s findings=%s",
+                survey["slug"], run_uid, len(prepared), counters,
+            )
+        else:
+            logger.warning(
+                "SurveyRun finished after it was confirmed interrupted, result not published: survey=%s run=%s",
+                survey["slug"], run_uid,
+            )
     except SurveyError as e:
         logger.warning("SurveyRun failed: survey=%s run=%s: %s", survey["slug"], run_uid, e)
-        repo.finish_survey_run(run_uid, RUN_FAILED, error_kind=ERROR_SURVEY, error_message=str(e))
+        closed = repo.finish_survey_run(run_uid, RUN_FAILED, error_kind=ERROR_SURVEY, error_message=str(e))
     except Exception as e:
         logger.exception("SurveyRun crashed: survey=%s run=%s", survey["slug"], run_uid)
-        repo.finish_survey_run(run_uid, RUN_FAILED, error_kind=ERROR_UNEXPECTED, error_message=str(e))
+        closed = repo.finish_survey_run(run_uid, RUN_FAILED, error_kind=ERROR_UNEXPECTED, error_message=str(e))
     finally:
-        _cleanup(survey)
+        _cleanup(survey, delete_allowed=closed)
 
     if succeeded:
         _publish(run_uid)
@@ -392,9 +400,12 @@ def _publish(run_uid: str) -> None:
     execute_pushes(started["started"])
 
 
-def _cleanup(survey: dict) -> None:
+def _cleanup(survey: dict, delete_allowed: bool = True) -> None:
     """
     收尾：按配置清理工作区，并按次数清理历史运行记录。
+
+    delete_allowed 为 False（本次运行已被确认中断）时不删工作区：确认之后可能已经开始了新一轮，
+    它正用着同一个工作区，这时删掉会让新一轮读到半个仓库。代价是这一次的工作区要等下一轮来清理。
 
     清理失败只记录不重抛 —— 分析结果已经落库，为了一次删目录失败把整轮标成
     失败会让人以为报告不可信。
@@ -405,6 +416,9 @@ def _cleanup(survey: dict) -> None:
         logger.warning("Purging old survey runs failed: %s", e)
 
     if not survey.get("delete_workspace_after"):
+        return
+    if not delete_allowed:
+        logger.warning("Run was confirmed interrupted, keep workspace for whoever runs next: %s", survey["slug"])
         return
     try:
         delete_workspace(survey["slug"])

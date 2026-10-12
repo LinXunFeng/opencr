@@ -365,6 +365,8 @@ can assert that another process's review has died. A heartbeat timeout
 (600s by default, `storage.stale_after_seconds`) therefore only **labels** a run as stale;
 it never rewrites it to failed - the run may simply be stuck in an unusually slow model call.
 
+A stale run still counts as in progress: it blocks retry on the same MR, and a stale survey run makes every scheduled and manual run of that survey skip. When an admin knows the run is gone (the service restarted, the process was killed), **Confirm interrupted** on the run's detail page marks it failed with reason `interrupted`. This only closes the record; it does not stop anything that is still executing. If the run was in fact alive, a review may still post comments to the MR afterwards, and a survey's late result is neither published nor written to the ledger, though it still uses the survey's workspace. Admin only; runs with a fresh heartbeat are rejected. Endpoints: `POST /api/admin/runs/<run_uid>/interrupt` and `POST /api/admin/survey-runs/<run_uid>/interrupt`.
+
 **Failed / degraded / skipped are three different things**:
 
 - **Failed**: the review did not complete (model or platform call failed, uncaught exception)
@@ -874,6 +876,6 @@ If anything fails, check logs first or run `./quick-test.sh` for diagnostics.
 
 Use **Retry** on a failed run's detail page and choose the original range or the latest full MR. The original range preserves the commit interval, mode and selection parameters, but uses current model/skill content and matches skills again. Latest full uses the current defaults (the same as the manual endpoint, overall by default). Older runs without complete inputs support latest full only. Unavailable original commits fail explicitly without switching ranges.
 
-A retry creates a new ReviewRun linked to the failed run and retains old records and comments; duplicate comments are possible. The source link may expire under retention cleanup. Only failed runs on opened MRs are eligible. An existing running run, including Stale, blocks retry and provides its run link. Concurrent retry requests are guarded across processes; later webhooks and existing manual requests remain unaffected.
+A retry creates a new ReviewRun linked to the failed run and retains old records and comments; duplicate comments are possible. The source link may expire under retention cleanup. Only failed runs on opened MRs are eligible. An existing running run, including Stale, blocks retry and provides its run link; an admin can confirm a Stale run interrupted to unblock it. Concurrent retry requests are guarded across processes; later webhooks and existing manual requests remain unaffected.
 
 Admins can enable **Guest retry** in Settings. It defaults to off and requires guest browsing to be enabled too; Finding bodies remain hidden. `POST /api/admin/runs/<run_uid>/retry` accepts `{"scope":"original"}` or `{"scope":"latest"}` and returns HTTP 202 with the new `run_uid`.

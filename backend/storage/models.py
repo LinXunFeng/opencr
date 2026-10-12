@@ -44,6 +44,8 @@ PHASE_DONE = "done"
 ERROR_REVIEW = "review_error"
 ERROR_SURVEY = "survey_error"
 ERROR_UNEXPECTED = "unexpected"
+# Admin 对 Stale 运行的人工判断，不是运行自己报出的错误；记录关了，执行未必停了
+ERROR_INTERRUPTED = "interrupted"
 
 # --- Degradation.kind ---------------------------------------------------
 DEGRADE_INLINE_POST_FAILED = "inline_post_failed"

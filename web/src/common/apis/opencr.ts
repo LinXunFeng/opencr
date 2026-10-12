@@ -465,6 +465,11 @@ export function retryRunApi(runUid: string, scope: "latest" | "original") {
   })
 }
 
+/** 确认疑似中断的审查运行已中断：只关闭记录，不停止执行。 */
+export function interruptRunApi(runUid: string) {
+  return request<{ run_uid: string, status: string }>({ url: `runs/${runUid}/interrupt`, method: "post" })
+}
+
 export function getSurveysApi() {
   return request<{ items: Survey[] }>({ url: "surveys", method: "get" })
 }
@@ -637,6 +642,11 @@ export function getSurveyRunsApi(params: { survey_uid?: string, limit?: number }
 
 export function getSurveyRunDetailApi(runUid: string) {
   return request<SurveyRunDetail>({ url: `survey-runs/${runUid}`, method: "get" })
+}
+
+/** 确认疑似中断的巡检运行已中断：只关闭记录，不停止执行。 */
+export function interruptSurveyRunApi(runUid: string) {
+  return request<{ run_uid: string, status: string }>({ url: `survey-runs/${runUid}/interrupt`, method: "post" })
 }
 
 export function getSurveyStatsApi(days = 90) {

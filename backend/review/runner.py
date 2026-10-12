@@ -536,7 +536,10 @@ def execute_review_run(
 
     except ReviewError as e:
         logger.error("%s Review failed for MR !%s: %s", log_prefix, mr_iid, e)
-        repo.finish_run(run_uid, RUN_FAILED, ERROR_REVIEW, str(e))
+        if not repo.finish_run(run_uid, RUN_FAILED, ERROR_REVIEW, str(e)):
+            # 运行已被确认中断，后来者（重新触发）可能已经在这个 MR 上发过结果，再发一条失败只会添乱
+            logger.info("%s Run %s was already closed, skip failure comment", log_prefix, run_uid)
+            return
         try:
             post_mr_comment(project_id, mr_iid, f"❌ 代码审查失败\n\n```\n{str(e)}\n```")
         except Exception:
