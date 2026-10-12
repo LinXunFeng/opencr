@@ -314,6 +314,30 @@ def api_retry_run(run_uid: str):
     return jsonify({"run_uid": params["run_uid"], "status": "processing"}), 202
 
 
+def _interrupt_response(outcome: str, run_uid: str, run_label: str):
+    """把确认中断的结果翻译成响应。ReviewRun 与 SurveyRun 共用同一套语义。"""
+    if outcome == repo.INTERRUPT_NOT_FOUND:
+        return jsonify({"error": "运行记录不存在或已清理"}), 404
+    if outcome == repo.INTERRUPT_NOT_STALE:
+        # 包括心跳恰好在确认前一刻恢复的情况：它在动，就不该被关掉
+        return jsonify({"error": "该运行已结束，或心跳已恢复、不再是疑似中断，请刷新后查看"}), 409
+    logger.warning("Admin confirmed %s interrupted: run=%s", run_label, run_uid)
+    return jsonify({"run_uid": run_uid, "status": "failed"})
+
+
+@admin_bp.route("/api/admin/runs/<run_uid>/interrupt", methods=["POST"])
+@require_admin
+def api_interrupt_run(run_uid: str):
+    """
+    确认一个疑似中断的 ReviewRun 已中断，记为失败。
+
+    只关闭记录，不停止执行：多进程下本进程碰不到别的进程里的线程。
+    只对 Admin 开放，即使游客重新触发已开启 —— 关错了的代价是同一个 MR 上两次审查并发发评论。
+    """
+    outcome = repo.confirm_run_interrupted(run_uid, _stale_after())
+    return _interrupt_response(outcome, run_uid, "review run")
+
+
 @admin_bp.route("/api/admin/runs/<run_uid>/history", methods=["GET"])
 @require_viewer
 def api_change_history(run_uid: str):
@@ -1023,6 +1047,18 @@ def api_survey_run_detail(run_uid: str):
         context and context["is_latest_succeeded"] and context["survey"]["bindings"]
     )
     return jsonify(detail)
+
+
+@admin_bp.route("/api/admin/survey-runs/<run_uid>/interrupt", methods=["POST"])
+@require_admin
+def api_interrupt_survey_run(run_uid: str):
+    """
+    确认一个疑似中断的 SurveyRun 已中断，记为失败，该 Survey 的定时与手动执行随之恢复。
+
+    同样只关闭记录：原运行若其实还活着，之后的结果不会发布，但它仍在占用同一个工作区。
+    """
+    outcome = repo.confirm_survey_run_interrupted(run_uid, _stale_after())
+    return _interrupt_response(outcome, run_uid, "survey run")
 
 
 @admin_bp.route("/api/admin/survey-runs/<run_uid>/push", methods=["POST"])

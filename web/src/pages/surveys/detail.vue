@@ -1,8 +1,9 @@
 <script lang="ts" setup>
 import type { SurveyFinding, SurveyPush, SurveyRunDetail } from "@@/apis/opencr"
-import { addSurveyIgnoreApi, getSurveyRunDetailApi, pushSurveyRunApi } from "@@/apis/opencr"
+import { addSurveyIgnoreApi, getSurveyRunDetailApi, interruptSurveyRunApi, pushSurveyRunApi } from "@@/apis/opencr"
 import {
   formatTime,
+  INTERRUPT_NOTES,
   PROFILE_KIND_LABEL,
   PUSH_STATUS_LABEL,
   PUSH_STATUS_TAG,
@@ -61,6 +62,33 @@ function schedulePushPolling() {
   if (pending) pollTimer = setTimeout(load, 3000, true)
 }
 onBeforeUnmount(() => clearTimeout(pollTimer))
+
+const interrupting = ref(false)
+
+/** 确认疑似中断：先讲清只关记录不停执行、原运行若还活着会怎样，再提交。 */
+async function confirmInterrupt() {
+  if (!detail.value || interrupting.value) return
+  try {
+    await ElMessageBox.confirm(
+      h("div", INTERRUPT_NOTES.survey.map(text => h("p", text))),
+      INTERRUPT_NOTES.surveyTitle,
+      { type: "warning", confirmButtonText: INTERRUPT_NOTES.button, cancelButtonText: INTERRUPT_NOTES.cancel }
+    )
+  } catch {
+    return
+  }
+  interrupting.value = true
+  try {
+    await interruptSurveyRunApi(runUid.value)
+    ElMessage.success(INTERRUPT_NOTES.surveyDone)
+  } catch (error) {
+    ElMessage.error((error as Error).message)
+  } finally {
+    interrupting.value = false
+  }
+  // 成功与 409（心跳恢复或已结束）都要刷新，让页面反映真实状态
+  await load(true)
+}
 
 const pushing = ref(false)
 async function push(bindingId?: number | null) {
@@ -164,6 +192,11 @@ onMounted(() => load())
             <el-tag v-if="detail.is_stale" size="small" type="warning" effect="plain" class="ml">
               疑似中断
             </el-tag>
+            <el-tooltip v-if="detail.is_stale && userStore.isAdmin" :content="INTERRUPT_NOTES.buttonTip" placement="top">
+              <el-button type="warning" size="small" plain class="ml" :loading="interrupting" @click="confirmInterrupt">
+                {{ INTERRUPT_NOTES.button }}
+              </el-button>
+            </el-tooltip>
           </el-descriptions-item>
           <el-descriptions-item label="阶段">
             {{ SURVEY_PHASE_LABEL[detail.phase] || detail.phase || "—" }}

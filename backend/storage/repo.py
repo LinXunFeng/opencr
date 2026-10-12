@@ -16,6 +16,7 @@ from sqlalchemy import delete, func, select, text, update
 from .db import session_scope
 from .models import (
     DELIVERY_SUMMARY_ONLY,
+    ERROR_INTERRUPTED,
     ERROR_REVIEW,
     ERROR_UNEXPECTED,
     PHASE_DONE,
@@ -194,7 +195,7 @@ def update_progress(
     files_done: Optional[int] = None,
     review_skills: Optional[List[str]] = None,
 ) -> None:
-    """推进阶段/文件计数，并顺带刷新心跳。"""
+    """推进阶段/文件计数，并顺带刷新心跳。已结束（含已确认中断）的运行不再改写。"""
     values: Dict[str, object] = {"heartbeat_at": utcnow()}
     if phase:
         values["phase"] = phase
@@ -206,14 +207,20 @@ def update_progress(
         values["review_skills"] = json.dumps(sorted(set(review_skills)), ensure_ascii=False)
 
     with session_scope() as session:
-        session.execute(update(ReviewRun).where(ReviewRun.run_uid == run_uid).values(**values))
+        session.execute(
+            update(ReviewRun)
+            .where(ReviewRun.run_uid == run_uid, ReviewRun.status == RUN_RUNNING)
+            .values(**values)
+        )
 
 
 def heartbeat(run_uid: str) -> None:
     """仅刷新心跳。长时间停留在同一阶段时（例如单次大模型调用）用它保活。"""
     with session_scope() as session:
         session.execute(
-            update(ReviewRun).where(ReviewRun.run_uid == run_uid).values(heartbeat_at=utcnow())
+            update(ReviewRun)
+            .where(ReviewRun.run_uid == run_uid, ReviewRun.status == RUN_RUNNING)
+            .values(heartbeat_at=utcnow())
         )
 
 
@@ -242,7 +249,9 @@ def add_degradation(run_uid: str, kind: str, count: int = 1) -> None:
             items.append({"kind": kind, "count": int(count)})
 
         run.degradations = json.dumps(items, ensure_ascii=False)
-        run.heartbeat_at = utcnow()
+        # 降级是真实发生过的事，照记；心跳只给进行中的运行续，已确认中断的不能被它"救活"
+        if run.status == RUN_RUNNING:
+            run.heartbeat_at = utcnow()
 
 
 def finish_run(
@@ -250,8 +259,13 @@ def finish_run(
     status: str,
     error_kind: str = "",
     error_message: str = "",
-) -> None:
-    """收尾一次 ReviewRun。error_message 截断到 4000 字符，避免超长堆栈撑爆行。"""
+) -> bool:
+    """
+    收尾一次 ReviewRun，返回是否由本次调用收尾。error_message 截断到 4000 字符，避免超长堆栈撑爆行。
+
+    只收尾仍在进行中的运行：被确认中断的运行可能其实还活着，它迟到的收尾不能把
+    "已确认中断"改写回成功或另一种失败。返回 False 时调用方应跳过收尾之后的对外动作。
+    """
     now = utcnow()
     values: Dict[str, object] = {
         "status": status,
@@ -265,7 +279,56 @@ def finish_run(
         values["error_message"] = str(error_message)[:4000]
 
     with session_scope() as session:
-        session.execute(update(ReviewRun).where(ReviewRun.run_uid == run_uid).values(**values))
+        result = session.execute(
+            update(ReviewRun)
+            .where(ReviewRun.run_uid == run_uid, ReviewRun.status == RUN_RUNNING)
+            .values(**values)
+        )
+        return result.rowcount > 0
+
+
+INTERRUPTED_MESSAGE = "管理员确认中断：心跳超时后由人工关闭了这条记录，系统没有停止任何正在执行的工作。"
+
+# 确认中断的三种结果
+INTERRUPT_OK = "ok"
+INTERRUPT_NOT_FOUND = "not_found"
+INTERRUPT_NOT_STALE = "not_stale"
+
+
+def _confirm_interrupted(model, run_uid: str, stale_after_seconds: int) -> str:
+    """
+    把一个 Stale 运行记为失败（已确认中断），ReviewRun 与 SurveyRun 共用。
+
+    返回 INTERRUPT_OK、INTERRUPT_NOT_FOUND 或 INTERRUPT_NOT_STALE。阶段与最后心跳保留原值，
+    它们是"卡在哪一步、何时失联"的唯一线索。
+    """
+    now = utcnow()
+    cutoff = now - timedelta(seconds=stale_after_seconds)
+    with session_scope() as session:
+        exists = session.scalar(select(model.id).where(model.run_uid == run_uid))
+        if exists is None:
+            return INTERRUPT_NOT_FOUND
+        # 判定与改写放进同一条 UPDATE：先查后改的话，查完那一刻心跳刚好恢复的运行也会被关掉
+        result = session.execute(
+            update(model)
+            .where(
+                model.run_uid == run_uid,
+                model.status == RUN_RUNNING,
+                model.heartbeat_at < cutoff,
+            )
+            .values(
+                status=RUN_FAILED,
+                finished_at=now,
+                error_kind=ERROR_INTERRUPTED,
+                error_message=INTERRUPTED_MESSAGE,
+            )
+        )
+        return INTERRUPT_OK if result.rowcount > 0 else INTERRUPT_NOT_STALE
+
+
+def confirm_run_interrupted(run_uid: str, stale_after_seconds: int) -> str:
+    """确认一个 Stale 的 ReviewRun 已中断。返回值见 ``_confirm_interrupted``。"""
+    return _confirm_interrupted(ReviewRun, run_uid, stale_after_seconds)
 
 
 # --------------------------------------------------------------------------
@@ -1226,7 +1289,7 @@ def update_survey_progress(
     repos_done: Optional[int] = None,
     matched_skills: Optional[List[str]] = None,
 ) -> None:
-    """推进阶段与仓库计数，并顺带刷新心跳。"""
+    """推进阶段与仓库计数，并顺带刷新心跳。已结束（含已确认中断）的运行不再改写。"""
     from .models import SurveyRun
 
     values: Dict[str, object] = {"heartbeat_at": utcnow()}
@@ -1240,7 +1303,11 @@ def update_survey_progress(
         values["matched_skills"] = json.dumps(sorted(set(matched_skills)), ensure_ascii=False)
 
     with session_scope() as session:
-        session.execute(update(SurveyRun).where(SurveyRun.run_uid == run_uid).values(**values))
+        session.execute(
+            update(SurveyRun)
+            .where(SurveyRun.run_uid == run_uid, SurveyRun.status == RUN_RUNNING)
+            .values(**values)
+        )
 
 
 def survey_heartbeat(run_uid: str) -> None:
@@ -1249,7 +1316,9 @@ def survey_heartbeat(run_uid: str) -> None:
 
     with session_scope() as session:
         session.execute(
-            update(SurveyRun).where(SurveyRun.run_uid == run_uid).values(heartbeat_at=utcnow())
+            update(SurveyRun)
+            .where(SurveyRun.run_uid == run_uid, SurveyRun.status == RUN_RUNNING)
+            .values(heartbeat_at=utcnow())
         )
 
 
@@ -1274,7 +1343,9 @@ def add_survey_degradation(run_uid: str, kind: str, count: int = 1) -> None:
         else:
             items.append({"kind": kind, "count": int(count)})
         run.degradations = json.dumps(items, ensure_ascii=False)
-        run.heartbeat_at = utcnow()
+        # 降级是真实发生过的事，照记；心跳只给进行中的运行续，已确认中断的不能被它"救活"
+        if run.status == RUN_RUNNING:
+            run.heartbeat_at = utcnow()
 
 
 def record_survey_repo(
@@ -1460,7 +1531,8 @@ def record_survey_inspected_files(run_uid: str, files: List[dict]) -> None:
     with session_scope() as session:
         session.execute(
             update(SurveyRun)
-            .where(SurveyRun.run_uid == run_uid)
+            # 已确认中断的运行不再写：取证清单只在成功的运行上被台账读取，写进去也只会改写已关闭的记录
+            .where(SurveyRun.run_uid == run_uid, SurveyRun.status == RUN_RUNNING)
             .values(inspected_files=json.dumps(items, ensure_ascii=False), heartbeat_at=utcnow())
         )
 
@@ -1528,8 +1600,13 @@ def finish_survey_run(
     summary: str = "",
     error_kind: str = "",
     error_message: str = "",
-) -> None:
-    """收尾一次 SurveyRun。"""
+) -> bool:
+    """
+    收尾一次 SurveyRun，返回是否由本次调用收尾。
+
+    与 finish_run 同理只收尾仍在进行中的运行。返回 False 时调用方不能再更新 Ledger、
+    不能推送：被确认中断后，同一 Survey 可能已经有更新的一轮写过台账，迟到的旧结果会把它盖掉。
+    """
     from .models import SURVEY_PHASE_DONE, SurveyRun
 
     now = utcnow()
@@ -1547,7 +1624,19 @@ def finish_survey_run(
         values["error_message"] = str(error_message)[:4000]
 
     with session_scope() as session:
-        session.execute(update(SurveyRun).where(SurveyRun.run_uid == run_uid).values(**values))
+        result = session.execute(
+            update(SurveyRun)
+            .where(SurveyRun.run_uid == run_uid, SurveyRun.status == RUN_RUNNING)
+            .values(**values)
+        )
+        return result.rowcount > 0
+
+
+def confirm_survey_run_interrupted(run_uid: str, stale_after_seconds: int) -> str:
+    """确认一个 Stale 的 SurveyRun 已中断。返回值见 ``_confirm_interrupted``。"""
+    from .models import SurveyRun
+
+    return _confirm_interrupted(SurveyRun, run_uid, stale_after_seconds)
 
 
 def _survey_run_to_dict(run: "SurveyRun", stale_after_seconds: int = 600) -> dict:

@@ -1,6 +1,6 @@
 <script lang="ts" setup>
 import type { RunDetail } from "@@/apis/opencr"
-import { getChangeHistoryApi, getRunDetailApi, retryRunApi } from "@@/apis/opencr"
+import { getChangeHistoryApi, getRunDetailApi, interruptRunApi, retryRunApi } from "@@/apis/opencr"
 import VerdictTag from "@@/components/VerdictTag/index.vue"
 import {
   DEGRADATION_LABEL,
@@ -8,6 +8,7 @@ import {
   ERROR_KIND_LABEL,
   formatTime,
   HISTORY_NOTE,
+  INTERRUPT_NOTES,
   PHASE_LABEL,
   RUN_STATUS_LABEL,
   RUN_STATUS_TAG,
@@ -16,9 +17,11 @@ import {
   TRIGGER_LABEL,
   VERDICT_LABEL
 } from "@@/constants/opencr"
+import { useUserStore } from "@/pinia/stores/user"
 
 const route = useRoute()
 const router = useRouter()
+const userStore = useUserStore()
 
 const loading = ref(true)
 const detail = ref<RunDetail | null>(null)
@@ -54,6 +57,33 @@ async function submitRetry() {
   } finally {
     retrying.value = false
   }
+}
+
+const interrupting = ref(false)
+
+/** 确认疑似中断：先讲清只关记录不停执行，再提交；成功后原地刷新以显示失败与重新触发入口。 */
+async function confirmInterrupt() {
+  if (!detail.value || interrupting.value) return
+  try {
+    await ElMessageBox.confirm(
+      h("div", INTERRUPT_NOTES.review.map(text => h("p", text))),
+      INTERRUPT_NOTES.reviewTitle,
+      { type: "warning", confirmButtonText: INTERRUPT_NOTES.button, cancelButtonText: INTERRUPT_NOTES.cancel }
+    )
+  } catch {
+    return
+  }
+  interrupting.value = true
+  try {
+    await interruptRunApi(detail.value.run_uid)
+    ElMessage.success(INTERRUPT_NOTES.reviewDone)
+  } catch (error) {
+    ElMessage.error((error as Error).message)
+  } finally {
+    interrupting.value = false
+  }
+  // 成功与 409（心跳恢复或已经结束）都要刷新，让页面反映真实状态
+  await load()
 }
 
 const scope = ref("current")
@@ -140,7 +170,12 @@ watch(() => route.params.runUid, load, { immediate: true })
             <el-tag v-if="detail.is_stale" type="warning" size="small">
               疑似中断
             </el-tag>
-            <el-tag v-else :type="RUN_STATUS_TAG[detail.status]" size="small">
+            <el-tooltip v-if="detail.is_stale && userStore.isAdmin" :content="INTERRUPT_NOTES.buttonTip" placement="top">
+              <el-button type="warning" size="small" plain :loading="interrupting" @click="confirmInterrupt">
+                {{ INTERRUPT_NOTES.button }}
+              </el-button>
+            </el-tooltip>
+            <el-tag v-if="!detail.is_stale" :type="RUN_STATUS_TAG[detail.status]" size="small">
               {{ RUN_STATUS_LABEL[detail.status] || detail.status }}
             </el-tag>
           </div>
