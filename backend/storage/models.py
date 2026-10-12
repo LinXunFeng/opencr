@@ -351,6 +351,50 @@ PUSH_FAILED = "failed"
 PUSH_TRIGGER_AUTO = "auto"
 PUSH_TRIGGER_MANUAL = "manual"
 
+# --- SurveyFix.phase -----------------------------------------------------
+FIX_PHASE_FETCHING = "fetching"
+FIX_PHASE_GENERATING = "generating"
+FIX_PHASE_VERIFYING = "verifying"
+FIX_PHASE_ASSIGNING = "assigning"
+FIX_PHASE_SUBMITTING = "submitting"
+FIX_PHASE_DONE = "done"
+
+# --- SurveyFix.error_kind ------------------------------------------------
+# status=skipped 时只会是 FIX_NOT_APPLICABLE：模型在最新代码里没有确认到这个问题，没有可提的修改。
+# 它不是"已修复"——只说明这一次没找到可改的地方，台账状态不受影响。
+FIX_NOT_APPLICABLE = "not_applicable"
+# 以下是 status=failed 的原因；被确认中断的与其他运行一样记 ERROR_INTERRUPTED，意外错误记 ERROR_UNEXPECTED
+# 生成的修改都没通过本地验证，不提合并请求
+FIX_VERIFY_FAILED = "verify_failed"
+FIX_UNSUPPORTED = "unsupported"
+FIX_GIT_FAILED = "git_failed"
+FIX_PLATFORM_FAILED = "platform_failed"
+FIX_MODEL_FAILED = "model_failed"
+
+# --- SurveyFix.assignee_source -------------------------------------------
+# 处理人从哪来：问题代码的原始作者；原始作者不可用时依次退回配置里指定的仓库负责人（configured）、
+# 按项目权限推断的仓库负责人（owner）。都找不到时为空，合并请求不指派
+ASSIGNEE_AUTHOR = "author"
+ASSIGNEE_CONFIGURED = "configured"
+ASSIGNEE_OWNER = "owner"
+
+# --- SurveyFix.trigger ---------------------------------------------------
+FIX_TRIGGER_MANUAL = "manual"
+# Admin 在报告页「一键全部修复」
+FIX_TRIGGER_BATCH = "batch"
+# 巡检成功结束后按 Survey 的配置自动发起
+FIX_TRIGGER_AUTO = "auto"
+
+# --- Survey.fix_mode -----------------------------------------------------
+# manual：只由 Admin 发起（单条或一键全部）；auto：每轮成功结束后自动对尚未修复过的问题发起
+FIX_MODE_MANUAL = "manual"
+FIX_MODE_AUTO = "auto"
+FIX_MODES = (FIX_MODE_MANUAL, FIX_MODE_AUTO)
+
+# --- Survey.fix_min_severity ---------------------------------------------
+# 批量修复的严重度门槛可选值，从高到低。没有 unknown：判断不了够不够格的问题批量时一律不处理
+FIX_MIN_SEVERITIES = (SEVERITY_CRITICAL, SEVERITY_WARNING, SEVERITY_ADVICE)
+
 
 class Survey(Base):
     """一份定期巡检配置。它是配置，不是执行——执行实例是 SurveyRun。"""
@@ -387,6 +431,14 @@ class Survey(Base):
     budget_l1_max_chars: Mapped[Optional[int]] = mapped_column(Integer)
     budget_l2_max_focus: Mapped[Optional[int]] = mapped_column(Integer)
     budget_index_timeout_seconds: Mapped[Optional[int]] = mapped_column(Integer)
+
+    # 修复的触发方式（FIX_MODES）。默认手动：巡检后自动发起的修复每轮都会往代码平台提合并请求，必须由人明确打开
+    fix_mode: Mapped[str] = mapped_column(String(16), nullable=False, default=FIX_MODE_MANUAL, server_default=FIX_MODE_MANUAL)
+    # 一键全部修复与巡检后自动发起的修复只处理不低于这个严重度的问题。默认 warning：「建议」档的问题批量提合并请求，
+    # 噪音会盖过价值；单条手动修复不受它限制
+    fix_min_severity: Mapped[str] = mapped_column(
+        String(16), nullable=False, default=SEVERITY_WARNING, server_default=SEVERITY_WARNING
+    )
 
     # 保留最近多少次 SurveyRun。清理永远不会删掉最近一次（见 repo.purge_survey_runs）。
     retention_runs: Mapped[int] = mapped_column(Integer, nullable=False, default=20)
@@ -769,4 +821,107 @@ class SurveyPush(Base):
     __table_args__ = (
         Index("ix_survey_push_run", "run_id"),
         Index("ix_survey_push_binding_status", "binding_id", "status"),
+    )
+
+
+class SurveyFix(Base):
+    """
+    FixRun（修复运行）：针对一条巡检 Finding 生成修改、本地验证、并在代码平台上提出合并请求的一次执行。
+
+    挂在 Survey 而不是 SurveyRun 下：同一个问题下一轮仍存在时是另一条 Finding，
+    修复记录要能跟着指纹出现在之后的报告与台账里；运行记录按次数清理也不能把已提出的合并请求链接一起删掉。
+    它不改变 Ledger 状态 —— 提了合并请求、甚至合并了，都要等后续 SurveyRun 复核给出证据。
+    """
+
+    __tablename__ = "survey_fix"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    # 叫 run_uid 而不是 fix_uid：确认中断（repo._confirm_interrupted）按这个列名找运行，三类运行共用一份判定
+    run_uid: Mapped[str] = mapped_column(String(36), nullable=False, unique=True)
+    survey_id: Mapped[int] = mapped_column(
+        ForeignKey("survey.id", ondelete="CASCADE"), nullable=False
+    )
+    # 发现所在的运行被清理后置空，下面的快照仍能说清修的是哪个问题
+    finding_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("survey_finding.id", ondelete="SET NULL")
+    )
+
+    # 发起时那条发现的快照
+    fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    repo_slug: Mapped[str] = mapped_column(String(128), nullable=False, default="")
+    file_path: Mapped[Optional[str]] = mapped_column(String(1024))
+    line: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    category: Mapped[str] = mapped_column(String(24), nullable=False, default=CATEGORY_CORRECTNESS)
+    severity: Mapped[str] = mapped_column(String(16), nullable=False, default=SEVERITY_UNKNOWN)
+    title: Mapped[Optional[str]] = mapped_column(String(512))
+    body: Mapped[Optional[str]] = mapped_column(Text)
+
+    # 仓库地址与目标分支取自发现所在那一轮的仓库记录；修改基于目标分支的最新提交
+    repo_url: Mapped[str] = mapped_column(String(1024), nullable=False, default="")
+    target_branch: Mapped[Optional[str]] = mapped_column(String(255))
+    base_sha: Mapped[Optional[str]] = mapped_column(String(64))
+    source_branch: Mapped[Optional[str]] = mapped_column(String(255))
+
+    trigger: Mapped[str] = mapped_column(
+        String(16), nullable=False, default=FIX_TRIGGER_MANUAL, server_default=FIX_TRIGGER_MANUAL
+    )
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default=RUN_RUNNING)
+    phase: Mapped[Optional[str]] = mapped_column(String(32))
+    error_kind: Mapped[Optional[str]] = mapped_column(String(32))
+    error_message: Mapped[Optional[str]] = mapped_column(Text)
+
+    # 模型对本次修改的说明，也是合并请求正文的一部分
+    summary: Mapped[Optional[str]] = mapped_column(Text)
+    # unified diff。正文一侧的数据，只对 Admin 返回
+    diff: Mapped[Optional[str]] = mapped_column(Text)
+    # 每次生成与验证的结果，JSON 数组：[{"passed", "checks": [...], "problems": [...]}]
+    verification: Mapped[Optional[str]] = mapped_column(Text)
+
+    # 原始作者：问题代码行最近一次实质改动（排除只改格式的改动）的提交作者
+    author_name: Mapped[Optional[str]] = mapped_column(String(255))
+    author_email: Mapped[Optional[str]] = mapped_column(String(255))
+    # 处理人：合并请求实际指派给谁。assignee_note 说明为什么没指派给原始作者
+    assignee_source: Mapped[Optional[str]] = mapped_column(String(16))
+    assignee_username: Mapped[Optional[str]] = mapped_column(String(255))
+    assignee_name: Mapped[Optional[str]] = mapped_column(String(255))
+    assignee_note: Mapped[Optional[str]] = mapped_column(Text)
+
+    mr_iid: Mapped[Optional[int]] = mapped_column(Integer)
+    mr_url: Mapped[Optional[str]] = mapped_column(String(1024))
+
+    started_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=utcnow)
+    heartbeat_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=utcnow)
+    finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+
+    __table_args__ = (
+        Index("ix_survey_fix_survey_fp", "survey_id", "fingerprint"),
+        Index("ix_survey_fix_finding", "finding_id"),
+        Index("ix_survey_fix_status_heartbeat", "status", "heartbeat_at"),
+    )
+
+
+class RepoOwner(Base):
+    """
+    RepoOwner（仓库负责人）的人工配置：一个项目或一个组织路径，指定谁是负责人。
+
+    全局而不挂在 Survey 下：负责人是仓库本身的属性，多个巡检覆盖同一个仓库时不该各配一份、配出不一样的人。
+    按平台上的项目路径认仓库，而不是巡检的 repo_slug：slug 只取最后两段，a-b/c 与 a/b-c 会撞成同一个，
+    而这里配错一个人，合并请求就会指派给不相干的人。
+    配的是组织路径时对它下面的全部项目生效，同一个项目命中多条时取路径最长（最具体）的那条。
+    """
+
+    __tablename__ = "repo_owner"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    # 小写、去掉首尾斜杠的项目或组织路径，例如 team/app 或 team
+    path: Mapped[str] = mapped_column(String(512), nullable=False)
+    # 平台用户名，JSON 数组，按顺序取第一个可用的：只配一个人的话，他离职或被封禁时又会退回按权限推断
+    usernames: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    # 留痕用：半年后没人记得为什么是这个人
+    note: Mapped[Optional[str]] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=utcnow)
+
+    __table_args__ = (
+        Index("ux_repo_owner_path", "path", unique=True),
     )

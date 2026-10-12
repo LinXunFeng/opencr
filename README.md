@@ -469,6 +469,20 @@ When some repositories in an organisation are unmaintained or unimportant, exclu
 Reports can be exported as Markdown. The export renders the same data as the console, so a guest
 export contains no bodies either.
 
+### Automatic fixes: opening merge requests
+
+For issues under "new" and "persisting" in a report, an admin can click "提出修复" (propose a fix) one at a time, or "一键全部修复" (fix all) on the latest successful run's report. OpenCR fetches the latest code of the repository's target branch, asks the model to change **only the file the issue is in**, verifies the change locally, and if it passes pushes a branch prefixed `opencr/fix-` and opens a merge request. It runs in the background; results appear in the report's "修复合并请求" (fix merge requests) card, and "详情" (details) shows the diff, every verification round and the assignee.
+
+- **Local verification does not build or run tests.** It checks that the edits apply verbatim, that no more than 200 lines change, Python / JSON syntax, and then asks the model to review whether the issue is resolved and nothing new was introduced. A failed round is retried once with the reasons; if it still fails, no merge request is opened. Builds and tests are left to the repository's own CI; see [`docs/adr/0007-survey-fix-local-verification.md`](docs/adr/0007-survey-fix-local-verification.md).
+- **If the model finds the issue is gone from the latest code** (or fixing it needs another file), the fix is recorded as "not changed" with the reason, and no merge request is opened.
+- **The merge request is assigned to the original author**: whoever last made a substantive change to the affected lines. Changes that only touch formatting (whitespace, line breaks, quotes or commas, judged line by line, so logic changed in the same commit still counts) are skipped, as is anything listed in the repository's `.git-blame-ignore-revs`, so the fix does not land on someone who merely ran a formatter. If the original author is unavailable — blocked or deactivated, no longer a project member, below Developer, or not matched to a platform account — it goes to the **repository owner** instead (the highest-access available direct member of the project, Owner before Maintainer; inherited members only if there is none). Why the original author was passed over is shown in the fix details and the merge request description.
+- **Merge request links appear in the report, the Markdown export and the ledger on destinations** (system column "修复合并请求", one link per line). After a fix succeeds the ledger is pushed again immediately rather than waiting for the next run.
+- **Opening or merging a merge request does not change an issue's state.** The ledger still follows what later runs re-check.
+- **How fixes are triggered is configured per survey** (edit survey → "修复触发方式"): by default only admins start them; switch to "巡检后自动发起" (automatic) and every successful run starts fixes for issues that have never been fixed. Fix-all and automatic fixes only take issues at or above the survey's "批量修复门槛" (batch threshold; default warning and above, unknown severity never), at most 20 per batch, run one by one in the background; the rest wait for the next batch. An issue that has any fix record (successful or not) is never picked by a batch again; retry it individually.
+- **Repository owners can be configured** (Scheduled Surveys → "仓库负责人"): assign owners to a project or group path, several in priority order; a group path covers every project under it, and the most specific entry wins. When the original author is unavailable, the first available configured owner (still a member, account active, at least Developer) is used; only without a configuration, or when none of them is available, is the owner inferred by the rule above.
+- A second fix cannot be started for the same issue while one is running; a stale fix can be confirmed interrupted on its details page and then retried. Admins only; guests do not see fixes.
+- GitLab only for now. Besides `api`, the token needs `write_repository` to push branches, and its account needs at least Developer access on the target project.
+
 ### Pushing to external platforms (destinations)
 
 Survey results can be mirrored to external platforms so they can be assigned and tracked in a spreadsheet. **Google Sheet** is supported today; the plugin interface is designed around keyed upserts so platforms such as Feishu Bitable can be added the same way.
@@ -536,7 +550,7 @@ Either way, **publish the OAuth app to production**: refresh tokens issued by an
 
 Columns come in two kinds:
 
-- **System columns**: key, survey, repository, file, lines, category, severity, title, body, state, first seen, last seen, finding count, and optionally a run-details link. They are **located by header name**, so you may reorder them freely — but **do not rename system headers**: a renamed header makes the next push add a fresh column.
+- **System columns**: key, survey, repository, file, lines, category, severity, title, body, state, first seen, last seen, finding count, fix merge requests, and optionally a run-details link. They are **located by header name**, so you may reorder them freely — but **do not rename system headers**: a renamed header makes the next push add a fresh column.
 - **Your own columns** (owner, progress, notes…) are never read or written.
 
 Rules worth knowing:

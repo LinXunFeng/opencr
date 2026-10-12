@@ -129,7 +129,14 @@ export const INTERRUPT_NOTES = {
     "请先确认它确实不会再继续，例如服务重启过、进程被杀或刚部署过。如果它其实仍在执行，跑完的结果不会发布、也不会更新问题台账；但它仍在使用这个巡检的工作区，这时马上开始新一轮会和它互相干扰。",
     "确认后，这个巡检的定时与手动执行会恢复。"
   ],
-  surveyDone: "已记为失败（已确认中断），这个巡检可以再次执行"
+  surveyDone: "已记为失败（已确认中断），这个巡检可以再次执行",
+  fixTitle: "确认这次修复已经中断？",
+  fix: [
+    "这只会把这条修复记录改为「失败 · 已确认中断」，不会停止任何正在执行的修复——系统无法停掉另一个进程里的工作。",
+    "如果它其实仍在执行、还没走到提交那一步，它不会再推分支或提合并请求；已经在提交的那一步会照常完成，推上去的分支与合并请求留在代码平台上。",
+    "确认后可以对这个问题重新发起修复。"
+  ],
+  fixDone: "已记为失败（已确认中断），可以重新发起修复"
 }
 
 /**
@@ -360,6 +367,91 @@ export const PUSH_STATUS_TAG: Record<string, TagType> = {
   running: "primary",
   succeeded: "success",
   failed: "danger"
+}
+
+/** 修复运行的状态。与 backend/survey/report.py 的 FIX_STATUS_LABELS 一致 */
+export const FIX_STATUS_LABEL: Record<string, string> = {
+  running: "进行中",
+  succeeded: "已提出",
+  skipped: "未修改",
+  failed: "失败"
+}
+
+export const FIX_STATUS_TAG: Record<string, TagType> = {
+  running: "primary",
+  succeeded: "success",
+  skipped: "info",
+  failed: "danger"
+}
+
+export const FIX_PHASE_LABEL: Record<string, string> = {
+  fetching: "拉取仓库",
+  generating: "生成修改",
+  verifying: "本地验证",
+  assigning: "追溯处理人",
+  submitting: "提出合并请求",
+  done: "已结束"
+}
+
+/** 与 backend/survey/report.py 的 ASSIGNEE_SOURCE_LABELS 一致 */
+export const ASSIGNEE_SOURCE_LABEL: Record<string, string> = {
+  author: "原始作者",
+  configured: "指定负责人",
+  owner: "仓库负责人"
+}
+
+/** 修复运行的触发来源 */
+export const FIX_TRIGGER_LABEL: Record<string, string> = {
+  manual: "手动",
+  batch: "一键全部修复",
+  auto: "自动"
+}
+
+export const FIX_MODE_LABEL: Record<string, string> = {
+  manual: "Admin 发起",
+  auto: "巡检后自动发起"
+}
+
+export const FIX_MIN_SEVERITY_OPTIONS = [
+  { value: "critical", label: "只处理严重" },
+  { value: "warning", label: "警告及以上" },
+  { value: "advice", label: "全部（含建议）" }
+]
+
+/**
+ * 修复相关的口径文案。
+ * 「提了合并请求 ≠ 问题已解决」要在每个入口都说清；文案集中在这里，各处才不会说出不一样的口径。
+ */
+export const FIX_NOTES = {
+  confirmTitle: "针对这个问题提出修复？",
+  confirm: [
+    "OpenCR 会拉取该仓库目标分支的最新代码，让模型只修改这一个文件，并做本地验证（补丁可应用、改动范围、Python/JSON 语法、模型复核）。本地验证不包括构建与测试，那要靠仓库自己的 CI。",
+    "验证通过后会在代码平台上推一个 opencr/fix- 开头的分支并提出合并请求，指派给这段代码的原始作者——追溯时跳过只改格式的改动；原始作者已不可用（被封禁、离开项目、对应不上账号）时改派仓库负责人：先取「仓库负责人」配置里第一个可用的人，没有配置或都不可用时取项目里权限最高的人。",
+    "提出或合并合并请求都不会改变问题台账的状态，要等后续巡检复核。合并请求链接会附在报告、Markdown 导出与输出目标的台账里。"
+  ],
+  confirmButton: "提出修复",
+  started: "已开始修复，完成后会在「修复合并请求」里显示结果",
+  notResolved: "提出或合并了合并请求都不改变问题状态，以后续巡检的复核为准。",
+  verifyScope: "本地验证只包括补丁可应用、改动范围、Python/JSON 语法与模型复核，不包括构建与测试。",
+  author: "原始作者：问题代码行最近一次实质改动的作者，追溯时跳过只改格式（空白、换行、引号、逗号）的改动。",
+  modeHelp: {
+    manual: "只在 Admin 点「提出修复」或报告页「一键全部修复」时发起。",
+    auto: "每轮巡检成功结束后，自动对尚未修复过、且不低于下面门槛的问题发起修复（每批有上限，后台逐个执行），每个都会在代码平台上推分支、提合并请求。"
+  } as Record<string, string>,
+  minSeverityHelp: "一键全部修复与巡检后自动发起的修复只处理不低于这个严重度的问题，严重度未知的不处理；单条「提出修复」不受限制。",
+  fixAllTitle: "一键修复这一轮的问题？",
+  fixAll: (count: number, severity: string) => [
+    `将为 ${count} 个尚未修复过、且不低于「${severity}」的问题发起修复，每批有上限，在后台逐个执行；超出上限的再点一次接着处理。已经修复过的（不论成败）不会重复发起，要重试请单条「提出修复」。`,
+    "每个问题都会单独推一个分支、提一个合并请求并指派处理人，本地验证不包括构建与测试。",
+    "提出或合并合并请求都不改变问题台账的状态。"
+  ],
+  fixAllButton: "一键全部修复",
+  fixBatchRunning: "这个巡检有一批修复正在后台逐个执行，同一时间只跑一批；结束后可以再点一次处理剩下的。",
+  fixAllStarted: (queued: number, total: number) =>
+    queued < total ? `已开始修复 ${queued} 个，另有 ${total - queued} 个超出本批上限，稍后再点一次` : `已开始修复 ${queued} 个`,
+  ownerPage: "原始作者不可用时，合并请求先指派给这里配置的负责人（按顺序取第一个仍在项目里、账号可用、权限不低于 Developer 的人）；没有配置或配置的人都不可用时，按项目权限推断：项目直属成员里权限最高的人，直属成员里没有时再看从组织继承来的。",
+  ownerPath: "填项目或组织的路径（或直接粘贴地址）。组织路径对它下面的全部项目生效，同一个项目命中多条时取最具体的那条。",
+  ownerUsernames: "平台用户名，可填多个、按优先级排列。保存时不访问代码平台，发起修复时才校验是否可用。"
 }
 
 /** 忽略理由的长度上限，与服务端 SURVEY_IGNORE_NOTE_MAX 一致；超出的部分服务端会静默截掉，所以前端先拦 */

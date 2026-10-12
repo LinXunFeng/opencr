@@ -128,6 +128,18 @@ export const constantRoutes: RouteRecordRaw[] = [
         meta: { title: "巡检报告", hidden: true, activeMenu: "/surveys/runs", surveyGated: true }
       },
       {
+        path: "owners",
+        component: () => import("@/pages/surveys/owners.vue"),
+        name: "RepoOwners",
+        meta: { title: "仓库负责人", elIcon: "User", surveyGated: true, adminOnly: true }
+      },
+      {
+        path: "fixes/:runUid",
+        component: () => import("@/pages/surveys/fix.vue"),
+        name: "SurveyFixDetail",
+        meta: { title: "修复详情", hidden: true, activeMenu: "/surveys/runs", surveyGated: true, adminOnly: true }
+      },
+      {
         path: "list/:surveyUid/ignores",
         component: () => import("@/pages/surveys/ignores.vue"),
         name: "SurveyIgnores",

@@ -1,7 +1,20 @@
 <script lang="ts" setup>
 import type { SurveyFinding, SurveyPush, SurveyRunDetail } from "@@/apis/opencr"
-import { addSurveyIgnoreApi, getSurveyRunDetailApi, interruptSurveyRunApi, pushSurveyRunApi } from "@@/apis/opencr"
 import {
+  addSurveyIgnoreApi,
+  fixAllSurveyRunApi,
+  fixSurveyFindingApi,
+  getSurveyRunDetailApi,
+  interruptSurveyRunApi,
+  pushSurveyRunApi
+} from "@@/apis/opencr"
+import {
+  ASSIGNEE_SOURCE_LABEL,
+  FIX_NOTES,
+  FIX_PHASE_LABEL,
+  FIX_STATUS_LABEL,
+  FIX_STATUS_TAG,
+  FIX_TRIGGER_LABEL,
   formatTime,
   INTERRUPT_NOTES,
   PROFILE_KIND_LABEL,
@@ -10,6 +23,7 @@ import {
   PUSH_TRIGGER_LABEL,
   RUN_STATUS_LABEL,
   RUN_STATUS_TAG,
+  SEVERITY_LABEL,
   SURVEY_DEGRADATION_LABEL,
   SURVEY_NOTES,
   SURVEY_PHASE_LABEL,
@@ -52,13 +66,16 @@ async function load(silent = false) {
 }
 
 /**
- * 推送在后台线程执行，接口登记完就返回。有进行中的推送时轮询刷新，直到全部结束。
+ * 推送与修复都在后台线程执行，接口登记完就返回。有进行中的推送或修复时轮询刷新，直到全部结束。
  * 疑似中断的记录不再等：它们大概率永远不会结束。
  */
 let pollTimer: ReturnType<typeof setTimeout> | undefined
 function schedulePushPolling() {
   clearTimeout(pollTimer)
   const pending = detail.value?.pushes.some(p => p.status === "running" && !p.is_stale)
+    || detail.value?.fixes?.some(f => f.status === "running" && !f.is_stale)
+    // 批次里两个修复之间的空档没有进行中的记录，单看上一行会提前停止刷新
+    || detail.value?.fix_batch_running
   if (pending) pollTimer = setTimeout(load, 3000, true)
 }
 onBeforeUnmount(() => clearTimeout(pollTimer))
@@ -157,6 +174,54 @@ async function ignore(finding: SurveyFinding) {
   } catch (error) {
     ElMessage.error((error as Error).message)
   }
+}
+
+/** 发起修复：先讲清会对代码平台做什么、指派给谁、合并请求不等于问题已解决，再提交 */
+async function fix(finding: SurveyFinding) {
+  try {
+    await ElMessageBox.confirm(
+      h("div", FIX_NOTES.confirm.map(text => h("p", text))),
+      FIX_NOTES.confirmTitle,
+      { type: "warning", confirmButtonText: FIX_NOTES.confirmButton, cancelButtonText: "取消" }
+    )
+  } catch {
+    return
+  }
+  try {
+    await fixSurveyFindingApi(finding.id)
+    ElMessage.success(FIX_NOTES.started)
+  } catch (error) {
+    ElMessage.error((error as Error).message)
+  }
+  await load(true)
+}
+
+const fixingAll = ref(false)
+
+/** 一键全部修复：先讲清会提多少个合并请求、哪些不会重复发起，再提交 */
+async function fixAll() {
+  const d = detail.value
+  if (!d?.fix_all_candidates || fixingAll.value) return
+  const severity = SEVERITY_LABEL[d.fix_min_severity || ""] || d.fix_min_severity || ""
+  try {
+    await ElMessageBox.confirm(
+      h("div", FIX_NOTES.fixAll(d.fix_all_candidates, severity).map(text => h("p", text))),
+      FIX_NOTES.fixAllTitle,
+      { type: "warning", confirmButtonText: FIX_NOTES.fixAllButton, cancelButtonText: "取消" }
+    )
+  } catch {
+    return
+  }
+  fixingAll.value = true
+  try {
+    const result = await fixAllSurveyRunApi(runUid.value)
+    ElMessage.success(FIX_NOTES.fixAllStarted(result.queued, result.total))
+  } catch (error) {
+    ElMessage.error((error as Error).message)
+  } finally {
+    fixingAll.value = false
+  }
+  await load(true)
 }
 
 onMounted(() => load())
@@ -372,6 +437,74 @@ onMounted(() => load())
         :title="SURVEY_NOTES.guestScope"
       />
 
+      <el-card v-if="detail.fixes?.length" shadow="never" class="mb">
+        <template #header>
+          修复合并请求（{{ detail.fixes.length }}）
+          <span class="sub ml">{{ FIX_NOTES.notResolved }}</span>
+        </template>
+        <el-table :data="detail.fixes" size="small">
+          <el-table-column label="问题" min-width="240" show-overflow-tooltip>
+            <template #default="{ row }">
+              <div>{{ row.title }}</div>
+              <div class="sub">
+                <code>{{ row.repo_slug }}/{{ row.file_path }}</code>
+              </div>
+            </template>
+          </el-table-column>
+          <el-table-column label="触发" width="110">
+            <template #default="{ row }">
+              {{ FIX_TRIGGER_LABEL[row.trigger] || row.trigger }}
+            </template>
+          </el-table-column>
+          <el-table-column label="状态" width="170">
+            <template #default="{ row }">
+              <el-tag size="small" :type="FIX_STATUS_TAG[row.status] || 'info'">
+                {{ FIX_STATUS_LABEL[row.status] || row.status }}
+              </el-tag>
+              <el-tag v-if="row.is_stale" size="small" type="warning" effect="plain" class="ml">
+                疑似中断
+              </el-tag>
+              <span v-else-if="row.status === 'running'" class="sub ml">{{ FIX_PHASE_LABEL[row.phase] || row.phase }}</span>
+            </template>
+          </el-table-column>
+          <el-table-column label="处理人" min-width="180">
+            <template #default="{ row }">
+              <template v-if="row.assignee_username">
+                @{{ row.assignee_username }}
+                <el-tooltip v-if="row.assignee_note" :content="row.assignee_note" placement="top">
+                  <el-tag size="small" effect="plain" class="ml">
+                    {{ ASSIGNEE_SOURCE_LABEL[row.assignee_source] }}
+                  </el-tag>
+                </el-tooltip>
+                <el-tag v-else size="small" effect="plain" class="ml">
+                  {{ ASSIGNEE_SOURCE_LABEL[row.assignee_source] }}
+                </el-tag>
+              </template>
+              <span v-else class="sub">{{ row.assignee_note || "—" }}</span>
+            </template>
+          </el-table-column>
+          <el-table-column label="合并请求" width="120">
+            <template #default="{ row }">
+              <a v-if="row.mr_url" :href="row.mr_url" target="_blank" rel="noopener">!{{ row.mr_iid }}</a>
+              <span v-else>—</span>
+            </template>
+          </el-table-column>
+          <el-table-column label="发起时间" min-width="160">
+            <template #default="{ row }">
+              {{ formatTime(row.started_at) }}
+            </template>
+          </el-table-column>
+          <el-table-column prop="error_message" label="未提出的原因" min-width="200" show-overflow-tooltip />
+          <el-table-column label="操作" width="80" fixed="right">
+            <template #default="{ row }">
+              <el-button link type="primary" size="small" @click="router.push({ name: 'SurveyFixDetail', params: { runUid: row.run_uid } })">
+                详情
+              </el-button>
+            </template>
+          </el-table-column>
+        </el-table>
+      </el-card>
+
       <el-card shadow="never">
         <template #header>
           发现（共 {{ detail.counts.total }} 条）
@@ -388,16 +521,29 @@ onMounted(() => load())
               查看忽略清单
             </el-button>
           </span>
+          <el-tooltip
+            v-if="detail.fix_all_available && detail.fix_all_candidates"
+            :content="FIX_NOTES.fixBatchRunning" :disabled="!detail.fix_batch_running" placement="top"
+          >
+            <span class="fix-all">
+              <el-button
+                size="small" type="primary" plain :loading="fixingAll || detail.fix_batch_running"
+                :disabled="detail.fix_batch_running" @click="fixAll"
+              >
+                {{ FIX_NOTES.fixAllButton }}（{{ detail.fix_all_candidates }}）
+              </el-button>
+            </span>
+          </el-tooltip>
         </template>
 
         <el-alert class="mb" type="info" :closable="false" show-icon :title="SURVEY_NOTES.stateDiff" />
 
         <el-tabs v-model="activeTab">
           <el-tab-pane :label="`新增 (${detail.counts.new})`" name="new">
-            <FindingTable :items="newFindings" :can-ignore="userStore.isAdmin" @ignore="ignore" />
+            <FindingTable :items="newFindings" :can-ignore="userStore.isAdmin" :can-fix="userStore.isAdmin" @ignore="ignore" @fix="fix" />
           </el-tab-pane>
           <el-tab-pane :label="`仍存在 (${detail.counts.persisted})`" name="persisted">
-            <FindingTable :items="persistedFindings" :can-ignore="userStore.isAdmin" @ignore="ignore" />
+            <FindingTable :items="persistedFindings" :can-ignore="userStore.isAdmin" :can-fix="userStore.isAdmin" @ignore="ignore" @fix="fix" />
           </el-tab-pane>
           <el-tab-pane :label="`已消失 (${detail.counts.resolved})`" name="resolved">
             <el-alert class="mb" type="success" :closable="false" show-icon :title="SURVEY_NOTES.resolvedNotStored" />
@@ -460,5 +606,9 @@ onMounted(() => load())
 
 .degraded {
   color: var(--el-color-warning);
+}
+
+.fix-all {
+  float: right;
 }
 </style>

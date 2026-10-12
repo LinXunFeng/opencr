@@ -466,3 +466,109 @@ def get_note_award_emoji(project_id: int, mr_iid: int, note_id: int) -> List[str
     if not isinstance(payload, list):
         return []
     return [str(item.get("name") or "").strip() for item in payload if isinstance(item, dict)]
+
+
+# ---------------------------------------------------------------------------
+# 巡检修复（FixRun）用到的接口
+# ---------------------------------------------------------------------------
+
+# 成员接口最多翻几页（每页 100）。超大的组织继承成员可能上千，找原始作者与负责人不需要看全
+MAX_MEMBER_PAGES = 10
+
+
+def _gitlab_post(path: str, payload: dict, timeout: int = 30):
+    """GitLab POST 的统一封装。失败时抛 ReviewError，消息里带上平台返回的原因（例如权限不足、分支已有合并请求）。"""
+    import requests
+    import urllib3
+
+    cfg = require_gitlab_config()
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    try:
+        response = requests.post(
+            f"{cfg['url']}/api/v4{path}",
+            headers={"PRIVATE-TOKEN": cfg["token"]},
+            json=payload,
+            timeout=timeout,
+            verify=False,
+        )
+    except requests.RequestException as e:
+        raise ReviewError(f"请求 GitLab 失败：{e}") from e
+    if response.status_code >= 400:
+        raise ReviewError(f"GitLab 返回 {response.status_code}：{response.text[:500]}")
+    return response
+
+
+def encode_project_path(project_path: str) -> str:
+    """把 group/sub/project 编码成接口路径里的项目 id。"""
+    return quote(str(project_path or "").strip().strip("/"), safe="")
+
+
+def get_project(project_path: str) -> dict:
+    """读取项目信息（含 web_url、默认分支）。"""
+    response = _gitlab_get(f"/projects/{encode_project_path(project_path)}")
+    data = response.json() or {}
+    return data if isinstance(data, dict) else {}
+
+
+def list_project_members(project_path: str, inherited: bool = True) -> List[dict]:
+    """
+    列出项目成员。inherited=True 时包括从上级组织继承来的（members/all），否则只列项目直属成员。
+
+    找原始作者要用含继承的：多数人是在组织上被授权的，只看直属成员会把他们都当成"已不在项目里"。
+    """
+    endpoint = "members/all" if inherited else "members"
+    members: List[dict] = []
+    for page in range(1, MAX_MEMBER_PAGES + 1):
+        response = _gitlab_get(
+            f"/projects/{encode_project_path(project_path)}/{endpoint}",
+            params={"per_page": 100, "page": page},
+        )
+        batch = response.json() or []
+        if not isinstance(batch, list) or not batch:
+            break
+        members.extend(item for item in batch if isinstance(item, dict))
+        if len(batch) < 100:
+            break
+    return members
+
+
+def search_users(query: str) -> List[dict]:
+    """
+    按关键字搜索用户。
+
+    管理员令牌能按任意邮箱搜到人，普通令牌只能搜到公开了邮箱的人 —— 搜不到不代表这个人不存在，
+    调用方要有别的匹配方式兜底。
+    """
+    response = _gitlab_get("/users", params={"search": str(query or "").strip(), "per_page": 20})
+    data = response.json() or []
+    return [item for item in data if isinstance(item, dict)] if isinstance(data, list) else []
+
+
+def get_current_user() -> dict:
+    """令牌所属的账号。"""
+    response = _gitlab_get("/user")
+    data = response.json() or {}
+    return data if isinstance(data, dict) else {}
+
+
+def create_merge_request(
+    project_path: str,
+    source_branch: str,
+    target_branch: str,
+    title: str,
+    description: str,
+    assignee_id: Optional[int] = None,
+) -> dict:
+    """创建合并请求，返回平台的响应（含 iid 与 web_url）。合并后删除源分支：那是机器建的一次性分支。"""
+    payload = {
+        "source_branch": source_branch,
+        "target_branch": target_branch,
+        "title": title,
+        "description": description,
+        "remove_source_branch": True,
+    }
+    if assignee_id:
+        payload["assignee_id"] = int(assignee_id)
+    response = _gitlab_post(f"/projects/{encode_project_path(project_path)}/merge_requests", payload)
+    data = response.json() or {}
+    return data if isinstance(data, dict) else {}

@@ -23,10 +23,19 @@ from ..review.config import (
     load_storage_config,
 )
 from ..storage import repo
-from ..storage.models import PUSH_TRIGGER_MANUAL
+from ..storage.models import FIX_MIN_SEVERITIES, FIX_MODES, FIX_TRIGGER_BATCH, PUSH_TRIGGER_MANUAL
 from ..survey.common import MAX_REPOS_LOWER_BOUND, MAX_REPOS_UPPER_BOUND, SurveyError, slugify
 from ..survey.config import SETTING_MAX_REPOS, load_max_repos, load_public_url, load_survey_config
 from ..survey.destinations import DESTINATION_TYPES, list_destination_types, load_destinations
+from ..survey.fix import (
+    FixBatchBusy,
+    attach_fixes,
+    execute_survey_fix_in_background,
+    fix_batch_lease_name,
+    fix_unsupported_reason,
+    project_path_from_url,
+    start_fix_batch,
+)
 from ..survey.profile import codegraph_available
 from ..survey.push import PushRejected, begin_pushes, check_destination, execute_pushes_in_background
 from ..survey.report import render_run_markdown
@@ -315,7 +324,7 @@ def api_retry_run(run_uid: str):
 
 
 def _interrupt_response(outcome: str, run_uid: str, run_label: str):
-    """把确认中断的结果翻译成响应。ReviewRun 与 SurveyRun 共用同一套语义。"""
+    """把确认中断的结果翻译成响应。ReviewRun、SurveyRun 与修复运行共用同一套语义。"""
     if outcome == repo.INTERRUPT_NOT_FOUND:
         return jsonify({"error": "运行记录不存在或已清理"}), 404
     if outcome == repo.INTERRUPT_NOT_STALE:
@@ -595,6 +604,17 @@ def _parse_survey_payload(payload: dict, partial: bool) -> tuple:
     for key in ("enabled", "delete_workspace_after"):
         if key in payload:
             fields[key] = bool(payload[key])
+
+    if "fix_mode" in payload:
+        mode = str(payload.get("fix_mode") or "").strip().lower()
+        if mode not in FIX_MODES:
+            raise ValueError(f"fix_mode 只能是 {' / '.join(FIX_MODES)}")
+        fields["fix_mode"] = mode
+    if "fix_min_severity" in payload:
+        severity = str(payload.get("fix_min_severity") or "").strip().lower()
+        if severity not in FIX_MIN_SEVERITIES:
+            raise ValueError(f"fix_min_severity 只能是 {' / '.join(FIX_MIN_SEVERITIES)}")
+        fields["fix_min_severity"] = severity
 
     if "excluded_skills" in payload:
         raw = payload["excluded_skills"]
@@ -1040,6 +1060,17 @@ def api_survey_run_detail(run_uid: str):
     )
     if detail is None:
         return jsonify({"error": "运行记录不存在"}), 404
+    if admin:
+        _attach_survey_fixes(run_uid, detail)
+        context = repo.get_survey_push_context(run_uid)
+        latest = bool(context and context["is_latest_succeeded"])
+        # 一键全部修复只对最近一次成功的运行开放：旧报告里的问题可能已经被新一轮复核过，按旧报告批量提合并请求没有意义
+        detail["fix_all_candidates"] = (
+            len(repo.list_survey_fix_candidates(run_uid, context["survey"]["fix_min_severity"])) if latest else 0
+        )
+        detail["fix_all_available"] = latest
+        detail["fix_batch_running"] = bool(context) and repo.lease_active(fix_batch_lease_name(context["survey_id"]))
+        detail["fix_min_severity"] = context["survey"]["fix_min_severity"] if context else ""
     # 推送记录与报告同源同权：Guest 看得到推送状态，看不到目标位置与错误信息
     detail["pushes"] = repo.list_survey_pushes(run_uid, include_detail=admin)
     context = repo.get_survey_push_context(run_uid)
@@ -1098,17 +1129,166 @@ def api_export_survey_run(run_uid: str):
     导出走的是和界面同一份数据，因此 Guest 导出的报告同样不含正文 ——
     否则导出就成了绕过可见范围的后门。
     """
+    admin = is_admin()
     detail = repo.get_survey_run_detail(
-        run_uid, include_body=is_admin(), stale_after_seconds=_stale_after()
+        run_uid, include_body=admin, stale_after_seconds=_stale_after()
     )
     if detail is None:
         return jsonify({"error": "运行记录不存在"}), 404
+    if admin:
+        _attach_survey_fixes(run_uid, detail)
     markdown = render_run_markdown(detail)
     return current_app.response_class(
         markdown,
         mimetype="text/markdown; charset=utf-8",
         headers={"Content-Disposition": f'attachment; filename="survey-{run_uid[:8]}.md"'},
     )
+
+
+def _attach_survey_fixes(run_uid: str, detail: dict) -> None:
+    """
+    给报告附上修复运行：整体列表放在 detail["fixes"]，每条发现挂上自己的（finding["fixes"]）。
+
+    只对 Admin 调用：修复记录带着问题标题、作者与合并请求，属于正文一侧（ADR-0002）。
+    """
+    sections = ("findings", "resolved_findings", "unchecked_findings", "ignored_repo_findings")
+    # 四栏都要查：问题被合并请求修掉之后，下一轮正好落进「已消失」，那时最需要看到它对应的合并请求
+    issues = [item for key in sections for item in detail.get(key) or []]
+    fixes = repo.list_survey_fixes_for_issues(detail.get("survey_uid") or "", issues, stale_after_seconds=_stale_after())
+    detail["fixes"] = fixes
+    for key in sections:
+        attach_fixes(detail.get(key) or [], fixes)
+
+
+# 登记修复运行被拒绝时的响应
+_FIX_START_ERRORS = {
+    repo.FIX_START_NOT_FOUND: ("发现不存在", 404),
+    repo.FIX_START_IGNORED: ("这条发现已在忽略清单里", 409),
+    repo.FIX_START_NO_REPO: ("找不到这条发现所在仓库的地址", 409),
+    repo.FIX_START_BUSY: ("这个问题已有正在进行的修复", 409),
+}
+
+
+@admin_bp.route("/api/admin/survey-findings/<int:finding_id>/fix", methods=["POST"])
+@require_admin
+def api_fix_survey_finding(finding_id: int):
+    """
+    针对一条巡检发现发起修复：生成修改、本地验证、在代码平台上提出合并请求并指派处理人。
+
+    只有 Admin 能做，guest_retry 也不放开它：推分支、提合并请求都是对外部平台的写入。
+    修复在后台线程执行，接口登记完即返回 202。
+    """
+    unsupported = fix_unsupported_reason()
+    if unsupported:
+        return jsonify({"error": unsupported}), 400
+    outcome, run_uid = repo.start_survey_fix(finding_id)
+    if outcome != repo.FIX_START_OK:
+        message, status = _FIX_START_ERRORS[outcome]
+        return jsonify({"error": message}), status
+    execute_survey_fix_in_background(run_uid)
+    logger.info("Admin triggered survey fix: finding=%s fix=%s", finding_id, run_uid)
+    return jsonify({"run_uid": run_uid}), 202
+
+
+@admin_bp.route("/api/admin/survey-runs/<run_uid>/fix-all", methods=["POST"])
+@require_admin
+def api_fix_all_survey_run(run_uid: str):
+    """
+    一键全部修复：为这一轮尚未修复过、且不低于巡检配置的严重度门槛的问题批量发起修复，后台逐个执行。
+
+    只对该巡检最近一次成功的运行开放。每批有上限，返回本批排队的数量与候选总数，剩下的再点一次接着处理。
+    """
+    unsupported = fix_unsupported_reason()
+    if unsupported:
+        return jsonify({"error": unsupported}), 400
+    context = repo.get_survey_push_context(run_uid)
+    if context is None:
+        return jsonify({"error": "运行记录不存在"}), 404
+    if not context["is_latest_succeeded"]:
+        return jsonify({"error": "只能对该巡检最近一次成功的运行一键修复"}), 409
+    total = len(repo.list_survey_fix_candidates(run_uid, context["survey"]["fix_min_severity"]))
+    try:
+        batch = start_fix_batch(run_uid, FIX_TRIGGER_BATCH)
+    except FixBatchBusy as e:
+        return jsonify({"error": str(e)}), 409
+    logger.info("Admin triggered fix-all: run=%s queued=%s total=%s", run_uid, len(batch), total)
+    return jsonify({"queued": len(batch), "total": total}), 202
+
+
+@admin_bp.route("/api/admin/survey-fixes/<run_uid>", methods=["GET"])
+@require_admin
+def api_survey_fix_detail(run_uid: str):
+    """单次修复运行的完整记录：修改的 diff、每轮验证、原始作者与处理人、合并请求。"""
+    fix = repo.get_survey_fix(run_uid, stale_after_seconds=_stale_after())
+    if fix is None:
+        return jsonify({"error": "修复记录不存在"}), 404
+    fix.pop("survey_id", None)
+    return jsonify(fix)
+
+
+@admin_bp.route("/api/admin/survey-fixes/<run_uid>/interrupt", methods=["POST"])
+@require_admin
+def api_interrupt_survey_fix(run_uid: str):
+    """
+    确认一个疑似中断的修复运行已中断，记为失败，同一个问题随之可以重新发起修复。
+
+    同样只关闭记录：原运行若其实还活着、还没走到提交阶段，它不会再推分支或提合并请求；
+    已经在提交的那一步照常完成，推上去的分支与合并请求留在平台上。
+    """
+    outcome = repo.confirm_survey_fix_interrupted(run_uid, _stale_after())
+    return _interrupt_response(outcome, run_uid, "survey fix")
+
+
+def _parse_repo_owner_payload(payload: dict) -> tuple:
+    """校验仓库负责人配置的入参，返回 (路径, 用户名列表, 备注)。路径可以填整条仓库地址或组织地址。"""
+    raw_path = str(payload.get("path") or "").strip()
+    path = project_path_from_url(raw_path, load_gitlab_config().get("url", "")) if raw_path else ""
+    raw_names = payload.get("usernames")
+    if isinstance(raw_names, str):
+        raw_names = [part for part in raw_names.replace("，", ",").replace("\n", ",").split(",")]
+    if not isinstance(raw_names, list):
+        raise ValueError("usernames 必须是数组")
+    return path, [str(n) for n in raw_names], str(payload.get("note") or "")
+
+
+@admin_bp.route("/api/admin/repo-owners", methods=["GET"])
+@require_admin
+def api_repo_owners():
+    """仓库负责人配置。含具体的人，不对 Guest 开放。"""
+    return jsonify({"items": repo.list_repo_owners()})
+
+
+@admin_bp.route("/api/admin/repo-owners", methods=["POST"])
+@require_admin
+def api_add_repo_owner():
+    """新增一条仓库负责人配置；同一路径已有配置时覆盖它。"""
+    try:
+        path, usernames, note = _parse_repo_owner_payload(request.get_json(silent=True) or {})
+        item = repo.save_repo_owner(path, usernames, note)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify(item), 201
+
+
+@admin_bp.route("/api/admin/repo-owners/<int:owner_id>", methods=["PATCH"])
+@require_admin
+def api_update_repo_owner(owner_id: int):
+    """修改一条仓库负责人配置。"""
+    try:
+        path, usernames, note = _parse_repo_owner_payload(request.get_json(silent=True) or {})
+        item = repo.save_repo_owner(path, usernames, note, owner_id=owner_id)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    if item is None:
+        return jsonify({"error": "配置不存在"}), 404
+    return jsonify(item)
+
+
+@admin_bp.route("/api/admin/repo-owners/<int:owner_id>", methods=["DELETE"])
+@require_admin
+def api_delete_repo_owner(owner_id: int):
+    """删除一条仓库负责人配置。之后这个仓库的负责人按项目权限推断。"""
+    return jsonify({"removed": repo.delete_repo_owner(owner_id)})
 
 
 @admin_bp.route("/api/admin/survey-stats", methods=["GET"])

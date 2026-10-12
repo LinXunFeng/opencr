@@ -16,6 +16,8 @@ from sqlalchemy import delete, func, select, text, update
 from .db import session_scope
 from .models import (
     DELIVERY_SUMMARY_ONLY,
+    FIX_MIN_SEVERITIES,
+    FIX_TRIGGER_MANUAL,
     ERROR_INTERRUPTED,
     ERROR_REVIEW,
     ERROR_UNEXPECTED,
@@ -30,6 +32,7 @@ from .models import (
     RUN_SUCCEEDED,
     SETTLED_VERDICTS,
     SEVERITY_UNKNOWN,
+    SEVERITY_WARNING,
     TRACKABLE_DELIVERIES,
     VERDICT_ACCEPTED,
     VERDICT_UNDECIDED,
@@ -297,7 +300,7 @@ INTERRUPT_NOT_STALE = "not_stale"
 
 def _confirm_interrupted(model, run_uid: str, stale_after_seconds: int) -> str:
     """
-    把一个 Stale 运行记为失败（已确认中断），ReviewRun 与 SurveyRun 共用。
+    把一个 Stale 运行记为失败（已确认中断），ReviewRun、SurveyRun 与修复运行（SurveyFix）共用。
 
     返回 INTERRUPT_OK、INTERRUPT_NOT_FOUND 或 INTERRUPT_NOT_STALE。阶段与最后心跳保留原值，
     它们是"卡在哪一步、何时失联"的唯一线索。
@@ -475,6 +478,15 @@ def list_mrs_pending_settlement(limit: int = 50) -> List[dict]:
 # 后台查询
 # --------------------------------------------------------------------------
 
+def _is_stale(run, stale_after_seconds: int) -> bool:
+    """一条运行记录（ReviewRun、SurveyRun 或修复运行）是否疑似中断：仍在进行中，但心跳已超过阈值。"""
+    return (
+        run.status == RUN_RUNNING
+        and run.heartbeat_at is not None
+        and (utcnow() - run.heartbeat_at) > timedelta(seconds=stale_after_seconds)
+    )
+
+
 def _run_to_dict(run: ReviewRun, stale_after_seconds: int = 600) -> dict:
     """
     把 ReviewRun 转成可直接返回给前端的字典。
@@ -491,11 +503,7 @@ def _run_to_dict(run: ReviewRun, stale_after_seconds: int = 600) -> dict:
     except (ValueError, TypeError):
         skills = []
 
-    is_stale = (
-        run.status == RUN_RUNNING
-        and run.heartbeat_at is not None
-        and (utcnow() - run.heartbeat_at) > timedelta(seconds=stale_after_seconds)
-    )
+    is_stale = _is_stale(run, stale_after_seconds)
     return {
         "run_uid": run.run_uid,
         "project_id": run.project_id,
@@ -756,6 +764,31 @@ def acquire_lease(name: str, holder: str, ttl_seconds: int) -> bool:
         return False
 
 
+def try_acquire_lease(name: str, holder: str, ttl_seconds: int) -> bool:
+    """
+    acquire_lease 的不抛异常版本：两个进程同时首次抢同一个租约时，后插入的那个会撞主键，按"没抢到"处理。
+    """
+    try:
+        return acquire_lease(name, holder, ttl_seconds)
+    except Exception:
+        # 主键冲突说明别人刚抢到；其他数据库错误同样按没抢到处理，后果只是这一次不执行
+        logger.warning("Acquiring lease failed: name=%s", name, exc_info=True)
+        return False
+
+
+def release_lease(name: str, holder: str) -> None:
+    """释放自己持有的租约。别人已经接手（我们的租约过期后被抢走）时不动它。"""
+    with session_scope() as session:
+        session.execute(delete(LeaderLease).where(LeaderLease.name == name, LeaderLease.holder == holder))
+
+
+def lease_active(name: str) -> bool:
+    """这个租约当前是否被人持有且未过期。"""
+    with session_scope() as session:
+        lease = session.get(LeaderLease, name)
+        return lease is not None and lease.expires_at > utcnow()
+
+
 # --------------------------------------------------------------------------
 # 运行期设置
 # --------------------------------------------------------------------------
@@ -993,6 +1026,8 @@ def _survey_to_dict(survey: "Survey") -> dict:
         "budget_l2_max_focus": survey.budget_l2_max_focus,
         "budget_index_timeout_seconds": survey.budget_index_timeout_seconds,
         "retention_runs": survey.retention_runs,
+        "fix_mode": survey.fix_mode,
+        "fix_min_severity": survey.fix_min_severity,
         "last_run_at": survey.last_run_at.isoformat() if survey.last_run_at else "",
         "next_run_at": survey.next_run_at.isoformat() if survey.next_run_at else "",
         "created_at": survey.created_at.isoformat() if survey.created_at else "",
@@ -1081,7 +1116,7 @@ def create_survey(
     **options,
 ) -> dict:
     """新建一个巡检配置，返回它的完整数据。bindings 为 [{destination, target}]，target 须已规整。"""
-    from .models import Survey, SurveySource
+    from .models import FIX_MODE_MANUAL, Survey, SurveySource
 
     survey_uid = str(uuid.uuid4())
     with session_scope() as session:
@@ -1101,6 +1136,8 @@ def create_survey(
             budget_l2_max_focus=options.get("budget_l2_max_focus"),
             budget_index_timeout_seconds=options.get("budget_index_timeout_seconds"),
             retention_runs=int(options.get("retention_runs") or 20),
+            fix_mode=options.get("fix_mode") or FIX_MODE_MANUAL,
+            fix_min_severity=options.get("fix_min_severity") or SEVERITY_WARNING,
         )
         session.add(survey)
         session.flush()
@@ -1655,11 +1692,7 @@ def _survey_run_to_dict(run: "SurveyRun", stale_after_seconds: int = 600) -> dic
     except (ValueError, TypeError):
         codegraph_stats = None
 
-    is_stale = (
-        run.status == RUN_RUNNING
-        and run.heartbeat_at is not None
-        and (utcnow() - run.heartbeat_at) > timedelta(seconds=stale_after_seconds)
-    )
+    is_stale = _is_stale(run, stale_after_seconds)
     return {
         "run_uid": run.run_uid,
         "trigger": run.trigger,
@@ -2741,3 +2774,431 @@ def list_survey_pushes(run_uid: str, include_detail: bool) -> List[dict]:
                 item["error_message"] = p.error_message or ""
             items.append(item)
         return items
+
+
+# --------------------------------------------------------------------------
+# SurveyFix（修复运行）
+# --------------------------------------------------------------------------
+
+# 登记修复运行的结果
+FIX_START_OK = "ok"
+FIX_START_NOT_FOUND = "not_found"
+FIX_START_IGNORED = "ignored"
+FIX_START_NO_REPO = "no_repo"
+FIX_START_BUSY = "busy"
+# 只给从没修复过的问题发起时（一键全部修复、巡检后自动发起），这个问题已经有过修复记录
+FIX_START_EXISTS = "exists"
+
+# 严重度从高到低的次序，用于批量修复的门槛与排序。unknown 不在其中：模型没按格式给出严重度的问题，
+# 判断不了够不够格，批量时一律不处理，需要的话由人单条发起
+_FIX_SEVERITY_RANK = {severity: len(FIX_MIN_SEVERITIES) - i for i, severity in enumerate(FIX_MIN_SEVERITIES)}
+
+# 合并请求的 diff 最多存多少字符。修复只改一个文件，正常远小于此；超出说明模型改动失控，截断后照样能看出问题
+SURVEY_FIX_DIFF_MAX = 200_000
+
+
+def start_survey_fix(finding_id: int, trigger: str = FIX_TRIGGER_MANUAL, only_new: bool = False) -> tuple:
+    """
+    为一条巡检发现登记一次修复运行，返回 (结果, run_uid)。结果取 FIX_START_* 之一，非 ok 时 run_uid 为空串。
+
+    only_new=True（一键全部修复、巡检后自动发起）时，这个问题有过任何修复记录都不再发起：成功的已经有合并请求，
+    失败或未修改的重复发起大概率是同一个结果，只会每轮多烧几次模型调用、多推几个分支。要重试由人单条发起。
+    判断放在同一个写锁里：两批同时跑时，先后选出的候选可能重叠，挑候选那一刻的判断挡不住重复。
+
+    同一个问题（同巡检、同指纹、标题规整后相同）已有进行中的修复时拒绝：两次并行会提出两个一样的合并请求。
+    这个问题在后续运行里是另一条发现，所以不按 finding_id 判断。疑似中断的也算进行中，与 SurveyRun 的口径一致，
+    要先确认中断才能重新发起。检查与登记放在同一个写锁里，挡住跨 worker 的并发点击。
+    """
+    from ..survey.common import issue_key
+    from .models import FIX_PHASE_FETCHING, SurveyFinding, SurveyFix, SurveyRunRepo
+
+    with session_scope() as session:
+        session.execute(text("BEGIN IMMEDIATE"))
+        finding = session.get(SurveyFinding, int(finding_id))
+        if finding is None:
+            return FIX_START_NOT_FOUND, ""
+        if finding.ignore_id is not None:
+            # 用户说过不再提醒的问题，界面上已经隐藏；绕过界面直接发起也不受理
+            return FIX_START_IGNORED, ""
+        repo_row = session.scalar(
+            select(SurveyRunRepo).where(
+                SurveyRunRepo.run_id == finding.run_id, SurveyRunRepo.repo_slug == finding.repo_slug
+            ).limit(1)
+        )
+        if repo_row is None or not repo_row.url or not finding.file_path:
+            return FIX_START_NO_REPO, ""
+
+        key = issue_key(finding.fingerprint, finding.title)
+        previous = [
+            item for item in session.scalars(
+                select(SurveyFix).where(
+                    SurveyFix.survey_id == finding.survey_id, SurveyFix.fingerprint == finding.fingerprint
+                )
+            ).all()
+            # 标题为空时认不出是不是同一个问题，只按 finding_id 判断，免得把同文件同类的另一个问题挡掉
+            if item.finding_id == finding.id or (key[1] and issue_key(item.fingerprint, item.title) == key)
+        ]
+        if any(item.status == RUN_RUNNING for item in previous):
+            return FIX_START_BUSY, ""
+        if only_new and previous:
+            return FIX_START_EXISTS, ""
+
+        run_uid = str(uuid.uuid4())
+        now = utcnow()
+        session.add(
+            SurveyFix(
+                run_uid=run_uid,
+                survey_id=finding.survey_id,
+                finding_id=finding.id,
+                fingerprint=finding.fingerprint,
+                repo_slug=finding.repo_slug,
+                file_path=finding.file_path,
+                line=finding.line,
+                category=finding.category,
+                severity=finding.severity,
+                title=finding.title,
+                body=finding.body,
+                repo_url=repo_row.url,
+                target_branch=repo_row.branch or "",
+                trigger=trigger,
+                status=RUN_RUNNING,
+                phase=FIX_PHASE_FETCHING,
+                started_at=now,
+                heartbeat_at=now,
+            )
+        )
+        return FIX_START_OK, run_uid
+
+
+def update_survey_fix(run_uid: str, **values) -> bool:
+    """改写进行中的修复运行的字段并刷新心跳，返回是否改写了。已结束（含已确认中断）的不再改写。"""
+    from .models import SurveyFix
+
+    values["heartbeat_at"] = utcnow()
+    if "diff" in values:
+        values["diff"] = str(values["diff"] or "")[:SURVEY_FIX_DIFF_MAX]
+    if "verification" in values and not isinstance(values["verification"], str):
+        values["verification"] = json.dumps(values["verification"], ensure_ascii=False)
+    with session_scope() as session:
+        result = session.execute(
+            update(SurveyFix)
+            .where(SurveyFix.run_uid == run_uid, SurveyFix.status == RUN_RUNNING)
+            .values(**values)
+        )
+        return result.rowcount > 0
+
+
+def finish_survey_fix(run_uid: str, status: str, error_kind: str = "", error_message: str = "") -> bool:
+    """
+    收尾一次修复运行，返回是否由本次调用收尾。
+
+    与 finish_survey_run 同理只收尾仍在进行中的。返回 False 说明它已被确认中断，
+    调用方不能再拿它的结果去触发推送。
+    """
+    from .models import FIX_PHASE_DONE, SurveyFix
+
+    now = utcnow()
+    values: Dict[str, object] = {"status": status, "phase": FIX_PHASE_DONE, "heartbeat_at": now, "finished_at": now}
+    if error_kind:
+        values["error_kind"] = error_kind
+    if error_message:
+        values["error_message"] = str(error_message)[:4000]
+    with session_scope() as session:
+        result = session.execute(
+            update(SurveyFix)
+            .where(SurveyFix.run_uid == run_uid, SurveyFix.status == RUN_RUNNING)
+            .values(**values)
+        )
+        return result.rowcount > 0
+
+
+def confirm_survey_fix_interrupted(run_uid: str, stale_after_seconds: int) -> str:
+    """确认一个 Stale 的修复运行已中断。返回值见 ``_confirm_interrupted``。"""
+    from .models import SurveyFix
+
+    return _confirm_interrupted(SurveyFix, run_uid, stale_after_seconds)
+
+
+def _survey_fix_to_dict(fix: "SurveyFix", stale_after_seconds: int, include_detail: bool) -> dict:
+    """
+    修复运行的接口数据。整条都属于正文一侧（标题、作者、合并请求），只对 Admin 返回。
+
+    include_detail=False 时省掉 diff、验证过程与原问题正文，用于列表。
+    """
+    is_stale = _is_stale(fix, stale_after_seconds)
+    item = {
+        "run_uid": fix.run_uid,
+        "finding_id": fix.finding_id,
+        "fingerprint": fix.fingerprint,
+        "repo_slug": fix.repo_slug,
+        "file_path": fix.file_path or "",
+        "line": fix.line,
+        "category": fix.category,
+        "severity": fix.severity,
+        "title": fix.title or "",
+        "target_branch": fix.target_branch or "",
+        "source_branch": fix.source_branch or "",
+        "trigger": fix.trigger,
+        "status": fix.status,
+        "phase": fix.phase or "",
+        "is_stale": is_stale,
+        "error_kind": fix.error_kind or "",
+        "error_message": fix.error_message or "",
+        "author_name": fix.author_name or "",
+        "author_email": fix.author_email or "",
+        "assignee_source": fix.assignee_source or "",
+        "assignee_username": fix.assignee_username or "",
+        "assignee_name": fix.assignee_name or "",
+        "assignee_note": fix.assignee_note or "",
+        "mr_iid": fix.mr_iid,
+        "mr_url": fix.mr_url or "",
+        "started_at": fix.started_at.isoformat() if fix.started_at else "",
+        "finished_at": fix.finished_at.isoformat() if fix.finished_at else "",
+    }
+    if include_detail:
+        try:
+            verification = json.loads(fix.verification) if fix.verification else []
+        except (ValueError, TypeError):
+            verification = []
+        item.update({
+            "body": fix.body or "",
+            "base_sha": fix.base_sha or "",
+            "summary": fix.summary or "",
+            "diff": fix.diff or "",
+            "verification": verification if isinstance(verification, list) else [],
+            "heartbeat_at": fix.heartbeat_at.isoformat() if fix.heartbeat_at else "",
+        })
+    return item
+
+
+def get_survey_fix(run_uid: str, stale_after_seconds: int = 600) -> Optional[dict]:
+    """单次修复运行的完整记录，附带所属巡检的标识与时区；不存在返回 None。"""
+    from .models import Survey, SurveyFix
+
+    with session_scope() as session:
+        fix = session.scalar(select(SurveyFix).where(SurveyFix.run_uid == run_uid))
+        if fix is None:
+            return None
+        survey = session.get(Survey, fix.survey_id)
+        item = _survey_fix_to_dict(fix, stale_after_seconds, include_detail=True)
+        item["survey_id"] = fix.survey_id
+        item["survey_uid"] = survey.survey_uid if survey else ""
+        item["survey_name"] = survey.name if survey else ""
+        item["repo_url"] = fix.repo_url
+        return item
+
+
+def list_survey_fixes_for_issues(survey_uid: str, issues: List[dict], stale_after_seconds: int = 600) -> List[dict]:
+    """
+    针对报告里这些问题发起过的全部修复运行，按发起时间倒序。issues 是报告里的发现（含 id、fingerprint、title）。
+
+    认"同一个问题"的口径与 survey.fix.attach_fixes 一致：finding_id 相同，或同指纹且标题规整后相同。
+    只按指纹的话，同一文件同一类别里另一个问题（包括已被忽略的问题）的修复也会列进来。
+    上一轮发起的修复，这一轮问题仍存在时是另一条发现，按标题才认得出来。
+    """
+    from ..survey.common import issue_key
+    from .models import Survey, SurveyFix
+
+    if not issues:
+        return []
+    finding_ids = {item.get("id") for item in issues}
+    keys = {issue_key(item.get("fingerprint"), item.get("title")) for item in issues}
+    keys = {key for key in keys if key[1]}
+    with session_scope() as session:
+        survey_id = session.scalar(select(Survey.id).where(Survey.survey_uid == survey_uid))
+        if survey_id is None:
+            return []
+        rows = session.scalars(
+            select(SurveyFix)
+            .where(
+                SurveyFix.survey_id == survey_id,
+                SurveyFix.fingerprint.in_({item.get("fingerprint") for item in issues}),
+            )
+            .order_by(SurveyFix.id.desc())
+        ).all()
+        return [
+            _survey_fix_to_dict(f, stale_after_seconds, include_detail=False)
+            for f in rows
+            if f.finding_id in finding_ids or issue_key(f.fingerprint, f.title) in keys
+        ]
+
+
+def survey_fix_links(survey_id: int) -> Dict[str, List[str]]:
+    """
+    一个巡检下每个指纹已提出的修复合并请求链接，按发起时间排列。供台账镜像使用。
+
+    只收已提出合并请求的：失败与跳过的没有链接可附，进行中的还没有结果。
+    """
+    from .models import SurveyFix
+
+    links: Dict[str, List[str]] = {}
+    with session_scope() as session:
+        rows = session.execute(
+            select(SurveyFix.fingerprint, SurveyFix.mr_url)
+            .where(SurveyFix.survey_id == int(survey_id), SurveyFix.status == RUN_SUCCEEDED)
+            .order_by(SurveyFix.id.asc())
+        ).all()
+    for fingerprint, url in rows:
+        if url and url not in links.setdefault(fingerprint, []):
+            links[fingerprint].append(url)
+    return links
+
+
+def latest_succeeded_survey_run_uid(survey_id: int) -> str:
+    """该巡检最近一次成功运行的 run_uid；没有时返回空串。"""
+    from .models import SurveyRun
+
+    with session_scope() as session:
+        uid = session.scalar(
+            select(SurveyRun.run_uid)
+            .where(SurveyRun.survey_id == int(survey_id), SurveyRun.status == RUN_SUCCEEDED)
+            .order_by(SurveyRun.id.desc())
+            .limit(1)
+        )
+    return uid or ""
+
+
+def list_survey_fix_candidates(run_uid: str, min_severity: str) -> List[int]:
+    """
+    一键全部修复与巡检后自动发起的修复要处理的发现 id，按优先级排好：严重度高的在前，同级时本轮新增的在前。
+
+    只取这一轮可见的发现（被忽略的不算），严重度不低于 min_severity，且这个问题从没有过修复记录；
+    同一个问题在这一轮被报了几遍时只取一条。是否有过修复在登记时还会在写锁里再判断一次（only_new），
+    这里先剔除是为了让返回的数量对得上实际会发起的数量。
+    """
+    from ..survey.common import issue_key
+    from .models import FINDING_STATE_NEW, SurveyFinding, SurveyFix, SurveyRun
+
+    threshold = _FIX_SEVERITY_RANK.get(str(min_severity or "").strip().lower(), _FIX_SEVERITY_RANK[SEVERITY_WARNING])
+    with session_scope() as session:
+        run = session.scalar(select(SurveyRun).where(SurveyRun.run_uid == run_uid))
+        if run is None:
+            return []
+        findings = session.scalars(
+            select(SurveyFinding).where(SurveyFinding.run_id == run.id, _survey_finding_not_ignored())
+        ).all()
+        fixes = session.execute(
+            select(SurveyFix.finding_id, SurveyFix.fingerprint, SurveyFix.title).where(
+                SurveyFix.survey_id == run.survey_id
+            )
+        ).all()
+    fixed_ids = {row.finding_id for row in fixes if row.finding_id is not None}
+    fixed_keys = {issue_key(row.fingerprint, row.title) for row in fixes if issue_key(row.fingerprint, row.title)[1]}
+
+    picked: List = []
+    seen_keys = set()
+    for finding in findings:
+        if _FIX_SEVERITY_RANK.get(finding.severity, 0) < threshold or not finding.file_path:
+            continue
+        key = issue_key(finding.fingerprint, finding.title)
+        if finding.id in fixed_ids or (key[1] and (key in fixed_keys or key in seen_keys)):
+            continue
+        if key[1]:
+            seen_keys.add(key)
+        picked.append(finding)
+    picked.sort(key=lambda f: (-_FIX_SEVERITY_RANK.get(f.severity, 0), f.state != FINDING_STATE_NEW, f.id))
+    return [f.id for f in picked]
+
+
+# --------------------------------------------------------------------------
+# RepoOwner（仓库负责人配置）
+# --------------------------------------------------------------------------
+
+REPO_OWNER_NOTE_MAX = 2000
+
+
+def normalize_owner_path(raw: str) -> str:
+    """
+    把填写的项目或组织路径规整成比对用的形式：小写、去掉首尾斜杠与 .git 后缀。
+
+    平台上的路径大小写不敏感；填整条地址的情况由调用方先剥成路径（见 survey.fix.project_path_from_url）。
+    """
+    text = str(raw or "").strip().strip("/").lower()
+    return text[:-4] if text.endswith(".git") else text
+
+
+def _repo_owner_to_dict(owner: "RepoOwner") -> dict:
+    """仓库负责人配置的接口数据。"""
+    try:
+        usernames = json.loads(owner.usernames or "[]")
+    except (ValueError, TypeError):
+        usernames = []
+    return {
+        "id": owner.id,
+        "path": owner.path,
+        "usernames": usernames if isinstance(usernames, list) else [],
+        "note": owner.note or "",
+        "created_at": owner.created_at.isoformat() if owner.created_at else "",
+        "updated_at": owner.updated_at.isoformat() if owner.updated_at else "",
+    }
+
+
+def list_repo_owners() -> List[dict]:
+    """全部仓库负责人配置，按路径排序：组织与它下面的项目排在一起，方便看出谁覆盖了谁。"""
+    from .models import RepoOwner
+
+    with session_scope() as session:
+        rows = session.scalars(select(RepoOwner).order_by(RepoOwner.path.asc())).all()
+        return [_repo_owner_to_dict(r) for r in rows]
+
+
+def save_repo_owner(path: str, usernames: List[str], note: str = "", owner_id: Optional[int] = None) -> Optional[dict]:
+    """
+    新增或修改一条仓库负责人配置，返回保存后的数据。
+
+    owner_id 为空时按路径新增，路径已存在则覆盖它的负责人与备注（同一个路径只有一条，不会出现两条互相打架）；
+    owner_id 不存在时返回 None。路径与别的配置冲突时抛 ValueError。
+    """
+    from .models import RepoOwner
+
+    normalized = normalize_owner_path(path)
+    names = [str(n).strip().lstrip("@") for n in usernames or [] if str(n).strip().lstrip("@")]
+    if not normalized:
+        raise ValueError("路径不能为空")
+    if not names:
+        raise ValueError("至少填写一个负责人")
+    with session_scope() as session:
+        same_path = session.scalar(select(RepoOwner).where(RepoOwner.path == normalized))
+        if owner_id is None:
+            owner = same_path or RepoOwner(path=normalized, created_at=utcnow())
+        else:
+            owner = session.get(RepoOwner, int(owner_id))
+            if owner is None:
+                return None
+            if same_path is not None and same_path.id != owner.id:
+                raise ValueError(f"已有路径为 {normalized} 的配置")
+        owner.path = normalized
+        # 保持填写顺序去重：顺序就是优先级
+        owner.usernames = json.dumps(list(dict.fromkeys(names)), ensure_ascii=False)
+        owner.note = (note or "").strip()[:REPO_OWNER_NOTE_MAX] or None
+        owner.updated_at = utcnow()
+        session.add(owner)
+        session.flush()
+        return _repo_owner_to_dict(owner)
+
+
+def delete_repo_owner(owner_id: int) -> bool:
+    """删除一条仓库负责人配置。返回是否真的删掉了。"""
+    from .models import RepoOwner
+
+    with session_scope() as session:
+        return session.execute(delete(RepoOwner).where(RepoOwner.id == int(owner_id))).rowcount > 0
+
+
+def find_repo_owner(project_path: str) -> Optional[dict]:
+    """
+    一个项目适用的仓库负责人配置：路径等于项目路径、或是它的上级组织路径的配置里，路径最长的那条。没有时返回 None。
+    """
+    from .models import RepoOwner
+
+    target = normalize_owner_path(project_path)
+    if not target:
+        return None
+    parts = target.split("/")
+    candidates = ["/".join(parts[:n]) for n in range(len(parts), 0, -1)]
+    with session_scope() as session:
+        rows = {r.path: r for r in session.scalars(select(RepoOwner).where(RepoOwner.path.in_(candidates))).all()}
+        for path in candidates:
+            if path in rows:
+                return _repo_owner_to_dict(rows[path])
+    return None

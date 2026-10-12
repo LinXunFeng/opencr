@@ -78,13 +78,15 @@ def _git_env(token: str) -> Dict[str, str]:
     return env
 
 
-def _run_git(args: List[str], cwd: Optional[Path], token: str, timeout: int) -> subprocess.CompletedProcess:
+def _run_git(
+    args: List[str], cwd: Optional[Path], token: str, timeout: int, extra_env: Optional[Dict[str, str]] = None
+) -> subprocess.CompletedProcess:
     """执行一条 git 命令；失败时抛 SurveyError，错误信息里剥掉可能的凭据。"""
     try:
         completed = subprocess.run(
             ["git", *args],
             cwd=str(cwd) if cwd else None,
-            env=_git_env(token),
+            env={**_git_env(token), **(extra_env or {})},
             capture_output=True,
             text=True,
             timeout=max(int(timeout), 1),
@@ -218,3 +220,197 @@ def workspace_size_bytes(survey_slug: str) -> int:
         except OSError:
             continue
     return total
+
+
+# ---------------------------------------------------------------------------
+# 修复运行（FixRun）的工作区
+# ---------------------------------------------------------------------------
+
+# 修复工作区放在工作区根目录下的这个子目录里。以点开头：Survey 的 slug 只含 [a-z0-9-]，不会撞名
+FIX_WORKSPACE_DIRNAME = ".fixes"
+# 修复提交的作者。用固定的服务身份而不是借用某个人的名字：提交历史里要一眼看得出这是机器提出的修改
+FIX_COMMIT_AUTHOR = ("OpenCR", "opencr@noreply.invalid")
+# 仓库自带的格式化提交清单（git blame 的通行约定），里面的提交在追溯原始作者时一并跳过
+BLAME_IGNORE_REVS_FILE = ".git-blame-ignore-revs"
+# 最多认多少条 .git-blame-ignore-revs。每条都要一次 rev-parse，几百条已经覆盖绝大多数仓库，
+# 再多的清单通常是脚本生成的、混着大量别的分支上的提交
+_MAX_IGNORE_REVS = 200
+
+
+def fix_workspace_dir(run_uid: str) -> Path:
+    """
+    单次修复运行的工作区目录。
+
+    不复用 Survey 的工作区：那里的仓库是浅克隆、每轮都会被 reset 与 clean，
+    巡检与修复同时进行时，一边的改动会被另一边清掉；追溯原始作者也需要历史，浅克隆里没有。
+    """
+    safe = slugify(run_uid, fallback="fix")
+    return workspace_root() / FIX_WORKSPACE_DIRNAME / safe
+
+
+def prepare_fix_repo(run_uid: str, url: str, branch: str = "", timeout: int = 600) -> Tuple[Path, str, str]:
+    """
+    为一次修复克隆仓库，返回 (工作区路径, 实际分支, commit sha)。
+
+    用 --filter=blob:none 而不是浅克隆：追溯原始作者要走提交历史，浅克隆只有一个提交；
+    全量克隆又要把所有历史文件内容都拉下来。无文件内容的部分克隆只拉提交与目录树，
+    blame 用到哪个文件的历史版本才按需取回。
+    """
+    token = load_gitlab_config().get("token", "")
+    repo_dir = fix_workspace_dir(run_uid)
+    if repo_dir.exists():
+        shutil.rmtree(repo_dir, ignore_errors=True)
+    repo_dir.parent.mkdir(parents=True, exist_ok=True)
+
+    args = ["clone", "--filter=blob:none", "--single-branch", "--no-tags"]
+    if branch:
+        args += ["--branch", branch]
+    args += [url, str(repo_dir)]
+    _run_git(args, repo_dir.parent, token, timeout)
+
+    actual_branch = branch or _run_git(
+        ["rev-parse", "--abbrev-ref", "HEAD"], repo_dir, token, timeout
+    ).stdout.strip()
+    sha = _run_git(["rev-parse", "HEAD"], repo_dir, token, timeout).stdout.strip()
+    return repo_dir, actual_branch, sha
+
+
+def read_blame_ignore_revs(repo_dir: Path, timeout: int = 60) -> List[str]:
+    """
+    读取仓库自带的 .git-blame-ignore-revs，只返回本地能解析成提交的条目。
+
+    不直接把文件交给 --ignore-revs-file：里面常有别的分支上的提交，单分支克隆里解析不到，
+    git 会因为一条无效条目让整个 blame 失败。
+    """
+    path = repo_dir / BLAME_IGNORE_REVS_FILE
+    # 符号链接可能指向仓库外的任意文件，不跟随
+    if path.is_symlink() or not path.is_file():
+        return []
+    token = load_gitlab_config().get("token", "")
+    revs: List[str] = []
+    for raw in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        candidate = raw.split("#", 1)[0].strip()
+        if not candidate:
+            continue
+        try:
+            resolved = _run_git(
+                ["rev-parse", "--verify", "--quiet", f"{candidate}^{{commit}}"], repo_dir, token, timeout
+            ).stdout.strip()
+        except SurveyError:
+            # 解析不到（多半是别的分支上的提交）就跳过，代价是这个格式化提交若出现在本分支历史里，仍要靠逐行判断认出它
+            continue
+        if resolved:
+            revs.append(resolved)
+        if len(revs) >= _MAX_IGNORE_REVS:
+            break
+    return revs
+
+
+def parse_blame_porcelain(text: str) -> List[dict]:
+    """
+    解析 `git blame --line-porcelain` 的输出，每行一项：
+    {"sha", "line", "orig_line", "author_name", "author_email", "author_time", "filename", "previous_sha",
+    "previous_filename"}。
+
+    line 是这一行在被 blame 的版本里的行号，orig_line 是它在归到的那个提交（sha）的 filename 里的行号；
+    previous_* 是这一行在该提交之前所在的提交与文件名，文件在该提交里首次出现时为空串。
+    """
+    entries: List[dict] = []
+    current: Optional[dict] = None
+    for raw in text.splitlines():
+        if raw.startswith("\t"):
+            if current is not None:
+                entries.append(current)
+            current = None
+            continue
+        parts = raw.split(" ")
+        if current is None:
+            if len(parts) >= 3 and len(parts[0]) >= 40:
+                current = {
+                    "sha": parts[0],
+                    "line": int(parts[2]) if parts[2].isdigit() else 0,
+                    "orig_line": int(parts[1]) if parts[1].isdigit() else 0,
+                    "author_name": "",
+                    "author_email": "",
+                    "author_time": 0,
+                    "filename": "",
+                    "previous_sha": "",
+                    "previous_filename": "",
+                }
+            continue
+        key, _, value = raw.partition(" ")
+        if key == "author":
+            current["author_name"] = value.strip()
+        elif key == "author-mail":
+            current["author_email"] = value.strip().strip("<>").strip()
+        elif key == "author-time":
+            current["author_time"] = int(value) if value.strip().isdigit() else 0
+        elif key == "filename":
+            current["filename"] = value
+        elif key == "previous":
+            prev_sha, _, prev_name = value.partition(" ")
+            current["previous_sha"] = prev_sha
+            current["previous_filename"] = prev_name
+    return entries
+
+
+def git_blame(
+    repo_dir: Path, file_path: str, ranges: List[Tuple[int, int]], ignore_revs: List[str], timeout: int = 300
+) -> List[dict]:
+    """
+    对文件的若干行区间做 blame，返回 parse_blame_porcelain 的结果。
+
+    -w 忽略只改空白的提交；-M 跟随文件内的代码移动 —— 把一段代码挪了个位置的人不是写它的人。
+    不加跨文件的 -C：它要把每个提交里其他被改动的文件也读一遍，部分克隆下每读一个历史版本就是一次网络请求，
+    历史长的仓库会拖到超时，结果是几乎总退回仓库负责人。代价是从别的文件整段搬来的代码会归给搬运的人。
+    """
+    if not ranges:
+        return []
+    token = load_gitlab_config().get("token", "")
+    args = ["blame", "--line-porcelain", "-w", "-M"]
+    for rev in ignore_revs:
+        args += ["--ignore-rev", rev]
+    for start, end in ranges:
+        args += ["-L", f"{int(start)},{int(end)}"]
+    args += ["HEAD", "--", file_path]
+    return parse_blame_porcelain(_run_git(args, repo_dir, token, timeout).stdout)
+
+
+def git_show_file(repo_dir: Path, rev: str, file_path: str, timeout: int = 120) -> Optional[str]:
+    """读取某个提交里的文件内容；文件在那个提交里不存在时返回 None。"""
+    token = load_gitlab_config().get("token", "")
+    try:
+        return _run_git(["show", f"{rev}:{file_path}"], repo_dir, token, timeout).stdout
+    except SurveyError:
+        return None
+
+
+def commit_and_push_fix(repo_dir: Path, file_path: str, source_branch: str, message: str, timeout: int = 600) -> str:
+    """
+    把对单个文件的修改提交到新分支并推送，返回新提交的 sha。
+
+    只 add 这一个文件：修复只允许改发现所在的文件，工作区里别的变化（例如 blame 时生成的东西）一概不进提交。
+    """
+    token = load_gitlab_config().get("token", "")
+    name, email = FIX_COMMIT_AUTHOR
+    identity = {
+        "GIT_AUTHOR_NAME": name,
+        "GIT_AUTHOR_EMAIL": email,
+        "GIT_COMMITTER_NAME": name,
+        "GIT_COMMITTER_EMAIL": email,
+    }
+    _run_git(["checkout", "-b", source_branch], repo_dir, token, timeout)
+    _run_git(["add", "--", file_path], repo_dir, token, timeout)
+    _run_git(["commit", "--no-verify", "-m", message], repo_dir, token, timeout, extra_env=identity)
+    _run_git(["push", "origin", f"HEAD:refs/heads/{source_branch}"], repo_dir, token, timeout)
+    return _run_git(["rev-parse", "HEAD"], repo_dir, token, timeout).stdout.strip()
+
+
+def delete_fix_workspace(run_uid: str) -> None:
+    """删除一次修复运行的工作区。修复工作区不复用，做完即删，失败只记日志。"""
+    target = fix_workspace_dir(run_uid)
+    if not target.exists():
+        return
+    shutil.rmtree(target, ignore_errors=True)
+    if target.exists():
+        logger.warning("Fix workspace not fully removed: %s", target)

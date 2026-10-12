@@ -66,6 +66,9 @@ LEDGER_COLUMNS = (
     Column("first_seen", "首次发现", COLUMN_DATETIME),
     Column("last_seen", "最近发现", COLUMN_DATETIME),
     Column("count", "同类条数", COLUMN_NUMBER),
+    # 这一行下已提出的修复合并请求，一行一个链接。合并请求是按问题提的，一行（指纹）可能有好几个。
+    # 不用 url 类型：url 列只能放一个链接
+    Column("fix_links", "修复合并请求", COLUMN_LONG_TEXT),
 )
 LINK_COLUMN = Column("link", "运行详情", COLUMN_URL)
 
@@ -325,10 +328,17 @@ def _to_zone(value: Optional[datetime], zone) -> Optional[datetime]:
 
 
 def build_ledger_rows(
-    survey: dict, entries: List[dict], public_url: str, first_push: bool
+    survey: dict,
+    entries: List[dict],
+    public_url: str,
+    first_push: bool,
+    fix_links: Optional[Dict[str, List[str]]] = None,
 ) -> List[LedgerRow]:
     """
     把 Ledger 条目转成镜像行。
+
+    fix_links：指纹 → 已提出的修复合并请求链接（repo.survey_fix_links）。提了合并请求不改变行的状态，
+    只是把链接带上；状态仍然只由后续 SurveyRun 的复核决定。
 
     first_push：该 Binding 是否从未成功推送过。
     - 从未推送过 = 这是一张新表，所有行都要写进去（包括本轮未发现与已忽略）；
@@ -354,6 +364,7 @@ def build_ledger_rows(
             "first_seen": _to_zone(entry.get("first_seen_at"), zone),
             "last_seen": _to_zone(entry.get("last_seen_at"), zone),
             "count": int(entry.get("finding_count") or 0),
+            "fix_links": "\n".join((fix_links or {}).get(entry["fingerprint"]) or []),
             "link": run_detail_link(public_url, entry.get("last_run_uid") or ""),
         }
         rows.append(LedgerRow(

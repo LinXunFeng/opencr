@@ -1,10 +1,13 @@
 <script lang="ts" setup>
 import type { SurveyFinding } from "@@/apis/opencr"
 import {
+  ASSIGNEE_SOURCE_LABEL,
   CATEGORY_LABEL,
   CLUE_SOURCE_DESC,
   CLUE_SOURCE_LABEL,
   CLUE_SOURCE_TAG,
+  FIX_STATUS_LABEL,
+  FIX_STATUS_TAG,
   SEVERITY_LABEL,
   SEVERITY_TAG,
   SURVEY_UNCHECKED_REPO_LABEL
@@ -17,12 +20,17 @@ import {
  * Guest 拿不到 title 与 body（服务端剔除，不是前端隐藏），这里显示占位而不是空白 ——
  * 空白会被误读成"这条发现没有内容"。
  */
-defineProps<{
+const props = defineProps<{
   items: SurveyFinding[]
   canIgnore?: boolean
+  /** 只有本轮实际报出的发现（新增、仍存在）能发起修复：已消失与未复查的不确定代码里还有没有这个问题 */
+  canFix?: boolean
 }>()
 
-const emit = defineEmits<{ ignore: [finding: SurveyFinding] }>()
+const emit = defineEmits<{ ignore: [finding: SurveyFinding], fix: [finding: SurveyFinding] }>()
+
+/** 修复列只在有人能看到修复记录时出现：Guest 拿不到 fixes 字段 */
+const showFixes = computed(() => props.canFix || props.items.some(f => f.fixes?.length))
 
 // el-table 的插槽把 row 定为 DefaultRow，这里统一在边界处收窄，
 // 与项目既有页面的写法保持一致（见 pages/runs/index.vue）
@@ -44,6 +52,15 @@ function filterClue(value: string, row: any) {
 
 function emitIgnore(row: any) {
   emit("ignore", row as SurveyFinding)
+}
+
+function emitFix(row: any) {
+  emit("fix", row as SurveyFinding)
+}
+
+/** 同一个问题已有进行中的修复时不能再发起：服务端也会拒绝，这里提前把按钮置灰 */
+function fixRunning(row: any) {
+  return ((row as SurveyFinding).fixes ?? []).some(f => f.status === "running")
 }
 </script>
 
@@ -90,9 +107,28 @@ function emitIgnore(row: any) {
         <span v-else class="muted">（需登录查看）</span>
       </template>
     </el-table-column>
-    <el-table-column v-if="canIgnore" label="操作" width="110">
+    <el-table-column v-if="showFixes" label="修复合并请求" min-width="180">
       <template #default="{ row }">
-        <el-button link type="info" size="small" @click="emitIgnore(row)">
+        <div v-for="fix in row.fixes" :key="fix.run_uid" class="fix">
+          <a v-if="fix.mr_url" :href="fix.mr_url" target="_blank" rel="noopener">!{{ fix.mr_iid }}</a>
+          <router-link v-else :to="{ name: 'SurveyFixDetail', params: { runUid: fix.run_uid } }">
+            <el-tag size="small" :type="FIX_STATUS_TAG[fix.status] || 'info'" effect="plain">
+              {{ FIX_STATUS_LABEL[fix.status] || fix.status }}
+            </el-tag>
+          </router-link>
+          <span v-if="fix.assignee_username" class="muted">
+            @{{ fix.assignee_username }}（{{ ASSIGNEE_SOURCE_LABEL[fix.assignee_source] || "未指派" }}）
+          </span>
+        </div>
+        <span v-if="!row.fixes?.length" class="muted">—</span>
+      </template>
+    </el-table-column>
+    <el-table-column v-if="canIgnore || canFix" label="操作" width="160">
+      <template #default="{ row }">
+        <el-button v-if="canFix" link type="primary" size="small" :disabled="fixRunning(row)" @click="emitFix(row)">
+          提出修复
+        </el-button>
+        <el-button v-if="canIgnore" link type="info" size="small" @click="emitIgnore(row)">
           不再提醒
         </el-button>
       </template>
@@ -115,5 +151,9 @@ function emitIgnore(row: any) {
 
 .ml {
   margin-left: 6px;
+}
+
+.fix + .fix {
+  margin-top: 2px;
 }
 </style>

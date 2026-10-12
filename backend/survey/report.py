@@ -19,6 +19,9 @@ from ..storage.models import (
     CATEGORY_MAINTAINABILITY,
     CATEGORY_PERFORMANCE,
     CATEGORY_SECURITY,
+    ASSIGNEE_AUTHOR,
+    ASSIGNEE_CONFIGURED,
+    ASSIGNEE_OWNER,
     CLUE_BASELINE,
     CLUE_CODEGRAPH,
     CLUE_RECHECK,
@@ -32,6 +35,10 @@ from ..storage.models import (
     REPO_FETCH_FAILED,
     REPO_IGNORED,
     REPO_TRUNCATED,
+    RUN_FAILED,
+    RUN_RUNNING,
+    RUN_SKIPPED,
+    RUN_SUCCEEDED,
     SEVERITY_ADVICE,
     SEVERITY_CRITICAL,
     SEVERITY_UNKNOWN,
@@ -99,6 +106,20 @@ CODEGRAPH_UNAVAILABLE_LABELS: Dict[str, str] = {
     CODEGRAPH_MISSING: "codegraph 已启用但找不到可执行文件，画像均退化为依赖清单级——这是部署故障，不是有意关闭，不要拿这一轮做对照。",
 }
 
+# 文案与界面一致（web/src/common/constants/opencr.ts 的 FIX_STATUS_LABEL / ASSIGNEE_SOURCE_LABEL）
+FIX_STATUS_LABELS: Dict[str, str] = {
+    RUN_RUNNING: "进行中",
+    RUN_SUCCEEDED: "已提出",
+    RUN_SKIPPED: "未修改",
+    RUN_FAILED: "失败",
+}
+
+ASSIGNEE_SOURCE_LABELS: Dict[str, str] = {
+    ASSIGNEE_AUTHOR: "原始作者",
+    ASSIGNEE_CONFIGURED: "指定负责人",
+    ASSIGNEE_OWNER: "仓库负责人",
+}
+
 _SEVERITY_ORDER = [SEVERITY_CRITICAL, SEVERITY_WARNING, SEVERITY_ADVICE, SEVERITY_UNKNOWN]
 
 
@@ -136,10 +157,59 @@ def _render_findings(findings: List[dict], include_body: bool) -> str:
                 if body:
                     indented = "\n".join(f"  > {line}" for line in body.splitlines())
                     blocks.append(indented)
+                blocks.extend(_fix_link_lines(item.get("fixes") or []))
             else:
                 # Guest 视角：位置与分类是聚合信息，正文才是 ADR-0002 要挡的东西
                 blocks.append(f"- {tag} {location}")
     return "\n".join(blocks)
+
+
+def _fix_link_lines(fixes: List[dict]) -> List[str]:
+    """一条发现下已提出的修复合并请求，每个一行，带上处理人。"""
+    lines = []
+    for fix in fixes:
+        if not fix.get("mr_url"):
+            continue
+        who = f"，处理人 @{fix['assignee_username']}" if fix.get("assignee_username") else ""
+        lines.append(f"  - 修复合并请求：{fix['mr_url']}{who}")
+    return lines
+
+
+def _render_fixes(fixes: List[dict]) -> List[str]:
+    """
+    "修复合并请求"一节：这一轮各发现相关的全部修复运行，含没提出合并请求的，让读者知道哪些试过、为什么没成。
+
+    提出了合并请求不等于问题已解决，节首写明，避免被当成修复清单去关单。
+    """
+    if not fixes:
+        return []
+    lines = [
+        "## 修复合并请求",
+        "",
+        "_以下是针对本报告中问题发起的修复。提出或合并了合并请求都不改变问题状态，以后续巡检的复核为准。_",
+        "",
+        "| 问题 | 位置 | 状态 | 处理人 | 合并请求 |",
+        "| --- | --- | --- | --- | --- |",
+    ]
+    for fix in fixes:
+        location = f"`{fix.get('repo_slug','')}/{fix.get('file_path','')}`"
+        status = FIX_STATUS_LABELS.get(fix.get("status", ""), fix.get("status", ""))
+        if fix.get("status") != RUN_SUCCEEDED and fix.get("error_message"):
+            status += f"：{fix['error_message']}"
+        assignee = f"@{fix['assignee_username']}" if fix.get("assignee_username") else "-"
+        if fix.get("assignee_source") in ASSIGNEE_SOURCE_LABELS:
+            assignee += f"（{ASSIGNEE_SOURCE_LABELS[fix['assignee_source']]}）"
+        title = _table_cell(fix.get("title") or "")
+        lines.append(
+            f"| {title} | {location} | {_table_cell(status)} | {assignee} | {fix.get('mr_url') or '-'} |"
+        )
+    lines.append("")
+    return lines
+
+
+def _table_cell(text: str) -> str:
+    """Markdown 表格单元格：竖线转义、换行压成空格，否则会把表格拆坏。"""
+    return str(text or "").replace("|", "\\|").replace("\r", " ").replace("\n", " ")
 
 
 def _reach_cell(reach) -> str:
@@ -361,6 +431,8 @@ def render_run_markdown(detail: dict) -> str:
             _render_findings(ignored_repo_items, include_body),
             "",
         ])
+
+    lines.extend(_render_fixes(detail.get("fixes") or []))
 
     if not include_body:
         lines.extend([

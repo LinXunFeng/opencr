@@ -115,6 +115,16 @@ def normalize_title(title) -> str:
     return re.sub(r"\s+", " ", str(title or "")).strip().lower()
 
 
+def issue_key(fingerprint: str, title) -> Tuple[str, str]:
+    """
+    跨运行认出"同一个问题"的键：同指纹 + 标题规整后相同。标题为空时返回的键不该拿来比对。
+
+    修复跟随问题而不是某一条 Finding：同一个问题在之后的运行里是另一条 Finding。
+    登记修复时的去重、报告里挂修复的位置，都用这一个口径，不各写一份。
+    """
+    return str(fingerprint or ""), normalize_title(title)
+
+
 def finding_fingerprint(repo_slug: str, file_path: str, category: str) -> str:
     """
     Finding 的跨轮次身份。

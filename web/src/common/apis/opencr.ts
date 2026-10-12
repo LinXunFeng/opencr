@@ -214,6 +214,10 @@ export interface Survey {
   budget_l2_max_focus: number | null
   budget_index_timeout_seconds: number | null
   retention_runs: number
+  /** manual：只由 Admin 发起（单条或一键全部）；auto：每轮成功结束后自动对尚未修复过的问题发起 */
+  fix_mode: "manual" | "auto"
+  /** 一键全部修复与巡检后自动发起的修复只处理不低于它的问题；单条手动修复不受限制 */
+  fix_min_severity: "critical" | "warning" | "advice"
   last_run_at: string
   next_run_at: string
   created_at: string
@@ -293,6 +297,70 @@ export interface SurveyFinding {
   body?: string
   /** 只出现在「本轮未复查」里：所在仓库本轮没参与的原因（truncated / fetch_failed），其余为空串 */
   repo_status?: string
+  /** 针对这个问题发起过的修复（含之前各轮发起的同一个问题）。只有 Admin 拿得到 */
+  fixes?: SurveyFix[]
+}
+
+/** 修复运行：针对一条发现生成修改、本地验证并提出合并请求。整条只对 Admin 返回 */
+export interface SurveyFix {
+  run_uid: string
+  /** 发现所在的运行被清理后为 null */
+  finding_id: number | null
+  fingerprint: string
+  repo_slug: string
+  file_path: string
+  line: number
+  category: string
+  severity: string
+  title: string
+  target_branch: string
+  source_branch: string
+  /** manual = 单条手动；batch = 一键全部修复；auto = 巡检结束后自动发起 */
+  trigger: "manual" | "batch" | "auto"
+  /** succeeded = 已提出合并请求；skipped = 模型认为最新代码里没有可改的；failed 含验证没通过 */
+  status: "running" | "succeeded" | "skipped" | "failed"
+  phase: string
+  is_stale: boolean
+  error_kind: string
+  error_message: string
+  /** 原始作者：问题代码行最近一次实质改动（排除只改格式的改动）的作者 */
+  author_name: string
+  author_email: string
+  /** author = 原始作者；configured = 原始作者不可用，改派配置的仓库负责人；owner = 按项目权限推断的仓库负责人；空串 = 未指派 */
+  assignee_source: "" | "author" | "configured" | "owner"
+  assignee_username: string
+  assignee_name: string
+  /** 为什么没指派给原始作者 */
+  assignee_note: string
+  mr_iid: number | null
+  mr_url: string
+  started_at: string
+  finished_at: string
+}
+
+export interface SurveyFixCheck {
+  name: string
+  passed: boolean
+  detail: string
+}
+
+export interface SurveyFixAttempt {
+  passed: boolean
+  checks: SurveyFixCheck[]
+  /** 模型复核指出的问题；为空且检查全部通过才算这一轮通过 */
+  problems: string[]
+}
+
+export interface SurveyFixDetail extends SurveyFix {
+  survey_uid: string
+  survey_name: string
+  repo_url: string
+  body: string
+  base_sha: string
+  summary: string
+  diff: string
+  verification: SurveyFixAttempt[]
+  heartbeat_at: string
 }
 
 export interface SurveyRunRepo {
@@ -370,6 +438,15 @@ export interface SurveyRunDetail extends SurveyRun {
   pushes: SurveyPush[]
   /** 是该巡检最近一次成功的运行、且配置了输出目标 */
   pushable: boolean
+  /** 本报告各发现相关的修复运行，按发起时间倒序。只有 Admin 拿得到 */
+  fixes?: SurveyFix[]
+  /** 以下三项只有 Admin 拿得到。是否能一键全部修复（该巡检最近一次成功的运行） */
+  fix_all_available?: boolean
+  /** 一键全部修复的候选数：尚未修复过、且不低于门槛的问题。每批有上限 */
+  fix_all_candidates?: number
+  fix_min_severity?: string
+  /** 这个巡检有一批修复正在后台逐个执行（一键全部或自动）。同一时间只跑一批 */
+  fix_batch_running?: boolean
 }
 
 export interface SurveyStats {
@@ -676,4 +753,57 @@ export function checkDestinationApi(name: string, target: Record<string, string>
     method: "post",
     data: { target, survey_name: surveyName }
   })
+}
+
+/** 针对一条巡检发现发起修复。后台执行，返回修复运行的编号 */
+export function fixSurveyFindingApi(findingId: number) {
+  return request<{ run_uid: string }>({ url: `survey-findings/${findingId}/fix`, method: "post" })
+}
+
+export function getSurveyFixApi(runUid: string) {
+  return request<SurveyFixDetail>({ url: `survey-fixes/${runUid}`, method: "get" })
+}
+
+/** 确认疑似中断的修复运行已中断。只关闭记录，不停止执行 */
+export function interruptSurveyFixApi(runUid: string) {
+  return request<{ run_uid: string, status: string }>({ url: `survey-fixes/${runUid}/interrupt`, method: "post" })
+}
+
+/** 一键全部修复：后台逐个执行，返回本批排队数与候选总数 */
+export function fixAllSurveyRunApi(runUid: string) {
+  return request<{ queued: number, total: number }>({ url: `survey-runs/${runUid}/fix-all`, method: "post" })
+}
+
+/** 仓库负责人配置：一个项目或组织路径指定负责人，按顺序取第一个可用的 */
+export interface RepoOwner {
+  id: number
+  /** 小写的项目或组织路径；组织路径对它下面的全部项目生效，最具体的那条优先 */
+  path: string
+  usernames: string[]
+  note: string
+  created_at: string
+  updated_at: string
+}
+
+export interface RepoOwnerForm {
+  /** 可以填整条仓库或组织地址，服务端剥成路径 */
+  path: string
+  usernames: string[]
+  note: string
+}
+
+export function getRepoOwnersApi() {
+  return request<{ items: RepoOwner[] }>({ url: "repo-owners", method: "get" })
+}
+
+export function addRepoOwnerApi(data: RepoOwnerForm) {
+  return request<RepoOwner>({ url: "repo-owners", method: "post", data })
+}
+
+export function updateRepoOwnerApi(id: number, data: RepoOwnerForm) {
+  return request<RepoOwner>({ url: `repo-owners/${id}`, method: "patch", data })
+}
+
+export function deleteRepoOwnerApi(id: number) {
+  return request<{ removed: boolean }>({ url: `repo-owners/${id}`, method: "delete" })
 }
