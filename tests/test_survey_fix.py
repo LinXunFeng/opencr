@@ -1178,3 +1178,39 @@ class FixTitlePrefixSettingTests(FixRouteTestCase):
         for bad in ("x" * 41, "a\nb", "a\tb", 1, None, True):
             self.assertEqual(self.client.patch("/api/admin/settings", json={key: bad}).status_code, 400, bad)
         self.assertEqual(self.client.get("/api/admin/settings").json["writable"][key], "")
+
+
+class PlatformUserSearchTests(FixRouteTestCase):
+    """仓库负责人配置的候选项：搜索代码平台用户。"""
+
+    def test_admin_only_and_maps_fields(self):
+        """只对 Admin；只回用户名、姓名、状态与是否机器人，不回邮箱；没有用户名的条目丢掉。"""
+        self.assertIn(self.client.get("/api/admin/platform-users?q=al").status_code, (401, 403))
+        self._login()
+        users = [
+            {"id": 1, "username": "alice", "name": "Alice", "state": "active", "email": "alice@corp.com"},
+            {"id": 2, "username": "old", "name": "Old", "state": "blocked"},
+            {"id": 3, "username": "ci", "name": "CI", "bot": True},
+            {"id": 4, "name": "无用户名"},
+        ]
+        with mock.patch("backend.admin.routes.search_users", return_value=users) as search:
+            response = self.client.get("/api/admin/platform-users?q=%20al%20")
+        search.assert_called_once_with("al")
+        self.assertEqual(response.json["items"], [
+            {"username": "alice", "name": "Alice", "state": "active", "bot": False},
+            {"username": "old", "name": "Old", "state": "blocked", "bot": False},
+            {"username": "ci", "name": "CI", "state": "active", "bot": True},
+        ])
+
+    def test_empty_query_and_failures(self):
+        """空关键字不访问平台；平台出错回 502 且不带报错原文；非 GitLab 平台回 409。"""
+        self._login()
+        with mock.patch("backend.admin.routes.search_users") as search:
+            self.assertEqual(self.client.get("/api/admin/platform-users?q=").json["items"], [])
+        search.assert_not_called()
+        with mock.patch("backend.admin.routes.search_users", side_effect=RuntimeError("10.0.0.5 refused")):
+            response = self.client.get("/api/admin/platform-users?q=al")
+        self.assertEqual(response.status_code, 502)
+        self.assertNotIn("10.0.0.5", response.json["error"])
+        with mock.patch("backend.admin.routes.fix_unsupported_reason", return_value="修复目前只支持 GitLab"):
+            self.assertEqual(self.client.get("/api/admin/platform-users?q=al").status_code, 409)

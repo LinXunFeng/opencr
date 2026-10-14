@@ -22,6 +22,7 @@ from ..review.config import (
     load_review_config,
     load_storage_config,
 )
+from ..review.gitlab import search_users
 from ..storage import repo
 from ..storage.models import FIX_MIN_SEVERITIES, FIX_MODES, FIX_TRIGGER_BATCH, PUSH_TRIGGER_MANUAL
 from ..survey.common import MAX_REPOS_LOWER_BOUND, MAX_REPOS_UPPER_BOUND, SurveyError, slugify
@@ -1333,6 +1334,43 @@ def api_update_repo_owner(owner_id: int):
 def api_delete_repo_owner(owner_id: int):
     """删除一条仓库负责人配置。之后这个仓库在原始作者不可用时，合并请求不指派处理人。"""
     return jsonify({"removed": repo.delete_repo_owner(owner_id)})
+
+
+# 用户搜索关键字的长度上限，只为挡住拼出来的超长查询
+MAX_USER_SEARCH_CHARS = 100
+
+
+@admin_bp.route("/api/admin/platform-users", methods=["GET"])
+@require_admin
+def api_platform_users():
+    """
+    按关键字（用户名、姓名；普通令牌下邮箱只能搜到公开了的）搜索代码平台上的用户，给仓库负责人配置当候选项。
+
+    负责人按用户名匹配，手打的用户名拼错了要到发起修复时才会发现（那时只会默默跳过这个人），所以让人从平台上选。
+    只回用户名、姓名、账号状态与是否机器人，不回邮箱：候选框用不到它。
+    """
+    query = (request.args.get("q") or "").strip()[:MAX_USER_SEARCH_CHARS]
+    if not query:
+        return jsonify({"items": []})
+    unsupported = fix_unsupported_reason()
+    if unsupported:
+        return jsonify({"error": unsupported}), 409
+    try:
+        users = search_users(query)
+    except Exception:
+        # 搜不到只影响候选项，配置本身照常可以保存；报错原文可能带内网地址，只记日志
+        logger.warning("Searching platform users failed: q=%s", query, exc_info=True)
+        return jsonify({"error": "搜索代码平台用户失败，请稍后重试"}), 502
+    items = [
+        {
+            "username": str(u.get("username") or ""),
+            "name": str(u.get("name") or ""),
+            "state": str(u.get("state") or "active"),
+            "bot": bool(u.get("bot")),
+        }
+        for u in users if u.get("username")
+    ]
+    return jsonify({"items": items})
 
 
 @admin_bp.route("/api/admin/survey-stats", methods=["GET"])

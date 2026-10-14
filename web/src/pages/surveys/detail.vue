@@ -176,14 +176,36 @@ async function ignore(finding: SurveyFinding) {
   }
 }
 
-/** 发起修复：先讲清会对代码平台做什么、指派给谁、合并请求不等于问题已解决，再提交 */
+/**
+ * 发起修复：先讲清会对代码平台做什么、指派给谁、合并请求不等于问题已解决，再提交。
+ * 这个问题已经提出过合并请求时（含之前几轮巡检里针对同一个问题发起的），先列出已有的，讲清再提会新开一个重复的。
+ * 只在界面上提醒、不在服务端拦：换一种改法、或旧的被关掉后重提，都是合理的需要
+ */
 async function fix(finding: SurveyFinding) {
+  // 只看有没有链接、不看状态：链接在收尾之前就写入了，提完合并请求后运行被中断或收尾失败，平台上照样有一个
+  const opened = (finding.fixes ?? []).filter(f => f.mr_url)
+  const intro = FIX_NOTES.confirm.map(text => h("p", text))
+  const dialog = opened.length
+    ? {
+        title: FIX_NOTES.existingTitle,
+        button: FIX_NOTES.existingButton,
+        body: [
+          // 弹窗挂在 body 下，页面的 scoped 样式管不到它，只能写行内样式
+          h("p", { style: "font-weight: 600" }, FIX_NOTES.existing),
+          h("ul", opened.map(f => h("li", [
+            h("a", { href: f.mr_url, target: "_blank", rel: "noopener" }, f.mr_url),
+            FIX_NOTES.existingAssignee(f.assignee_username)
+          ]))),
+          ...intro
+        ]
+      }
+    : { title: FIX_NOTES.confirmTitle, button: FIX_NOTES.confirmButton, body: intro }
   try {
-    await ElMessageBox.confirm(
-      h("div", FIX_NOTES.confirm.map(text => h("p", text))),
-      FIX_NOTES.confirmTitle,
-      { type: "warning", confirmButtonText: FIX_NOTES.confirmButton, cancelButtonText: "取消" }
-    )
+    await ElMessageBox.confirm(h("div", dialog.body), dialog.title, {
+      type: "warning",
+      confirmButtonText: dialog.button,
+      cancelButtonText: "取消"
+    })
   } catch {
     return
   }

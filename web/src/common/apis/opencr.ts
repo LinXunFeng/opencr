@@ -830,6 +830,20 @@ export interface RepoOwnerForm {
   note: string
 }
 
+/** 代码平台上的用户，给仓库负责人配置当候选项 */
+export interface PlatformUser {
+  username: string
+  name: string
+  /** active 以外（blocked、deactivated 等）都不能当负责人 */
+  state: string
+  bot: boolean
+}
+
+/** 按用户名或姓名搜索代码平台用户 */
+export function searchPlatformUsersApi(q: string) {
+  return request<{ items: PlatformUser[] }>({ url: "platform-users", method: "get", params: { q } })
+}
+
 export function getRepoOwnersApi() {
   return request<{ items: RepoOwner[] }>({ url: "repo-owners", method: "get" })
 }

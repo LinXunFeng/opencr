@@ -1,6 +1,6 @@
 <script lang="ts" setup>
-import type { RepoOwner } from "@@/apis/opencr"
-import { addRepoOwnerApi, deleteRepoOwnerApi, getRepoOwnersApi, updateRepoOwnerApi } from "@@/apis/opencr"
+import type { PlatformUser, RepoOwner } from "@@/apis/opencr"
+import { addRepoOwnerApi, deleteRepoOwnerApi, getRepoOwnersApi, searchPlatformUsersApi, updateRepoOwnerApi } from "@@/apis/opencr"
 import { FIX_NOTES, formatTime } from "@@/constants/opencr"
 
 /**
@@ -32,6 +32,52 @@ async function load() {
   }
 }
 
+/**
+ * 负责人候选项：输入时实时搜索代码平台上的用户。
+ * 不允许手打任意用户名：负责人按用户名匹配，拼错了要到发起修复时才会被默默跳过，那时已经没人注意了
+ */
+const userOptions = ref<PlatformUser[]>([])
+const searchingUsers = ref(false)
+/** 搜索序号：输入得快时，先发出、后返回的旧结果不能盖掉新结果 */
+let searchSeq = 0
+
+/** el-select 的远程搜索：按关键字刷新候选项 */
+async function searchUsers(query: string) {
+  const seq = ++searchSeq
+  const q = query.trim()
+  if (!q) {
+    // 序号已经加过，在途的旧请求回来时不会再动加载状态，这里得自己收掉
+    userOptions.value = []
+    searchingUsers.value = false
+    return
+  }
+  searchingUsers.value = true
+  try {
+    const items = (await searchPlatformUsersApi(q)).items
+    if (seq === searchSeq) userOptions.value = items
+  } catch (error) {
+    if (seq === searchSeq) {
+      userOptions.value = []
+      ElMessage.error((error as Error).message)
+    }
+  } finally {
+    if (seq === searchSeq) searchingUsers.value = false
+  }
+}
+
+/** 账号为什么不能当负责人（机器人、已封禁或停用）；能当时返回空串 */
+function unavailableReason(user: PlatformUser) {
+  if (user.bot) return "机器人"
+  return user.state !== "active" ? user.state : ""
+}
+
+/** 候选项的文字：@用户名 姓名，不能选的注明原因 */
+function userLabel(user: PlatformUser) {
+  const base = `@${user.username}${user.name ? ` ${user.name}` : ""}`
+  const reason = unavailableReason(user)
+  return reason ? `${base}（${reason}）` : base
+}
+
 /** 打开编辑弹窗；不传 row 为新增。row 来自 el-table 插槽时类型是 DefaultRow，在这里收窄 */
 function openDialog(raw?: any) {
   const row = raw as RepoOwner | undefined
@@ -39,6 +85,10 @@ function openDialog(raw?: any) {
   dialog.path = row?.path ?? ""
   dialog.usernames = row ? [...row.usernames] : []
   dialog.note = row?.note ?? ""
+  // 作废上一个弹窗里还在途的搜索，免得它的结果落进这个弹窗
+  searchSeq++
+  userOptions.value = []
+  searchingUsers.value = false
   dialog.visible = true
 }
 
@@ -138,10 +188,19 @@ onMounted(load)
           </div>
         </el-form-item>
         <el-form-item label="负责人">
+          <!-- 选项的 label 用裸用户名：已选的人不在当前候选里时（编辑已有配置），标签显示的就是值本身，两种来源写法一致 -->
           <el-select
-            v-model="dialog.usernames" multiple filterable allow-create default-first-option
-            :reserve-keyword="false" placeholder="输入用户名后回车" style="width: 100%"
-          />
+            v-model="dialog.usernames" multiple filterable remote :remote-method="searchUsers"
+            :loading="searchingUsers" :reserve-keyword="false" :placeholder="FIX_NOTES.ownerSearchPlaceholder"
+            :no-match-text="FIX_NOTES.ownerSearchEmpty" :no-data-text="FIX_NOTES.ownerSearchEmpty" style="width: 100%"
+          >
+            <el-option
+              v-for="user in userOptions" :key="user.username" :label="user.username" :value="user.username"
+              :disabled="Boolean(unavailableReason(user))"
+            >
+              {{ userLabel(user) }}
+            </el-option>
+          </el-select>
           <div class="sub">
             {{ FIX_NOTES.ownerUsernames }}
           </div>

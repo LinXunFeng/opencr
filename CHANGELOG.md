@@ -13,6 +13,8 @@
 - 新增接口 `POST /api/admin/survey-findings/<finding_id>/fix`、`GET /api/admin/survey-fixes/<run_uid>`、`POST /api/admin/survey-fixes/<run_uid>/interrupt`，仅 Admin 可用；巡检运行详情接口对 Admin 增加 `fixes`，发现增加 `fixes`。游客看不到任何修复记录。
 - 修复的触发方式按巡检配置：默认「Admin 发起」（逐条，或在最近一次成功运行的报告页「一键全部修复」）；可改为「巡检后自动发起」，每轮成功结束后自动对尚未修复过的问题发起。批量（一键全部与自动）只处理不低于巡检「批量修复门槛」（默认警告及以上，严重度未知的不处理）的问题，每批最多 20 个、后台逐个执行；有过任何修复记录的问题不再被批量发起。修复记录标明触发来源（手动 / 一键全部修复 / 自动）。
 - 新增「仓库负责人」配置页（定期巡检菜单，仅 Admin）：给项目或组织路径指定负责人，可填多个、按优先级排列，组织路径对下面的项目生效、最具体的优先。原始作者不可用时取配置里第一个可用的人（处理人标为「仓库负责人」），没有配置或都不可用时不指派，原因写在修复详情与合并请求说明里。
+- 仓库负责人配置的负责人从代码平台上搜索选择（按用户名或姓名），不再手填：手填拼错的用户名要到发起修复时才会被默默跳过。已封禁或停用的账号与机器人不能选。新增接口 `GET /api/admin/platform-users?q=`，仅 Admin，只回用户名、姓名、账号状态与是否机器人。
+- 已提出过合并请求的问题再点「提出修复」时，确认弹窗先列出已有的合并请求与处理人，讲清再提会新开一个重复的合并请求，按钮改为「仍要再提一个」。
 - 新增「修复合并请求」页（定期巡检菜单，仅 Admin）：跨巡检列出修复提出的合并请求与处理人，可按巡检、处理人（多选，含「未指派」）与关键字筛选。新增接口 `GET /api/admin/survey-fixes`（参数 `survey_uid`、`assignees`（逗号分隔，`__unassigned__` 表示未指派）、`q`、`limit`、`offset`）。
 - 合并请求标题前缀默认 `[OpenCR]`，可在后台「设置」页修改或留空（运行期设置 `survey_fix_mr_title_prefix`，最多 40 个字符）。
 - 新增接口 `POST /api/admin/survey-runs/<run_uid>/fix-all`、`GET/POST /api/admin/repo-owners`、`PATCH/DELETE /api/admin/repo-owners/<id>`；巡检配置新增 `fix_mode`、`fix_min_severity`。
