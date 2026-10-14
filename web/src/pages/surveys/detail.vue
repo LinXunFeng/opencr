@@ -471,12 +471,15 @@ onMounted(() => load())
             <template #default="{ row }">
               <template v-if="row.assignee_username">
                 @{{ row.assignee_username }}
-                <el-tooltip v-if="row.assignee_note" :content="row.assignee_note" placement="top">
+                <el-tooltip
+                  v-if="row.assignee_note && ASSIGNEE_SOURCE_LABEL[row.assignee_source]" :content="row.assignee_note"
+                  placement="top"
+                >
                   <el-tag size="small" effect="plain" class="ml">
                     {{ ASSIGNEE_SOURCE_LABEL[row.assignee_source] }}
                   </el-tag>
                 </el-tooltip>
-                <el-tag v-else size="small" effect="plain" class="ml">
+                <el-tag v-else-if="ASSIGNEE_SOURCE_LABEL[row.assignee_source]" size="small" effect="plain" class="ml">
                   {{ ASSIGNEE_SOURCE_LABEL[row.assignee_source] }}
                 </el-tag>
               </template>

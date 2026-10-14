@@ -116,6 +116,8 @@ FIX_STATUS_LABELS: Dict[str, str] = {
 ASSIGNEE_SOURCE_LABELS: Dict[str, str] = {
     ASSIGNEE_AUTHOR: "原始作者",
     ASSIGNEE_CONFIGURED: "仓库负责人",
+    # 旧规则（按项目权限推断负责人，已取消）留下的记录：不会再产生，但已有的记录导出时要能看懂
+    "owner": "按权限推断（旧规则）",
 }
 
 _SEVERITY_ORDER = [SEVERITY_CRITICAL, SEVERITY_WARNING, SEVERITY_ADVICE, SEVERITY_UNKNOWN]

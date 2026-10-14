@@ -122,7 +122,7 @@ onMounted(() => load())
           <el-descriptions-item label="处理人">
             <template v-if="detail.assignee_username">
               @{{ detail.assignee_username }}（{{ detail.assignee_name }}）
-              <el-tag size="small" effect="plain" class="ml">
+              <el-tag v-if="ASSIGNEE_SOURCE_LABEL[detail.assignee_source]" size="small" effect="plain" class="ml">
                 {{ ASSIGNEE_SOURCE_LABEL[detail.assignee_source] }}
               </el-tag>
             </template>

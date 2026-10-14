@@ -117,7 +117,7 @@ function fixRunning(row: any) {
             </el-tag>
           </router-link>
           <span v-if="fix.assignee_username" class="muted">
-            @{{ fix.assignee_username }}（{{ ASSIGNEE_SOURCE_LABEL[fix.assignee_source] || "未指派" }}）
+            @{{ fix.assignee_username }}<template v-if="ASSIGNEE_SOURCE_LABEL[fix.assignee_source]">（{{ ASSIGNEE_SOURCE_LABEL[fix.assignee_source] }}）</template>
           </span>
         </div>
         <span v-if="!row.fixes?.length" class="muted">—</span>

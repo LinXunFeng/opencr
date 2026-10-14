@@ -393,10 +393,14 @@ export const FIX_PHASE_LABEL: Record<string, string> = {
   done: "已结束"
 }
 
-/** 与 backend/survey/report.py 的 ASSIGNEE_SOURCE_LABELS 一致 */
+/**
+ * 与 backend/survey/report.py 的 ASSIGNEE_SOURCE_LABELS 一致。
+ * owner 是旧规则（按项目权限推断负责人，已取消）留下的记录，不会再产生，但已有的记录要能看懂
+ */
 export const ASSIGNEE_SOURCE_LABEL: Record<string, string> = {
   author: "原始作者",
-  configured: "仓库负责人"
+  configured: "仓库负责人",
+  owner: "按权限推断（旧规则）"
 }
 
 /** 修复运行的触发来源 */

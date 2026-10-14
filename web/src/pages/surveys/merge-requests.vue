@@ -145,8 +145,8 @@ onMounted(() => {
           <template #default="{ row }">
             <template v-if="row.assignee_username">
               @{{ row.assignee_username }}<span v-if="row.assignee_name" class="sub ml">{{ row.assignee_name }}</span>
-              <el-tag size="small" effect="plain" class="ml">
-                {{ ASSIGNEE_SOURCE_LABEL[row.assignee_source] || row.assignee_source }}
+              <el-tag v-if="ASSIGNEE_SOURCE_LABEL[row.assignee_source]" size="small" effect="plain" class="ml">
+                {{ ASSIGNEE_SOURCE_LABEL[row.assignee_source] }}
               </el-tag>
             </template>
             <el-tooltip v-else :content="row.assignee_note || '未指派'" placement="top">
