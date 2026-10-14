@@ -15,6 +15,7 @@
 - 新增「仓库负责人」配置页（定期巡检菜单，仅 Admin）：给项目或组织路径指定负责人，可填多个、按优先级排列，组织路径对下面的项目生效、最具体的优先。原始作者不可用时先取配置里第一个可用的人（处理人标为「指定负责人」），没有配置或都不可用时再按项目权限推断，原因写在修复详情与合并请求说明里。
 - 新增接口 `POST /api/admin/survey-runs/<run_uid>/fix-all`、`GET/POST /api/admin/repo-owners`、`PATCH/DELETE /api/admin/repo-owners/<id>`；巡检配置新增 `fix_mode`、`fix_min_severity`。
 - 令牌除 `api` 外需要 `write_repository`，令牌所属账号在目标项目里至少要有 Developer 权限，否则推分支失败。
+- 修复提交的作者默认跟随令牌所属账号（名字；邮箱优先取提交邮箱，没有再取主邮箱），可用新增配置项 `survey.fix_commit_name` / `survey.fix_commit_email`（或环境变量 `OPENCR_SURVEY_FIX_COMMIT_NAME` / `OPENCR_SURVEY_FIX_COMMIT_EMAIL`）改成固定身份，两项各自生效；都拿不到时署名 `OpenCR <opencr@noreply.invalid>`。
 - 新增术语 FixRun（修复运行）、原始作者、处理人、仓库负责人；新增 ADR-0007。
 
 ### Changed

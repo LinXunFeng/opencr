@@ -95,6 +95,15 @@ survey:
   # launchd 的 PATH 里没有 ~/.local/bin，写裸名会让服务运行时找不到它，
   # 表现为每次巡检都静默降级。
   codegraph_bin: "codegraph"
+  # Author name and email of the commits behind survey fix merge requests. Leave empty
+  # to follow the account that owns code_platform.token (its name, and its commit email
+  # if set, otherwise its primary email). Each field falls back on its own.
+  # 巡检修复合并请求里那次提交的作者名字与邮箱。留空则跟随 code_platform.token 所属的账号
+  # （名字；邮箱优先取账号设置的提交邮箱，没有再取主邮箱），两项各自生效，可以只填一项。
+  # 推分支、开合并请求的本来就是这个账号，跟随它时平台能把提交关联到账号上，
+  # "提交者邮箱必须属于推送者"一类的推送规则也能通过；填成别的邮箱可能会被这类规则拒绝。
+  fix_commit_name: ""
+  fix_commit_email: ""
   # Hard budget for a single survey run. Overridable per survey in the console.
   # 单次巡检的硬预算，可在后台按巡检单独覆盖。
   # 没有预算的话，一个每周自动跑的任务成本可以从几美元浮动到几百美元。

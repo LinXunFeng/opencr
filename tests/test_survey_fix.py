@@ -99,6 +99,60 @@ class ProjectPathTests(unittest.TestCase):
         self.assertEqual(project_path_from_url("https://h.com/gitlab/grp/app.git", "https://h.com/gitlab"), "grp/app")
 
 
+# 令牌所属账号在平台上的信息，修复提交默认署这个账号
+TOKEN_ACCOUNT = {"id": 100, "name": "Fix Bot", "username": "fixbot", "email": "bot@corp.com",
+                 "commit_email": "100-fixbot@users.noreply.g.com", "public_email": "public@corp.com"}
+
+
+class CommitAuthorTests(unittest.TestCase):
+    """修复提交的作者：配置优先，其次令牌账号，最后兜底身份。"""
+
+    def test_follows_token_account_by_default(self):
+        """没配置时跟随令牌账号，邮箱优先取提交邮箱。"""
+        from backend.survey.fix import pick_commit_author
+
+        self.assertEqual(pick_commit_author("", "", TOKEN_ACCOUNT), ("Fix Bot", "100-fixbot@users.noreply.g.com"))
+
+    def test_configured_fields_win_independently(self):
+        """名字与邮箱各自取值：只配了一项时另一项仍跟随令牌账号。"""
+        from backend.survey.fix import pick_commit_author
+
+        self.assertEqual(pick_commit_author(" Bot ", "", TOKEN_ACCOUNT), ("Bot", "100-fixbot@users.noreply.g.com"))
+        self.assertEqual(pick_commit_author("", "q@corp.com", TOKEN_ACCOUNT), ("Fix Bot", "q@corp.com"))
+
+    def test_account_field_fallbacks(self):
+        """账号缺名字时用用户名；提交邮箱缺失或不像邮箱时依次退到主邮箱、公开邮箱，都没有时用兜底身份。"""
+        from backend.survey.fix import FALLBACK_COMMIT_AUTHOR, pick_commit_author
+
+        account = {"name": "  ", "username": "fixbot", "commit_email": "", "email": "not-an-email", "public_email": "p@corp.com"}
+        self.assertEqual(pick_commit_author("", "", account), ("fixbot", "p@corp.com"))
+        self.assertEqual(pick_commit_author("", "", {}), FALLBACK_COMMIT_AUTHOR)
+
+    def test_resolve_reads_config_and_skips_platform_when_fully_configured(self):
+        """两项都配置了时不访问平台；查账号失败时退回兜底身份而不是让修复失败。"""
+        from backend.survey import fix
+
+        configured = {"fix_commit_name": "Bot", "fix_commit_email": "bot@corp.com"}
+        with mock.patch.object(fix, "load_survey_config", return_value=configured), \
+                mock.patch.object(fix, "get_current_user") as current:
+            self.assertEqual(fix.resolve_commit_author(), ("Bot", "bot@corp.com"))
+        current.assert_not_called()
+        with mock.patch.object(fix, "load_survey_config", return_value={"fix_commit_name": "", "fix_commit_email": ""}), \
+                mock.patch.object(fix, "get_current_user", side_effect=RuntimeError("401")):
+            self.assertEqual(fix.resolve_commit_author(), fix.FALLBACK_COMMIT_AUTHOR)
+
+    def test_config_keys_and_env_override(self):
+        """配置项从 survey 段读取，环境变量覆盖，首尾空白去掉。"""
+        from backend.survey import config
+
+        file_config = {"survey": {"fix_commit_name": " Bot ", "fix_commit_email": "bot@corp.com"}}
+        with mock.patch.object(config, "load_file_config", return_value=file_config), \
+                mock.patch.dict(os.environ, {"OPENCR_SURVEY_FIX_COMMIT_EMAIL": "env@corp.com"}):
+            os.environ.pop("OPENCR_SURVEY_FIX_COMMIT_NAME", None)
+            cfg = config.load_survey_config()
+        self.assertEqual((cfg["fix_commit_name"], cfg["fix_commit_email"]), ("Bot", "env@corp.com"))
+
+
 class AuthorshipTests(unittest.TestCase):
     """原始作者追溯里的纯函数。"""
 
@@ -388,6 +442,15 @@ class FixTestCase(LedgerStorageTestCase):
         patch = mock.patch("backend.survey.workspace.workspace_root", return_value=self.root / "ws")
         patch.start()
         self.addCleanup(patch.stop)
+        # 巡检配置不读本机的 config.yaml 与环境变量：那里配的提交作者会让断言随机器而变
+        patch = mock.patch("backend.survey.config.load_file_config", return_value={})
+        patch.start()
+        self.addCleanup(patch.stop)
+        env = mock.patch.dict(os.environ)
+        env.start()
+        self.addCleanup(env.stop)
+        for name in ("OPENCR_SURVEY_FIX_COMMIT_NAME", "OPENCR_SURVEY_FIX_COMMIT_EMAIL"):
+            os.environ.pop(name, None)
 
     def _run_with_finding(self, title="求和没有处理空价格", path="calc.py"):
         """一轮成功运行，含一条 app 仓库的发现，返回 (run_uid, finding_id)。"""
@@ -530,6 +593,7 @@ class ExecuteFixTests(FixTestCase):
                 mock.patch.object(assignee, "list_project_members", return_value=members or self.MEMBERS), \
                 mock.patch.object(assignee, "get_current_user", return_value={"id": 100}), \
                 mock.patch.object(assignee, "search_users", return_value=[]), \
+                mock.patch.object(fix, "get_current_user", return_value=TOKEN_ACCOUNT), \
                 mock.patch.object(fix, "_republish") as republish:
             fix.execute_survey_fix(uid)
         self.republish = republish
@@ -557,11 +621,20 @@ class ExecuteFixTests(FixTestCase):
         self.assertIn("合并不会直接改变巡检台账的状态", args.args[4])
         # 分支真的推到了远端，提交只含这一个文件
         branch = result["source_branch"]
-        shown = _git(self.root / "remote.git", "show", "--name-only", "--format=%an", branch)
-        self.assertEqual(shown.split(), ["OpenCR", "calc.py"])
+        shown = _git(self.root / "remote.git", "show", "--name-only", "--format=%an|%ae|%cn|%ce", branch)
+        # 没有配置提交作者时跟随令牌账号，邮箱取账号的提交邮箱
+        self.assertEqual(shown.split("\n")[:3], [
+            "Fix Bot|100-fixbot@users.noreply.g.com|Fix Bot|100-fixbot@users.noreply.g.com", "", "calc.py"])
         self.republish.assert_called_once()
         # 工作区做完即删
         self.assertFalse((self.root / "ws" / ".fixes").exists() and any((self.root / "ws" / ".fixes").iterdir()))
+
+    def test_configured_commit_author_wins(self):
+        """配置了提交作者时用配置的，只配了名字时邮箱仍跟随令牌账号。"""
+        with mock.patch.dict(os.environ, {"OPENCR_SURVEY_FIX_COMMIT_NAME": "Quality Bot"}):
+            result, _ = self._execute([self._proposal(), '{"resolved":true,"problems":[]}'])
+        shown = _git(self.root / "remote.git", "log", "-1", "--format=%an|%ae", result["source_branch"])
+        self.assertEqual(shown.strip(), "Quality Bot|100-fixbot@users.noreply.g.com")
 
     def test_blocked_author_goes_to_owner(self):
         """原始作者被封禁时改派仓库负责人，原因写进记录。"""

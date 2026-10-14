@@ -482,6 +482,7 @@ For issues under "new" and "persisting" in a report, an admin can click "提出�
 - **Repository owners can be configured** (Scheduled Surveys → "仓库负责人"): assign owners to a project or group path, several in priority order; a group path covers every project under it, and the most specific entry wins. When the original author is unavailable, the first available configured owner (still a member, account active, at least Developer) is used; only without a configuration, or when none of them is available, is the owner inferred by the rule above.
 - A second fix cannot be started for the same issue while one is running; a stale fix can be confirmed interrupted on its details page and then retried. Admins only; guests do not see fixes.
 - GitLab only for now. Besides `api`, the token needs `write_repository` to push branches, and its account needs at least Developer access on the target project.
+- **Commits are authored as the token's account by default** (its name, and its commit email if set, otherwise its primary email), matching the account that pushes the branch and opens the merge request. Set `survey.fix_commit_name` / `survey.fix_commit_email` in `config.yaml` to use a fixed name and email instead; each field applies on its own. If the target project has a push rule requiring the committer email to belong to the pusher, a different email will be rejected.
 
 ### Pushing to external platforms (destinations)
 

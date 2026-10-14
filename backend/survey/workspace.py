@@ -12,7 +12,7 @@ import os
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, NamedTuple, Optional, Tuple
 
 from ..review.config import load_gitlab_config
 from .common import CODEGRAPH_INDEX_DIRNAME, SurveyError, repo_slug_from_url, slugify
@@ -226,10 +226,15 @@ def workspace_size_bytes(survey_slug: str) -> int:
 # 修复运行（FixRun）的工作区
 # ---------------------------------------------------------------------------
 
+class CommitAuthor(NamedTuple):
+    """修复提交的署名，同时用作作者与提交者。"""
+
+    name: str
+    email: str
+
+
 # 修复工作区放在工作区根目录下的这个子目录里。以点开头：Survey 的 slug 只含 [a-z0-9-]，不会撞名
 FIX_WORKSPACE_DIRNAME = ".fixes"
-# 修复提交的作者。用固定的服务身份而不是借用某个人的名字：提交历史里要一眼看得出这是机器提出的修改
-FIX_COMMIT_AUTHOR = ("OpenCR", "opencr@noreply.invalid")
 # 仓库自带的格式化提交清单（git blame 的通行约定），里面的提交在追溯原始作者时一并跳过
 BLAME_IGNORE_REVS_FILE = ".git-blame-ignore-revs"
 # 最多认多少条 .git-blame-ignore-revs。每条都要一次 rev-parse，几百条已经覆盖绝大多数仓库，
@@ -385,19 +390,21 @@ def git_show_file(repo_dir: Path, rev: str, file_path: str, timeout: int = 120) 
         return None
 
 
-def commit_and_push_fix(repo_dir: Path, file_path: str, source_branch: str, message: str, timeout: int = 600) -> str:
+def commit_and_push_fix(
+    repo_dir: Path, file_path: str, source_branch: str, message: str, author: CommitAuthor, timeout: int = 600
+) -> str:
     """
     把对单个文件的修改提交到新分支并推送，返回新提交的 sha。
 
     只 add 这一个文件：修复只允许改发现所在的文件，工作区里别的变化（例如 blame 时生成的东西）一概不进提交。
     """
     token = load_gitlab_config().get("token", "")
-    name, email = FIX_COMMIT_AUTHOR
+    # 走环境变量而不是 git config：优先级高于机器上的 ~/.gitconfig，部署环境里配没配 user.name 都不影响
     identity = {
-        "GIT_AUTHOR_NAME": name,
-        "GIT_AUTHOR_EMAIL": email,
-        "GIT_COMMITTER_NAME": name,
-        "GIT_COMMITTER_EMAIL": email,
+        "GIT_AUTHOR_NAME": author.name,
+        "GIT_AUTHOR_EMAIL": author.email,
+        "GIT_COMMITTER_NAME": author.name,
+        "GIT_COMMITTER_EMAIL": author.email,
     }
     _run_git(["checkout", "-b", source_branch], repo_dir, token, timeout)
     _run_git(["add", "--", file_path], repo_dir, token, timeout)

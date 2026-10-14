@@ -83,6 +83,8 @@ def load_survey_config() -> dict:
         config_data, "survey.codegraph_enabled", "OPENCR_SURVEY_CODEGRAPH_ENABLED"
     )
     codegraph_bin = _pick_with_env(config_data, "survey.codegraph_bin", "OPENCR_SURVEY_CODEGRAPH_BIN")
+    fix_commit_name = _pick_with_env(config_data, "survey.fix_commit_name", "OPENCR_SURVEY_FIX_COMMIT_NAME")
+    fix_commit_email = _pick_with_env(config_data, "survey.fix_commit_email", "OPENCR_SURVEY_FIX_COMMIT_EMAIL")
 
     wall_clock_minutes = _pick_config_int(
         config_data, DEFAULT_WALL_CLOCK_MINUTES, "survey.budget.wall_clock_minutes"
@@ -107,6 +109,9 @@ def load_survey_config() -> dict:
         "scheduler_interval_seconds": max(scheduler_interval, 10),
         "codegraph_enabled": _truthy(codegraph_enabled_raw, True),
         "codegraph_bin": codegraph_bin or "codegraph",
+        # 留空表示跟随令牌账号，在发起修复时才去平台上查（见 survey.fix.resolve_commit_author）
+        "fix_commit_name": fix_commit_name.strip(),
+        "fix_commit_email": fix_commit_email.strip(),
         "budget": {
             "wall_clock_minutes": max(wall_clock_minutes, 1),
             "l1_max_chars": max(l1_max_chars, 1000),

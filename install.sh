@@ -164,6 +164,8 @@ load_project_config_file() {
         REVIEW_LOG_LEVEL=$(read_yaml_value "$config_yaml" "server" "log_level")
         OPENCR_PUBLIC_URL=$(read_yaml_value "$config_yaml" "server" "public_url")
         DESTINATIONS_BLOCK=$(extract_yaml_section "$config_yaml" "destinations")
+        OPENCR_SURVEY_FIX_COMMIT_NAME=$(read_yaml_value "$config_yaml" "survey" "fix_commit_name")
+        OPENCR_SURVEY_FIX_COMMIT_EMAIL=$(read_yaml_value "$config_yaml" "survey" "fix_commit_email")
 
         REVIEW_MAX_DIFF_SIZE=$(read_yaml_value "$config_yaml" "review" "max_diff_size")
         REVIEW_TIMEOUT=$(read_yaml_value "$config_yaml" "review" "timeout")
@@ -691,6 +693,8 @@ generate_config_file() {
     OPENCR_SURVEY_SCHEDULER_INTERVAL_SECONDS=${OPENCR_SURVEY_SCHEDULER_INTERVAL_SECONDS:-60}
     OPENCR_SURVEY_CODEGRAPH_ENABLED=${OPENCR_SURVEY_CODEGRAPH_ENABLED:-true}
     OPENCR_SURVEY_CODEGRAPH_BIN=${OPENCR_SURVEY_CODEGRAPH_BIN:-codegraph}
+    OPENCR_SURVEY_FIX_COMMIT_NAME=${OPENCR_SURVEY_FIX_COMMIT_NAME:-}
+    OPENCR_SURVEY_FIX_COMMIT_EMAIL=${OPENCR_SURVEY_FIX_COMMIT_EMAIL:-}
     OPENCR_SURVEY_WALL_CLOCK_MINUTES=${OPENCR_SURVEY_WALL_CLOCK_MINUTES:-60}
     OPENCR_SURVEY_L1_MAX_CHARS=${OPENCR_SURVEY_L1_MAX_CHARS:-400000}
     OPENCR_SURVEY_L2_MAX_FOCUS=${OPENCR_SURVEY_L2_MAX_FOCUS:-20}
@@ -736,6 +740,9 @@ survey:
   scheduler_interval_seconds: ${OPENCR_SURVEY_SCHEDULER_INTERVAL_SECONDS}
   codegraph_enabled: ${OPENCR_SURVEY_CODEGRAPH_ENABLED}
   codegraph_bin: "${OPENCR_SURVEY_CODEGRAPH_BIN}"
+  # 修复合并请求的提交作者；留空跟随令牌所属账号，说明见 config.example.yaml。
+  fix_commit_name: "${OPENCR_SURVEY_FIX_COMMIT_NAME}"
+  fix_commit_email: "${OPENCR_SURVEY_FIX_COMMIT_EMAIL}"
   budget:
     wall_clock_minutes: ${OPENCR_SURVEY_WALL_CLOCK_MINUTES}
     l1_max_chars: ${OPENCR_SURVEY_L1_MAX_CHARS}
