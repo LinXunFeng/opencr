@@ -116,6 +116,7 @@ def execute_push(push_id: int) -> None:
             repo.list_survey_ledger(push["survey_id"]),
             public_url,
             first_push=push["first_push"],
+            fix_links=repo.survey_fix_links(push["survey_id"]),
         )
         stats = destination.push(target, ledger_columns(include_link=bool(public_url)), rows)
     except DestinationError as e:

@@ -20,6 +20,8 @@ from ..storage.models import (
     DEGRADE_REPOS_TRUNCATED,
     ERROR_SURVEY,
     ERROR_UNEXPECTED,
+    FIX_MODE_AUTO,
+    FIX_TRIGGER_AUTO,
     PROFILE_MANIFEST,
     PUSH_TRIGGER_AUTO,
     REPO_FETCH_FAILED,
@@ -44,6 +46,7 @@ from .clues import annotate_focuses, summarize_codegraph
 from .common import SurveyError, finding_fingerprint
 from .config import load_max_repos, load_survey_config, resolve_budget
 from .crossrepo import build_cross_repo_map, render_cross_repo_map
+from .fix import FixBatchBusy, fix_unsupported_reason, start_fix_batch
 from .ignores import attach_ignored, match_by_title
 from .ledger import plan_rechecks, update_ledger_for_run
 from .profile import build_profile, codegraph_status, save_profile
@@ -353,7 +356,31 @@ def execute_survey_run(survey_uid: str, trigger: str) -> Optional[str]:
 
     if succeeded:
         _publish(run_uid)
+        _auto_fix(survey, run_uid)
     return run_uid
+
+
+def _auto_fix(survey: dict, run_uid: str) -> None:
+    """
+    Survey 的修复触发方式为巡检后自动发起时，为这一轮尚未修复过的问题发起修复（后台逐个执行）。
+
+    放在台账更新与推送之后：修复成功后会以最近一次成功运行的名义重推台账，台账得先是这一轮的。
+    """
+    if survey.get("fix_mode") != FIX_MODE_AUTO:
+        return
+    unsupported = fix_unsupported_reason()
+    if unsupported:
+        logger.warning("Auto fix skipped: survey=%s: %s", survey["slug"], unsupported)
+        return
+    try:
+        batch = start_fix_batch(run_uid, FIX_TRIGGER_AUTO)
+        logger.info("Auto fix started: survey=%s run=%s count=%s", survey["slug"], run_uid, len(batch))
+    except FixBatchBusy:
+        # 上一批还没跑完：这一轮的问题等下一轮再自动发起，或由 Admin 稍后一键全部修复
+        logger.info("Auto fix skipped, a batch is still running: survey=%s run=%s", survey["slug"], run_uid)
+    except Exception:
+        # 巡检后自动发起修复是附加动作，失败不影响这一轮已经发布的结果；Admin 仍可在报告页一键全部修复
+        logger.exception("Starting auto fix failed: survey=%s run=%s", survey["slug"], run_uid)
 
 
 def _record_codegraph_stats(

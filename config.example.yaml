@@ -95,6 +95,15 @@ survey:
   # launchd 的 PATH 里没有 ~/.local/bin，写裸名会让服务运行时找不到它，
   # 表现为每次巡检都静默降级。
   codegraph_bin: "codegraph"
+  # Author name and email of the commits behind survey fix merge requests. Leave empty
+  # to follow the account that owns code_platform.token (its name, and its commit email
+  # if set, otherwise its primary email). Each field falls back on its own.
+  # 巡检修复合并请求里那次提交的作者名字与邮箱。留空则跟随 code_platform.token 所属的账号
+  # （名字；邮箱优先取账号设置的提交邮箱，没有再取主邮箱），两项各自生效，可以只填一项。
+  # 推分支、开合并请求的本来就是这个账号，跟随它时平台能把提交关联到账号上，
+  # "提交者邮箱必须属于推送者"一类的推送规则也能通过；填成别的邮箱可能会被这类规则拒绝。
+  fix_commit_name: ""
+  fix_commit_email: ""
   # Hard budget for a single survey run. Overridable per survey in the console.
   # 单次巡检的硬预算，可在后台按巡检单独覆盖。
   # 没有预算的话，一个每周自动跑的任务成本可以从几美元浮动到几百美元。
@@ -204,15 +213,21 @@ admin:
 # 游客能看到运行状态与聚合统计，但看不到审查发现的正文；
 # 完整取舍见 docs/adr/0002-guest-read-scope.md。
 #
-# One more runtime setting lives in the console/database:
+# Two more runtime settings live in the console/database:
 #   survey_max_repos  max repos per survey run, after org expansion and dedup
 #                     (default 200, range 1~1000). Extra repos are skipped and the
 #                     run records a repos_truncated degradation. Takes effect on
 #                     the next survey run, no restart needed.
-# 另有一个运行期设置同样在后台「设置」页修改、存在数据库中：
+#   survey_fix_mr_title_prefix  prefix of survey fix merge request titles
+#                     (default "[OpenCR]", up to 40 characters; empty means no prefix).
+#                     Takes effect on the next fix.
+# 另有两个运行期设置同样在后台「设置」页修改、存在数据库中：
 #   survey_max_repos  单次巡检的仓库上限，按组织展开、去重之后计数
 #                     （默认 200，可填 1~1000）。超出的仓库不参与本轮，
 #                     运行记一条 repos_truncated 降级。下一次巡检生效，无需重启。
+#   survey_fix_mr_title_prefix  巡检修复合并请求标题的前缀（默认 "[OpenCR]"，最多 40 个字符，
+#                     留空表示不加前缀）。下一个修复生效。放在数据库里是因为要能设成空，
+#                     而这个文件分不清"留空"与"没写"。
 
 # Persistence settings for review history and acceptance statistics.
 # 审查历史与采纳统计的持久化配置。

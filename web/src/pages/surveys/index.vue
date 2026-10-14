@@ -11,7 +11,15 @@ import {
   runSurveyApi,
   updateSurveyApi
 } from "@@/apis/opencr"
-import { formatTime, SCHEDULE_KIND_LABEL, SURVEY_NOTES, WEEKDAY_OPTIONS } from "@@/constants/opencr"
+import {
+  FIX_MIN_SEVERITY_OPTIONS,
+  FIX_MODE_LABEL,
+  FIX_NOTES,
+  formatTime,
+  SCHEDULE_KIND_LABEL,
+  SURVEY_NOTES,
+  WEEKDAY_OPTIONS
+} from "@@/constants/opencr"
 import { useUserStore } from "@/pinia/stores/user"
 
 const userStore = useUserStore()
@@ -53,6 +61,8 @@ const form = reactive({
   selected_skills: [] as string[],
   delete_workspace_after: false,
   retention_runs: 20,
+  fix_mode: "manual" as Survey["fix_mode"],
+  fix_min_severity: "warning" as Survey["fix_min_severity"],
   budget_wall_clock_minutes: null as number | null,
   budget_l2_max_focus: null as number | null,
   sources: [] as SurveySource[],
@@ -102,6 +112,8 @@ function resetForm() {
   form.selected_skills = [...allSkills.value]
   form.delete_workspace_after = false
   form.retention_runs = 20
+  form.fix_mode = "manual"
+  form.fix_min_severity = "warning"
   form.budget_wall_clock_minutes = null
   form.budget_l2_max_focus = null
   form.sources = [{ kind: "repo", url: "", branch: "", exclude_patterns: [] }]
@@ -136,6 +148,8 @@ function openEdit(row: any) {
   form.selected_skills = allSkills.value.filter(s => !row.excluded_skills.includes(s))
   form.delete_workspace_after = row.delete_workspace_after
   form.retention_runs = row.retention_runs
+  form.fix_mode = row.fix_mode
+  form.fix_min_severity = row.fix_min_severity
   form.budget_wall_clock_minutes = row.budget_wall_clock_minutes
   form.budget_l2_max_focus = row.budget_l2_max_focus
   form.sources = row.sources.length
@@ -235,6 +249,8 @@ async function save() {
       excluded_skills: allSkills.value.filter(s => !form.selected_skills.includes(s)),
       delete_workspace_after: form.delete_workspace_after,
       retention_runs: form.retention_runs,
+      fix_mode: form.fix_mode,
+      fix_min_severity: form.fix_min_severity,
       budget_wall_clock_minutes: form.budget_wall_clock_minutes,
       budget_l2_max_focus: form.budget_l2_max_focus,
       sources,
@@ -584,6 +600,26 @@ onMounted(load)
           <el-input-number v-model="form.retention_runs" :min="1" :max="500" controls-position="right" />
           <div class="sub">
             最近一次永远保留——「新增/仍存在」的比对依赖它。
+          </div>
+        </el-form-item>
+
+        <el-form-item label="修复触发方式">
+          <el-radio-group v-model="form.fix_mode">
+            <el-radio v-for="(label, value) in FIX_MODE_LABEL" :key="value" :value="value">
+              {{ label }}
+            </el-radio>
+          </el-radio-group>
+          <div class="sub">
+            {{ FIX_NOTES.modeHelp[form.fix_mode] }}
+          </div>
+        </el-form-item>
+
+        <el-form-item label="批量修复门槛">
+          <el-select v-model="form.fix_min_severity" style="width: 200px">
+            <el-option v-for="opt in FIX_MIN_SEVERITY_OPTIONS" :key="opt.value" :label="opt.label" :value="opt.value" />
+          </el-select>
+          <div class="sub">
+            {{ FIX_NOTES.minSeverityHelp }}
           </div>
         </el-form-item>
 
