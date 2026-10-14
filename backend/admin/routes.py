@@ -25,7 +25,15 @@ from ..review.config import (
 from ..storage import repo
 from ..storage.models import FIX_MIN_SEVERITIES, FIX_MODES, FIX_TRIGGER_BATCH, PUSH_TRIGGER_MANUAL
 from ..survey.common import MAX_REPOS_LOWER_BOUND, MAX_REPOS_UPPER_BOUND, SurveyError, slugify
-from ..survey.config import SETTING_MAX_REPOS, load_max_repos, load_public_url, load_survey_config
+from ..survey.config import (
+    FIX_MR_TITLE_PREFIX_MAX,
+    SETTING_FIX_MR_TITLE_PREFIX,
+    SETTING_MAX_REPOS,
+    load_fix_mr_title_prefix,
+    load_max_repos,
+    load_public_url,
+    load_survey_config,
+)
 from ..survey.destinations import DESTINATION_TYPES, list_destination_types, load_destinations
 from ..survey.fix import (
     FixBatchBusy,
@@ -76,6 +84,8 @@ WRITABLE_SETTINGS = {
     # 默认开启，与 MR 审查一致；打开后巡检发现的正文与整合叙述**依然剔除**。
     "survey_guest_read": {"type": "bool"},
     SETTING_MAX_REPOS: {"type": "int", "min": MAX_REPOS_LOWER_BOUND, "max": MAX_REPOS_UPPER_BOUND},
+    # 允许空串：表示修复合并请求的标题不加前缀
+    SETTING_FIX_MR_TITLE_PREFIX: {"type": "str", "max_len": FIX_MR_TITLE_PREFIX_MAX},
 }
 
 
@@ -86,6 +96,7 @@ def _writable_settings() -> dict:
         "guest_retry": guest_retry_enabled(),
         "survey_guest_read": survey_guest_read_enabled(),
         SETTING_MAX_REPOS: load_max_repos(),
+        SETTING_FIX_MR_TITLE_PREFIX: load_fix_mr_title_prefix(),
     }
 
 
@@ -524,10 +535,19 @@ def api_update_settings():
             # bool 是 int 的子类，true 会被当成 1 放过去，所以用 type() 精确判断
             if type(value) is not int or not spec["min"] <= value <= spec["max"]:
                 return jsonify({"error": f"{key} 必须为 {spec['min']}~{spec['max']} 之间的整数"}), 400
+        if spec["type"] == "str":
+            if not isinstance(value, str) or len(value.strip()) > spec["max_len"]:
+                return jsonify({"error": f"{key} 必须为不超过 {spec['max_len']} 个字符的文本"}), 400
+            # 换行、制表符会把合并请求标题拆坏，宁可拒绝也不悄悄改掉用户填的内容；首尾空白照常去掉
+            if any(ch in value.strip() for ch in "\r\n\t"):
+                return jsonify({"error": f"{key} 不能包含换行或制表符"}), 400
 
     for key, value in payload.items():
         if WRITABLE_SETTINGS[key]["type"] == "bool":
             repo.set_setting(key, "1" if value else "0")
+        elif WRITABLE_SETTINGS[key]["type"] == "str":
+            # 与读取时（load_fix_mr_title_prefix）的规整一致：连续空白压成一个，存的就是实际生效的
+            repo.set_setting(key, " ".join(value.split()))
         else:
             repo.set_setting(key, str(value))
         logger.info("Admin changed setting %s -> %s", key, value)
@@ -1215,6 +1235,30 @@ def api_fix_all_survey_run(run_uid: str):
     return jsonify({"queued": len(batch), "total": total}), 202
 
 
+# 处理人筛选最多带多少个用户名：多选框里勾几十个人已经失去筛选的意义，上限只为挡住拼出来的超长查询
+MAX_ASSIGNEE_FILTERS = 50
+
+
+@admin_bp.route("/api/admin/survey-fixes", methods=["GET"])
+@require_admin
+def api_survey_fix_merge_requests():
+    """
+    修复提出的合并请求列表（跨巡检），可按巡检、处理人（可多选，含未指派）与关键字筛选。
+
+    只对 Admin：修复记录带问题标题、文件路径与处理人，属于正文一侧（见 ADR-0002）。
+    """
+    return jsonify(repo.list_fix_merge_requests(
+        survey_uid=(request.args.get("survey_uid") or "").strip(),
+        # 逗号分隔而不是重复参数：前端请求库默认把数组序列化成 assignee[]=a 的形式，两边容易对不上；
+        # 平台用户名不含逗号
+        assignees=(request.args.get("assignees") or "").split(",")[:MAX_ASSIGNEE_FILTERS],
+        keyword=(request.args.get("q") or "").strip()[:200],
+        limit=_int_arg("limit", 50, 200),
+        offset=_int_arg("offset", 0, 100000),
+        stale_after_seconds=_stale_after(),
+    ))
+
+
 @admin_bp.route("/api/admin/survey-fixes/<run_uid>", methods=["GET"])
 @require_admin
 def api_survey_fix_detail(run_uid: str):
@@ -1287,7 +1331,7 @@ def api_update_repo_owner(owner_id: int):
 @admin_bp.route("/api/admin/repo-owners/<int:owner_id>", methods=["DELETE"])
 @require_admin
 def api_delete_repo_owner(owner_id: int):
-    """删除一条仓库负责人配置。之后这个仓库的负责人按项目权限推断。"""
+    """删除一条仓库负责人配置。之后这个仓库在原始作者不可用时，合并请求不指派处理人。"""
     return jsonify({"removed": repo.delete_repo_owner(owner_id)})
 
 

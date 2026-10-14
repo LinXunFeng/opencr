@@ -129,6 +129,8 @@ export interface SettingsData {
     survey_guest_read: boolean
     /** 单次巡检的仓库上限，超出部分截掉并记一条 repos_truncated 降级 */
     survey_max_repos: number
+    /** 修复合并请求标题的前缀，空串表示不加 */
+    survey_fix_mr_title_prefix: string
   }
 }
 
@@ -326,8 +328,8 @@ export interface SurveyFix {
   /** 原始作者：问题代码行最近一次实质改动（排除只改格式的改动）的作者 */
   author_name: string
   author_email: string
-  /** author = 原始作者；configured = 原始作者不可用，改派配置的仓库负责人；owner = 按项目权限推断的仓库负责人；空串 = 未指派 */
-  assignee_source: "" | "author" | "configured" | "owner"
+  /** author = 原始作者；configured = 原始作者不可用，改派配置的仓库负责人；空串 = 未指派 */
+  assignee_source: "" | "author" | "configured"
   assignee_username: string
   assignee_name: string
   /** 为什么没指派给原始作者 */
@@ -762,6 +764,42 @@ export function fixSurveyFindingApi(findingId: number) {
 
 export function getSurveyFixApi(runUid: string) {
   return request<SurveyFixDetail>({ url: `survey-fixes/${runUid}`, method: "get" })
+}
+
+/** 「修复合并请求」列表里代表未指派的筛选值，与后端 repo.UNASSIGNED_FILTER 一致 */
+export const UNASSIGNED_FILTER = "__unassigned__"
+
+export interface FixMergeRequest extends SurveyFix {
+  survey_uid: string
+  survey_name: string
+}
+
+export interface FixMergeRequestList {
+  items: FixMergeRequest[]
+  total: number
+  /** 只按巡检与关键字筛选时，各处理人的合并请求数，给处理人筛选框当选项 */
+  assignees: { username: string, name: string, count: number }[]
+  /** 同口径下未指派的合并请求数 */
+  unassigned: number
+}
+
+export interface FixMergeRequestQuery {
+  survey_uid?: string
+  /** 处理人用户名，可含 UNASSIGNED_FILTER */
+  assignees?: string[]
+  q?: string
+  limit?: number
+  offset?: number
+}
+
+/** 修复提出的合并请求列表（跨巡检） */
+export function getFixMergeRequestsApi(query: FixMergeRequestQuery) {
+  const { assignees, ...rest } = query
+  return request<FixMergeRequestList>({
+    url: "survey-fixes",
+    method: "get",
+    params: { ...rest, assignees: assignees?.length ? assignees.join(",") : undefined }
+  })
 }
 
 /** 确认疑似中断的修复运行已中断。只关闭记录，不停止执行 */

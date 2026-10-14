@@ -9,7 +9,7 @@ FixRun（修复运行）的唯一执行入口：针对一条巡检 Finding 生�
 本地验证不在服务端构建、不跑测试，只做不需要目标仓库工具链的检查加一次模型复核，理由见
 docs/adr/0007-survey-fix-local-verification.md。构建与测试交给目标仓库自己的 CI。
 
-判定逻辑（apply_edits / static_checks / verdict_passed / project_path_from_url / pick_commit_author）是纯函数，不碰 git、网络与数据库。
+判定逻辑（apply_edits / static_checks / verdict_passed / project_path_from_url / pick_commit_author / mr_title）是纯函数，不碰 git、网络与数据库。
 """
 
 import difflib
@@ -48,7 +48,7 @@ from ..storage.models import (
 from .analysis import _call_model, _parse_json_payload
 from .assignee import changed_lines, find_original_author, resolve_assignee
 from .common import SurveyError, issue_key
-from .config import load_public_url, load_survey_config, resolve_budget
+from .config import load_fix_mr_title_prefix, load_public_url, load_survey_config, resolve_budget
 from .push import PushRejected, begin_pushes, execute_pushes
 from .workspace import CommitAuthor, commit_and_push_fix, delete_fix_workspace, prepare_fix_repo
 
@@ -139,6 +139,12 @@ def resolve_commit_author() -> CommitAuthor:
             # 若目标项目有推送规则卡提交者邮箱，推送那一步会失败并把原因记到修复记录上
             logger.warning("Fetching token account for commit author failed, using fallback", exc_info=True)
     return pick_commit_author(name, email, account)
+
+
+def mr_title(prefix: str, title: str) -> str:
+    """修复合并请求的标题：前缀加问题标题，前缀为空时只有问题标题；超出平台上限的部分截掉。"""
+    prefix = str(prefix or "").strip()
+    return (f"{prefix} {title}" if prefix else title)[:_MR_TITLE_MAX]
 
 
 def attach_fixes(findings: List[dict], fixes: List[dict]) -> None:
@@ -527,8 +533,8 @@ def _execute(run_uid: str, fix: dict) -> None:
     try:
         author = find_original_author(repo_dir, fix["file_path"], changed_lines(source, new_source))
     except SurveyError as e:
-        # 追溯失败只影响指派给谁，修改本身已经通过验证，退回仓库负责人
-        logger.warning("Blame failed, falling back to owner: run=%s: %s", run_uid, e)
+        # 追溯失败只影响指派给谁，修改本身已经通过验证，退回配置的仓库负责人（没有配置时不指派）
+        logger.warning("Blame failed, falling back to configured owner or none: run=%s: %s", run_uid, e)
         author = None
     assignee = resolve_assignee(project_path, author)
     repo.update_survey_fix(
@@ -556,7 +562,7 @@ def _execute(run_uid: str, fix: dict) -> None:
     repo.update_survey_fix(run_uid, source_branch=source_branch)
     mr = create_merge_request(
         project_path, source_branch, branch,
-        f"[OpenCR] {title}"[:_MR_TITLE_MAX],
+        mr_title(load_fix_mr_title_prefix(), title),
         _mr_description(fix, survey.get("name") or "", summary, attempts, assignee),
         assignee_id=assignee["id"],
     )

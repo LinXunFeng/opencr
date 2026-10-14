@@ -372,11 +372,10 @@ FIX_PLATFORM_FAILED = "platform_failed"
 FIX_MODEL_FAILED = "model_failed"
 
 # --- SurveyFix.assignee_source -------------------------------------------
-# 处理人从哪来：问题代码的原始作者；原始作者不可用时依次退回配置里指定的仓库负责人（configured）、
-# 按项目权限推断的仓库负责人（owner）。都找不到时为空，合并请求不指派
+# 处理人从哪来：问题代码的原始作者；原始作者不可用时退回配置里指定的仓库负责人（configured）。
+# 都找不到时为空，合并请求不指派
 ASSIGNEE_AUTHOR = "author"
 ASSIGNEE_CONFIGURED = "configured"
-ASSIGNEE_OWNER = "owner"
 
 # --- SurveyFix.trigger ---------------------------------------------------
 FIX_TRIGGER_MANUAL = "manual"
@@ -915,7 +914,7 @@ class RepoOwner(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     # 小写、去掉首尾斜杠的项目或组织路径，例如 team/app 或 team
     path: Mapped[str] = mapped_column(String(512), nullable=False)
-    # 平台用户名，JSON 数组，按顺序取第一个可用的：只配一个人的话，他离职或被封禁时又会退回按权限推断
+    # 平台用户名，JSON 数组，按顺序取第一个可用的：只配一个人的话，这个人离职或被封禁时合并请求就没人可指派
     usernames: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
     # 留痕用：半年后没人记得为什么是这个人
     note: Mapped[Optional[str]] = mapped_column(Text)

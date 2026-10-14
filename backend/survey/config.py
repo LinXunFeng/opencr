@@ -136,6 +136,11 @@ def load_survey_config() -> dict:
 
 # 运行期设置的键名，后台设置接口与这里共用
 SETTING_MAX_REPOS = "survey_max_repos"
+SETTING_FIX_MR_TITLE_PREFIX = "survey_fix_mr_title_prefix"
+# 修复合并请求标题的默认前缀，让人在合并请求列表里一眼认出这是机器提出的
+DEFAULT_FIX_MR_TITLE_PREFIX = "[OpenCR]"
+# 前缀长度上限。标题总长受平台限制（255），前缀太长会把问题标题本身挤掉
+FIX_MR_TITLE_PREFIX_MAX = 40
 
 
 def load_max_repos() -> int:
@@ -153,6 +158,20 @@ def load_max_repos() -> int:
         logger.warning("Invalid %s setting %r, using default", SETTING_MAX_REPOS, raw)
         value = DEFAULT_MAX_REPOS_PER_SURVEY
     return min(max(value, MAX_REPOS_LOWER_BOUND), MAX_REPOS_UPPER_BOUND)
+
+
+def load_fix_mr_title_prefix() -> str:
+    """
+    修复合并请求标题的前缀（运行期设置）。从没设置过时取默认值；设置成空串表示不加前缀。
+
+    存数据库而非 config.yaml：要能设成空串，而 config.yaml 的取值规则分不清"留空"与"没写"；
+    改了也不用重启，下一个修复就生效。
+    """
+    raw = repo.get_setting(SETTING_FIX_MR_TITLE_PREFIX)
+    if raw is None:
+        return DEFAULT_FIX_MR_TITLE_PREFIX
+    # 库里的脏值（手改过库）同样按接口的规则收拾：换行会把标题拆坏
+    return " ".join(str(raw).split())[:FIX_MR_TITLE_PREFIX_MAX]
 
 
 def load_public_url() -> str:

@@ -21,7 +21,6 @@ from ..storage.models import (
     CATEGORY_SECURITY,
     ASSIGNEE_AUTHOR,
     ASSIGNEE_CONFIGURED,
-    ASSIGNEE_OWNER,
     CLUE_BASELINE,
     CLUE_CODEGRAPH,
     CLUE_RECHECK,
@@ -116,8 +115,7 @@ FIX_STATUS_LABELS: Dict[str, str] = {
 
 ASSIGNEE_SOURCE_LABELS: Dict[str, str] = {
     ASSIGNEE_AUTHOR: "原始作者",
-    ASSIGNEE_CONFIGURED: "指定负责人",
-    ASSIGNEE_OWNER: "仓库负责人",
+    ASSIGNEE_CONFIGURED: "仓库负责人",
 }
 
 _SEVERITY_ORDER = [SEVERITY_CRITICAL, SEVERITY_WARNING, SEVERITY_ADVICE, SEVERITY_UNKNOWN]
@@ -196,7 +194,7 @@ def _render_fixes(fixes: List[dict]) -> List[str]:
         status = FIX_STATUS_LABELS.get(fix.get("status", ""), fix.get("status", ""))
         if fix.get("status") != RUN_SUCCEEDED and fix.get("error_message"):
             status += f"：{fix['error_message']}"
-        assignee = f"@{fix['assignee_username']}" if fix.get("assignee_username") else "-"
+        assignee = f"@{fix['assignee_username']}" if fix.get("assignee_username") else ("未指派" if fix.get("mr_url") else "-")
         if fix.get("assignee_source") in ASSIGNEE_SOURCE_LABELS:
             assignee += f"（{ASSIGNEE_SOURCE_LABELS[fix['assignee_source']]}）"
         title = _table_cell(fix.get("title") or "")

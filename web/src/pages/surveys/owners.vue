@@ -66,7 +66,7 @@ async function save() {
 async function remove(row: any) {
   const item = row as RepoOwner
   try {
-    await ElMessageBox.confirm(`删除 ${item.path} 的负责人配置？之后这里的仓库按项目权限推断负责人。`, "删除配置", {
+    await ElMessageBox.confirm(`删除 ${item.path} 的负责人配置？之后这里的仓库在原始作者不可用时不再指派处理人。`, "删除配置", {
       type: "warning"
     })
   } catch {
@@ -97,7 +97,7 @@ onMounted(load)
 
       <el-alert class="mb" type="info" :closable="false" show-icon :title="FIX_NOTES.ownerPage" />
 
-      <el-table :data="items" size="small" empty-text="还没有配置，负责人全部按项目权限推断">
+      <el-table :data="items" size="small" empty-text="还没有配置，原始作者不可用时合并请求不指派处理人">
         <el-table-column label="项目或组织路径" min-width="220">
           <template #default="{ row }">
             <code>{{ row.path }}</code>

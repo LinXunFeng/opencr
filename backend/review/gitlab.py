@@ -510,17 +510,16 @@ def get_project(project_path: str) -> dict:
     return data if isinstance(data, dict) else {}
 
 
-def list_project_members(project_path: str, inherited: bool = True) -> List[dict]:
+def list_project_members(project_path: str) -> List[dict]:
     """
-    列出项目成员。inherited=True 时包括从上级组织继承来的（members/all），否则只列项目直属成员。
+    列出项目成员，包括从上级组织继承来的（members/all）。
 
-    找原始作者要用含继承的：多数人是在组织上被授权的，只看直属成员会把他们都当成"已不在项目里"。
+    要用含继承的：多数人是在组织上被授权的，只看直属成员会把他们都当成"已不在项目里"。
     """
-    endpoint = "members/all" if inherited else "members"
     members: List[dict] = []
     for page in range(1, MAX_MEMBER_PAGES + 1):
         response = _gitlab_get(
-            f"/projects/{encode_project_path(project_path)}/{endpoint}",
+            f"/projects/{encode_project_path(project_path)}/members/all",
             params={"per_page": 100, "page": page},
         )
         batch = response.json() or []

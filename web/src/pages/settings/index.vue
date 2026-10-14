@@ -11,6 +11,7 @@ const guestRead = ref(true)
 const guestRetry = ref(false)
 const surveyGuestRead = ref(true)
 const surveyMaxRepos = ref<number | null>(200)
+const fixTitlePrefix = ref("")
 
 /** 读取当前设置。 */
 async function load() {
@@ -21,6 +22,7 @@ async function load() {
     guestRetry.value = data.value.writable.guest_retry
     surveyGuestRead.value = data.value.writable.survey_guest_read
     surveyMaxRepos.value = data.value.writable.survey_max_repos
+    fixTitlePrefix.value = data.value.writable.survey_fix_mr_title_prefix
   } catch (error) {
     ElMessage.error((error as Error).message)
   } finally {
@@ -125,6 +127,20 @@ async function saveSurveyMaxRepos() {
   }
 }
 
+/** 保存修复合并请求的标题前缀。允许留空：留空表示标题不加前缀 */
+async function saveFixTitlePrefix() {
+  saving.value = true
+  try {
+    const res = await updateSettingsApi({ survey_fix_mr_title_prefix: fixTitlePrefix.value })
+    fixTitlePrefix.value = res.writable.survey_fix_mr_title_prefix
+    ElMessage.success(fixTitlePrefix.value ? `标题前缀已设为 ${fixTitlePrefix.value}` : "已设为不加标题前缀")
+  } catch (error) {
+    ElMessage.error((error as Error).message)
+  } finally {
+    saving.value = false
+  }
+}
+
 onMounted(load)
 </script>
 
@@ -176,6 +192,17 @@ onMounted(load)
             单次巡检最多处理多少个仓库（组织展开、去重之后），默认 200。超出的仓库不参与本轮，
             运行详情里会记一条「仓库数超过单次巡检上限」降级。调大前留意：仓库越多，拉取、建索引与模型调用越久，
             可能需要同时调大巡检的耗时预算，否则会以「预算耗尽」提前收工。
+          </div>
+        </el-form-item>
+        <!-- 40 与后端 FIX_MR_TITLE_PREFIX_MAX 对应 -->
+        <el-form-item label="修复标题前缀">
+          <el-input v-model="fixTitlePrefix" :maxlength="40" placeholder="留空则不加前缀" style="width: 240px" :disabled="saving" />
+          <el-button class="ml" type="primary" :loading="saving" @click="saveFixTitlePrefix">
+            保存
+          </el-button>
+          <div class="hint">
+            巡检修复提出的合并请求，标题开头加的前缀，默认 <code>[OpenCR]</code>，方便在合并请求列表里认出机器提出的修改。
+            留空则标题只有问题本身。只影响之后提出的合并请求，已提出的不改。
           </div>
         </el-form-item>
       </el-form>

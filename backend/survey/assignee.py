@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 """
-修复合并请求的处理人：追溯问题代码的原始作者，作者不可用时退回仓库负责人（先看人工配置，没有再按项目权限推断）。
+修复合并请求的处理人：追溯问题代码的原始作者，作者不可用时退回人工配置的仓库负责人，都没有时不指派。
 
 原始作者不是"最后一次碰过这几行的人"。批量格式化、改缩进、换引号的提交会把整个文件的 blame 都归到
 执行格式化的人名下，指派给他等于把问题丢给一个从没写过这段逻辑的人。所以追溯时跳过只改格式的提交，
 一直追到最后一次实质改动这几行的提交。
 
-判定逻辑（formatting_only_lines / changed_lines / pick_author / match_member / unavailable_reason / pick_owner /
-pick_configured_owner）
-都是纯函数，不碰 git 与网络；find_original_author 与 resolve_assignee 负责把它们和 git、平台接口串起来。
+判定逻辑（formatting_only_lines / changed_lines / pick_author / match_member / unavailable_reason /
+pick_configured_owner）都是纯函数，不碰 git 与网络；find_original_author 与 resolve_assignee 负责把它们和 git、平台接口串起来。
 """
 
 import bisect
@@ -20,15 +19,13 @@ from typing import Dict, List, Optional, Tuple
 
 from ..review.gitlab import get_current_user, list_project_members, search_users
 from ..storage import repo
-from ..storage.models import ASSIGNEE_AUTHOR, ASSIGNEE_CONFIGURED, ASSIGNEE_OWNER
+from ..storage.models import ASSIGNEE_AUTHOR, ASSIGNEE_CONFIGURED
 from .workspace import git_blame, git_show_file, read_blame_ignore_revs
 
 logger = logging.getLogger(__name__)
 
 # 处理人至少要有 Developer 权限：低于它的人推不了分支、改不了代码，指派过去只能干看着
 MIN_ASSIGNEE_ACCESS = 30
-# 仓库负责人取 Maintainer 及以上
-MIN_OWNER_ACCESS = 40
 # 跳过格式化提交最多重做几轮 blame。每轮都可能揭出更早的一次格式化，层层嵌套超过这个数的仓库很少见，
 # 撞到上限时剩下的格式化提交不再计入作者统计（见 pick_author 的调用处）
 MAX_FORMAT_SKIP_ROUNDS = 5
@@ -355,48 +352,13 @@ def _membership_active(member: dict) -> bool:
     return str(member.get("membership_state") or "active").strip().lower() == "active"
 
 
-def pick_owner(members: List[dict], self_id: Optional[int]) -> Optional[dict]:
-    """
-    从一组成员里挑仓库负责人：权限最高（Owner 优先于 Maintainer）的可用成员，同级取最早加入平台的（id 最小）。
-
-    平台的合并请求在免费版只能指派一个人，所以只挑一个；挑法要确定，同一个仓库每次都落到同一个人身上。
-    先从项目直属成员里挑、挑不出再看继承来的，由调用方决定（见 resolve_assignee）。
-    """
-    candidates = [
-        m for m in members
-        if int(m.get("access_level") or 0) >= MIN_OWNER_ACCESS
-        and str(m.get("state") or "active").strip().lower() == "active"
-        and _membership_active(m)
-        and not _is_bot(m)
-        and (self_id is None or m.get("id") != self_id)
-    ]
-    if not candidates:
-        return None
-    return sorted(candidates, key=lambda m: (-int(m.get("access_level") or 0), int(m.get("id") or 0)))[0]
-
-
-def _direct_members(project_path: str) -> List[dict]:
-    """
-    项目直属成员；读取失败时返回空列表，由调用方退回含继承的成员。
-
-    负责人先从直属成员里挑：继承来的成员里，顶层组织的 Owner 往往是平台管理员，
-    按权限排序会排在这个项目真正的 Maintainer 前面。
-    """
-    try:
-        return list_project_members(project_path, inherited=False)
-    except Exception as e:
-        # 后果只是负责人可能落到继承来的高权限成员身上
-        logger.warning("Listing direct project members failed: project=%s: %s", project_path, e)
-        return []
-
-
 def resolve_assignee(project_path: str, author: Optional[dict]) -> dict:
     """
     决定修复合并请求的处理人。
 
-    依次尝试：原始作者 → 仓库负责人配置里第一个可用的人 → 按项目权限推断的仓库负责人。
-    返回 {"source", "id", "username", "name", "note"}：source 为 ASSIGNEE_AUTHOR / ASSIGNEE_CONFIGURED / ASSIGNEE_OWNER，
-    都找不到时为空串、id 为 None（合并请求照常提出，只是不指派）。note 说明为什么没指派给原始作者。
+    依次尝试：原始作者 → 仓库负责人配置里第一个可用的人。
+    返回 {"source", "id", "username", "name", "note"}：source 为 ASSIGNEE_AUTHOR / ASSIGNEE_CONFIGURED，
+    都找不到时为空串、id 为 None（合并请求照常提出，只是不指派）。note 说明为什么没指派给原始作者、为什么没有指派。
     平台接口出错不抛出：处理人只是锦上添花，为它让整个修复失败不划算。
     """
     result = {"source": "", "id": None, "username": "", "name": "", "note": ""}
@@ -410,7 +372,7 @@ def resolve_assignee(project_path: str, author: Optional[dict]) -> dict:
     try:
         self_id = get_current_user().get("id")
     except Exception as e:
-        # 读不到自己是谁的后果只是少了一条排除规则，OpenCR 的账号通常也不是 Maintainer
+        # 读不到自己是谁的后果只是少了一条排除规则：令牌账号若恰好是原始作者或配置里的人，会被指派给它自己
         logger.warning("Reading current user failed: %s", e)
         self_id = None
 
@@ -441,18 +403,13 @@ def resolve_assignee(project_path: str, author: Optional[dict]) -> dict:
             note=f"{reason}，改为指派给配置的仓库负责人{config_note}",
         )
         return result
+    # 不再按项目权限推断一个 Maintainer 兜底：推断出来的往往是组织管理员或早已不管这个仓库的人，
+    # 合并请求落到这样的人名下看起来"有人负责"，实际没人处理，比明明白白的未指派更难被发现。
+    # 未指派的合并请求在「修复合并请求」模块里可以单独筛出来
     if config_note:
-        reason = f"{reason}；{config_note}"
-
-    owner = pick_owner(_direct_members(project_path), self_id) or pick_owner(members, self_id)
-    if owner is None:
-        result["note"] = f"{reason}，且项目里没有可用的 Maintainer，未指派处理人"
-        return result
-    result.update(
-        source=ASSIGNEE_OWNER, id=owner.get("id"),
-        username=owner.get("username") or "", name=owner.get("name") or "",
-        note=f"{reason}，改为按项目权限指派仓库负责人",
-    )
+        result["note"] = f"{reason}；{config_note}，未指派处理人"
+    else:
+        result["note"] = f"{reason}，且没有为这个仓库配置负责人，未指派处理人"
     return result
 
 
@@ -479,12 +436,12 @@ def _configured_owner(project_path: str, members: List[dict], self_id: Optional[
     按仓库负责人配置找处理人，返回 (成员, 说明)。
 
     找到时说明是"（命中的配置路径）"；配置了但没有可用的人时成员为 None、说明列出每个人被跳过的原因；
-    没有适用的配置时两者都为空，调用方按项目权限推断。
+    没有适用的配置时两者都为空。
     """
     try:
         entry = repo.find_repo_owner(project_path)
     except Exception as e:
-        # 后果是这一次跳过配置、按项目权限推断负责人
+        # 后果是这一次跳过配置、合并请求不指派，说明里写的是"没有配置负责人"
         logger.warning("Reading repo owner config failed: project=%s: %s", project_path, e)
         return None, ""
     if entry is None:

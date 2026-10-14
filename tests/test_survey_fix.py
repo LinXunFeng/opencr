@@ -104,6 +104,18 @@ TOKEN_ACCOUNT = {"id": 100, "name": "Fix Bot", "username": "fixbot", "email": "b
                  "commit_email": "100-fixbot@users.noreply.g.com", "public_email": "public@corp.com"}
 
 
+class MrTitleTests(unittest.TestCase):
+    """合并请求标题的前缀。"""
+
+    def test_prefix_and_truncation(self):
+        """有前缀时以空格隔开；空前缀只留问题标题；超出平台上限的部分截掉。"""
+        from backend.survey.fix import mr_title
+
+        self.assertEqual(mr_title("[OpenCR]", "空指针"), "[OpenCR] 空指针")
+        self.assertEqual(mr_title("  ", "空指针"), "空指针")
+        self.assertEqual(len(mr_title("[Bot]", "长" * 400)), 255)
+
+
 class CommitAuthorTests(unittest.TestCase):
     """修复提交的作者：配置优先，其次令牌账号，最后兜底身份。"""
 
@@ -214,7 +226,7 @@ class AuthorshipTests(unittest.TestCase):
 
 
 class AssigneeSelectionTests(unittest.TestCase):
-    """把原始作者对应到平台账号，不可用时退回仓库负责人。"""
+    """把原始作者对应到平台账号，不可用且没有配置仓库负责人时不指派。"""
 
     def setUp(self):
         """这一组不建库：没有仓库负责人配置。不 mock 的话会去读开发机上真实的数据库。"""
@@ -264,17 +276,10 @@ class AssigneeSelectionTests(unittest.TestCase):
         self.assertIn("无法对应", unavailable_reason(None, False, None))
         self.assertIn("尚未生效", unavailable_reason(self.MEMBERS[7], True, None))
 
-    def test_pick_owner(self):
-        """Owner 优先于 Maintainer；被封禁的、机器人、OpenCR 自己都不选。"""
-        from backend.survey.assignee import pick_owner
-
-        self.assertEqual(pick_owner(self.MEMBERS, None)["id"], 4)
-        self.assertEqual(pick_owner(self.MEMBERS, 4)["id"], 3)
-        self.assertIsNone(pick_owner(self.MEMBERS[:2], None))
-
-    def test_resolve_falls_back_to_owner(self):
-        """原始作者可用就指派给他；被封禁或追溯不到时改派仓库负责人，并写明原因。"""
-        from backend.storage.models import ASSIGNEE_AUTHOR, ASSIGNEE_OWNER
+    def test_resolve_leaves_unassigned_without_config(self):
+        """原始作者可用就指派给他；被封禁或追溯不到、又没有配置仓库负责人时不指派，
+        即使项目里有可用的 Maintainer 与 Owner 也不按权限猜一个人，并写明原因。"""
+        from backend.storage.models import ASSIGNEE_AUTHOR
         from backend.survey import assignee
 
         with mock.patch.object(assignee, "list_project_members", return_value=self.MEMBERS), \
@@ -284,24 +289,12 @@ class AssigneeSelectionTests(unittest.TestCase):
             blocked = assignee.resolve_assignee("grp/app", {"name": "Bob", "email": "bob@corp.com"})
             unknown = assignee.resolve_assignee("grp/app", None)
         self.assertEqual((ok["source"], ok["username"]), (ASSIGNEE_AUTHOR, "alice"))
-        self.assertEqual((blocked["source"], blocked["username"]), (ASSIGNEE_OWNER, "dave"))
+        self.assertEqual((blocked["source"], blocked["id"], blocked["username"]), ("", None, ""))
         self.assertIn("Bob", blocked["note"])
         self.assertIn("blocked", blocked["note"])
-        self.assertEqual(unknown["source"], ASSIGNEE_OWNER)
-
-    def test_owner_prefers_direct_members(self):
-        """继承来的顶层组织 Owner 不能盖过项目自己的 Maintainer。"""
-        from backend.survey import assignee
-
-        def members(path, inherited=True):
-            """直属成员只有 carol；含继承的还多一个组织 Owner dave。"""
-            return self.MEMBERS if inherited else [self.MEMBERS[2]]
-
-        with mock.patch.object(assignee, "list_project_members", side_effect=members), \
-                mock.patch.object(assignee, "get_current_user", return_value={"id": 100}), \
-                mock.patch.object(assignee, "search_users", return_value=[]):
-            result = assignee.resolve_assignee("grp/app", None)
-        self.assertEqual(result["username"], "carol")
+        self.assertIn("没有为这个仓库配置负责人，未指派处理人", blocked["note"])
+        self.assertEqual((unknown["source"], unknown["id"]), ("", None))
+        self.assertIn("没有追溯到原始作者", unknown["note"])
 
     def test_members_failure_leaves_unassigned(self):
         """读不到成员时不指派，但不抛：处理人不该让整个修复失败。报错原文不进 note（它会进合并请求说明）。"""
@@ -617,6 +610,7 @@ class ExecuteFixTests(FixTestCase):
         # 项目路径去掉了 .git 后缀
         self.assertEqual(args.args[0], str(self.root / "remote").lstrip("/"))
         self.assertEqual(args.args[2], "main")
+        self.assertEqual(args.args[3], "[OpenCR] 求和没有处理空价格")
         self.assertEqual(args.kwargs["assignee_id"], 1)
         self.assertIn("合并不会直接改变巡检台账的状态", args.args[4])
         # 分支真的推到了远端，提交只含这一个文件
@@ -629,6 +623,14 @@ class ExecuteFixTests(FixTestCase):
         # 工作区做完即删
         self.assertFalse((self.root / "ws" / ".fixes").exists() and any((self.root / "ws" / ".fixes").iterdir()))
 
+    def test_mr_title_prefix_follows_setting(self):
+        """标题前缀按后台设置；设成空串时标题只有问题本身。"""
+        from backend.survey.config import SETTING_FIX_MR_TITLE_PREFIX
+
+        self.repo.set_setting(SETTING_FIX_MR_TITLE_PREFIX, "")
+        _, create = self._execute([self._proposal(), '{"resolved":true,"problems":[]}'])
+        self.assertEqual(create.call_args.args[3], "求和没有处理空价格")
+
     def test_configured_commit_author_wins(self):
         """配置了提交作者时用配置的，只配了名字时邮箱仍跟随令牌账号。"""
         with mock.patch.dict(os.environ, {"OPENCR_SURVEY_FIX_COMMIT_NAME": "Quality Bot"}):
@@ -636,13 +638,23 @@ class ExecuteFixTests(FixTestCase):
         shown = _git(self.root / "remote.git", "log", "-1", "--format=%an|%ae", result["source_branch"])
         self.assertEqual(shown.strip(), "Quality Bot|100-fixbot@users.noreply.g.com")
 
-    def test_blocked_author_goes_to_owner(self):
-        """原始作者被封禁时改派仓库负责人，原因写进记录。"""
+    def test_blocked_author_goes_to_configured_owner(self):
+        """原始作者被封禁时改派配置的仓库负责人，原因写进记录。"""
+        self.repo.save_repo_owner(str(self.root / "remote").lstrip("/"), ["lead"])
         members = [{**self.MEMBERS[0], "state": "blocked"}, *self.MEMBERS[1:]]
         result, create = self._execute([self._proposal(), '{"resolved":true,"problems":[]}'], members=members)
-        self.assertEqual((result["assignee_username"], result["assignee_source"]), ("lead", "owner"))
+        self.assertEqual((result["assignee_username"], result["assignee_source"]), ("lead", "configured"))
         self.assertIn("blocked", result["assignee_note"])
         self.assertEqual(create.call_args.kwargs["assignee_id"], 3)
+
+    def test_blocked_author_without_config_leaves_mr_unassigned(self):
+        """原始作者被封禁、又没有配置仓库负责人时，合并请求照常提出但不指派，原因写进记录。"""
+        members = [{**self.MEMBERS[0], "state": "blocked"}, *self.MEMBERS[1:]]
+        result, create = self._execute([self._proposal(), '{"resolved":true,"problems":[]}'], members=members)
+        self.assertEqual(result["status"], "succeeded")
+        self.assertFalse(result["assignee_username"] or result["assignee_source"])
+        self.assertIn("未指派处理人", result["assignee_note"])
+        self.assertIsNone(create.call_args.kwargs["assignee_id"])
 
     def test_retry_after_failed_verification(self):
         """第一轮套不上，第二轮带着原因重来并通过。"""
@@ -992,7 +1004,7 @@ class RepoOwnerStorageTests(FixTestCase):
 
 
 class ConfiguredOwnerTests(FixTestCase):
-    """原始作者不可用时，先找配置的负责人，再按项目权限推断。"""
+    """原始作者不可用时找配置的负责人，找不到就不指派。"""
 
     MEMBERS = [
         {"id": 1, "username": "alice", "name": "Alice", "state": "blocked", "access_level": 30},
@@ -1017,17 +1029,20 @@ class ConfiguredOwnerTests(FixTestCase):
         self.assertEqual((result["source"], result["username"]), ("configured", "carol"))
         self.assertIn("按 team 的配置", result["note"])
 
-    def test_falls_back_to_rule_when_configured_unavailable(self):
-        """配置的人都不可用时按项目权限推断，并写明配置的人为什么被跳过。"""
+    def test_unassigned_when_configured_unavailable(self):
+        """配置的人都不可用时不指派（不按项目权限推断，项目里的 Owner dave 也不选），并写明配置的人为什么被跳过。"""
         self.repo.save_repo_owner("team/app", ["gone", "nobody"])
         result = self._resolve()
-        self.assertEqual((result["source"], result["username"]), ("owner", "dave"))
+        self.assertEqual((result["source"], result["id"]), ("", None))
+        self.assertIn("未指派处理人", result["note"])
         self.assertIn("gone 账号不可用（blocked）", result["note"])
         self.assertIn("nobody 不在项目成员中", result["note"])
 
-    def test_no_config_uses_rule(self):
-        """没有配置时与原来一样按项目权限推断。"""
-        self.assertEqual(self._resolve()["source"], "owner")
+    def test_no_config_leaves_unassigned(self):
+        """没有配置时不指派。"""
+        result = self._resolve()
+        self.assertEqual((result["source"], result["id"]), ("", None))
+        self.assertIn("没有为这个仓库配置负责人", result["note"])
 
 
 class FixTriggerRouteTests(FixRouteTestCase):
@@ -1078,3 +1093,88 @@ class FixTriggerRouteTests(FixRouteTestCase):
         self.assertEqual(self.client.patch("/api/admin/repo-owners/999", json={"path": "x", "usernames": ["a"]}).status_code, 404)
         self.assertEqual(self.client.delete(f"/api/admin/repo-owners/{owner_id}").json, {"removed": True})
         self.assertEqual(self.client.get("/api/admin/repo-owners").json["items"], [])
+
+
+class FixMergeRequestListTests(FixRouteTestCase):
+    """「修复合并请求」列表：只列提出了合并请求的修复，按巡检、处理人（含未指派）与关键字筛选。"""
+
+    def _fix(self, title, assignee="", status="succeeded", mr=True):
+        """一条修复记录：给定处理人（空串表示未指派）与结果，返回 run_uid。"""
+        _, finding_id = self._run_with_finding(title=title)
+        _, uid = self.repo.start_survey_fix(finding_id)
+        fields = {"assignee_username": assignee or None, "assignee_name": assignee.title() or None,
+                  "assignee_source": "author" if assignee else None}
+        if mr:
+            fields.update(mr_iid=len(title), mr_url=f"https://g.com/a/app/-/merge_requests/{len(title)}")
+        self.repo.update_survey_fix(uid, **fields)
+        self.repo.finish_survey_fix(uid, status)
+        return uid
+
+    def _seed(self):
+        """alice 两条、bob 一条、未指派一条（空串与 NULL 各一种写法都要算），外加失败与没有合并请求的各一条。"""
+        self._fix("空价格 A", "alice")
+        self._fix("空价格 B", "alice")
+        self._fix("越界", "bob")
+        self._fix("未指派的问题")
+        uid = self._fix("另一个未指派")
+        self.repo.update_survey_fix(uid, assignee_username="")
+        self._fix("失败的修复", "alice", status="failed", mr=False)
+        self._fix("跳过的修复", "alice", status="skipped", mr=False)
+
+    def test_lists_only_opened_merge_requests_with_facets(self):
+        """失败与跳过的不列；选项里各处理人的数量与未指派的数量对得上。"""
+        from backend.storage.repo import list_fix_merge_requests
+
+        self._seed()
+        result = list_fix_merge_requests()
+        self.assertEqual(result["total"], 5)
+        self.assertEqual([(o["username"], o["count"]) for o in result["assignees"]], [("alice", 2), ("bob", 1)])
+        self.assertEqual(result["unassigned"], 2)
+        self.assertEqual(result["items"][0]["survey_name"], self.survey["name"])
+
+    def test_filters_by_assignees_unassigned_and_keyword(self):
+        """多选处理人取并集，可与未指派同时选；选项不受处理人筛选影响；关键字匹配标题。"""
+        from backend.storage.repo import UNASSIGNED_FILTER, list_fix_merge_requests
+
+        self._seed()
+        titles = lambda r: sorted(i["title"] for i in r["items"])  # noqa: E731
+        self.assertEqual(titles(list_fix_merge_requests(assignees=["bob"])), ["越界"])
+        both = list_fix_merge_requests(assignees=["bob", UNASSIGNED_FILTER])
+        self.assertEqual(titles(both), ["另一个未指派", "未指派的问题", "越界"])
+        self.assertEqual(len(both["assignees"]), 2)
+        self.assertEqual(titles(list_fix_merge_requests(assignees=[UNASSIGNED_FILTER])), ["另一个未指派", "未指派的问题"])
+        self.assertEqual(titles(list_fix_merge_requests(keyword="空价格")), ["空价格 A", "空价格 B"])
+        # % 与 _ 按字面匹配，不当通配符
+        self.assertEqual(list_fix_merge_requests(keyword="空_格")["total"], 0)
+        self.assertEqual(list_fix_merge_requests(keyword="%")["total"], 0)
+        self.assertEqual(list_fix_merge_requests(keyword="空价格", assignees=["bob"])["total"], 0)
+        self.assertEqual(list_fix_merge_requests(survey_uid="nope")["total"], 0)
+        paged = list_fix_merge_requests(limit=2, offset=4)
+        self.assertEqual((paged["total"], len(paged["items"])), (5, 1))
+
+    def test_route_admin_only_and_parses_filters(self):
+        """只对 Admin；处理人以逗号分隔传入。"""
+        self._seed()
+        self.assertIn(self.client.get("/api/admin/survey-fixes").status_code, (401, 403))
+        self._login()
+        response = self.client.get("/api/admin/survey-fixes?assignees=alice,__unassigned__&limit=10")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json["total"], 4)
+        uid = self.survey["survey_uid"]
+        self.assertEqual(self.client.get(f"/api/admin/survey-fixes?survey_uid={uid}&q=越界").json["total"], 1)
+
+
+class FixTitlePrefixSettingTests(FixRouteTestCase):
+    """后台设置里的修复合并请求标题前缀。"""
+
+    def test_default_update_and_validation(self):
+        """默认 [OpenCR]；可以改、可以设成空串（不加前缀）；超长、带换行、不是文本的拒绝。"""
+        self._login()
+        key = "survey_fix_mr_title_prefix"
+        self.assertEqual(self.client.get("/api/admin/settings").json["writable"][key], "[OpenCR]")
+        response = self.client.patch("/api/admin/settings", json={key: " [Bot] "})
+        self.assertEqual(response.json["writable"][key], "[Bot]")
+        self.assertEqual(self.client.patch("/api/admin/settings", json={key: ""}).json["writable"][key], "")
+        for bad in ("x" * 41, "a\nb", "a\tb", 1, None, True):
+            self.assertEqual(self.client.patch("/api/admin/settings", json={key: bad}).status_code, 400, bad)
+        self.assertEqual(self.client.get("/api/admin/settings").json["writable"][key], "")

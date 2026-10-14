@@ -3044,6 +3044,106 @@ def survey_fix_links(survey_id: int) -> Dict[str, List[str]]:
     return links
 
 
+# 「修复合并请求」列表里代表"未指派"的处理人取值。平台用户名只含字母、数字、点、横线与下划线，不会撞上它
+UNASSIGNED_FILTER = "__unassigned__"
+
+
+def _unassigned(username_column):
+    """处理人为空的条件。未指派在库里可能是 NULL 也可能是空串（取决于写入时走的哪条路径），两种都算。"""
+    from sqlalchemy import or_
+
+    return or_(username_column.is_(None), username_column == "")
+
+
+def _like_pattern(text: str) -> str:
+    """把关键字转成"包含"匹配的 LIKE 模式。% 与 _ 要转义：文件路径里到处是下划线，不转义会被当成任意字符。"""
+    escaped = text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{escaped}%"
+
+
+def _merge_request_fixes_stmt(survey_uid: str):
+    """提出了合并请求的修复运行（可限定巡检）的查询，口径与 survey_fix_links 一致：成功且有链接。"""
+    from .models import Survey, SurveyFix
+
+    stmt = select(SurveyFix).where(
+        SurveyFix.status == RUN_SUCCEEDED, SurveyFix.mr_url.is_not(None), SurveyFix.mr_url != ""
+    )
+    if survey_uid:
+        stmt = stmt.where(SurveyFix.survey_id == select(Survey.id).where(Survey.survey_uid == survey_uid).scalar_subquery())
+    return stmt
+
+
+def list_fix_merge_requests(
+    survey_uid: str = "",
+    assignees: Optional[List[str]] = None,
+    keyword: str = "",
+    limit: int = 50,
+    offset: int = 0,
+    stale_after_seconds: int = 600,
+) -> dict:
+    """
+    跨巡检列出修复提出的合并请求与处理人，按发起时间倒序。
+
+    assignees 是要看的处理人用户名，可含 UNASSIGNED_FILTER 表示未指派；为空表示不按处理人筛选。
+    keyword 在问题标题、仓库与文件路径里匹配。返回 {"items", "total", "assignees", "unassigned"}：
+    后两项是只按巡检与关键字筛选时，各处理人的合并请求数与未指派的数量，给筛选框当选项——
+    不受处理人筛选影响，否则选了一个人之后其他人就从选项里消失了。
+    """
+    from sqlalchemy import or_
+
+    from .models import Survey, SurveyFix
+
+    base = _merge_request_fixes_stmt(survey_uid)
+    text_filter = str(keyword or "").strip()
+    if text_filter:
+        pattern = _like_pattern(text_filter)
+        base = base.where(or_(
+            SurveyFix.title.ilike(pattern, escape="\\"),
+            SurveyFix.repo_slug.ilike(pattern, escape="\\"),
+            SurveyFix.file_path.ilike(pattern, escape="\\"),
+        ))
+
+    wanted = [str(a).strip() for a in (assignees or []) if str(a or "").strip()]
+    stmt = base
+    if wanted:
+        names = [a for a in wanted if a != UNASSIGNED_FILTER]
+        conds = [SurveyFix.assignee_username.in_(names)] if names else []
+        if UNASSIGNED_FILTER in wanted:
+            conds.append(_unassigned(SurveyFix.assignee_username))
+        stmt = stmt.where(or_(*conds))
+
+    with session_scope() as session:
+        total = session.scalar(select(func.count()).select_from(stmt.subquery())) or 0
+        rows = session.scalars(
+            stmt.order_by(SurveyFix.id.desc()).offset(max(int(offset), 0)).limit(max(int(limit), 1))
+        ).all()
+        surveys = {
+            s.id: s for s in session.scalars(select(Survey).where(Survey.id.in_({r.survey_id for r in rows}))).all()
+        } if rows else {}
+        items = []
+        for fix in rows:
+            item = _survey_fix_to_dict(fix, stale_after_seconds, include_detail=False)
+            survey = surveys.get(fix.survey_id)
+            item["survey_uid"] = survey.survey_uid if survey else ""
+            item["survey_name"] = survey.name if survey else ""
+            items.append(item)
+
+        facet = base.subquery()
+        counted = session.execute(
+            select(facet.c.assignee_username, func.max(facet.c.assignee_name), func.count())
+            .where(~_unassigned(facet.c.assignee_username))
+            .group_by(facet.c.assignee_username)
+        ).all()
+        unassigned = session.scalar(
+            select(func.count()).select_from(facet).where(_unassigned(facet.c.assignee_username))
+        ) or 0
+    options = sorted(
+        ({"username": username, "name": name or "", "count": count} for username, name, count in counted),
+        key=lambda o: (-o["count"], o["username"].lower()),
+    )
+    return {"items": items, "total": total, "assignees": options, "unassigned": unassigned}
+
+
 def latest_succeeded_survey_run_uid(survey_id: int) -> str:
     """该巡检最近一次成功运行的 run_uid；没有时返回空串。"""
     from .models import SurveyRun
