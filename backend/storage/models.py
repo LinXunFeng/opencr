@@ -916,6 +916,9 @@ class RepoOwner(Base):
     path: Mapped[str] = mapped_column(String(512), nullable=False)
     # 平台用户名，JSON 数组，按顺序取第一个可用的：只配一个人的话，这个人离职或被封禁时合并请求就没人可指派
     usernames: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    # 用户名 → 平台上的姓名，JSON 对象，只用于展示。用户名在有些平台上是工号一类的数字，光看它认不出是谁。
+    # 是保存或补查时的快照：改名后不会自动跟上，但匹配负责人只认 usernames，名字过期不影响指派
+    user_names: Mapped[Optional[str]] = mapped_column(Text)
     # 留痕用：半年后没人记得为什么是这个人
     note: Mapped[Optional[str]] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=utcnow)

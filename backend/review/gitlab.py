@@ -543,6 +543,19 @@ def search_users(query: str) -> List[dict]:
     return [item for item in data if isinstance(item, dict)] if isinstance(data, list) else []
 
 
+def get_user_by_username(username: str, timeout: int = 30) -> dict:
+    """
+    按用户名精确查找用户，找不到时返回空字典。
+
+    不用 search_users：模糊搜索按用户名、姓名、邮箱一起匹配，用户名是工号一类的数字时，
+    别人的邮箱或姓名里恰好含这串数字也会被搜出来。
+    """
+    response = _gitlab_get("/users", params={"username": str(username or "").strip()}, timeout=timeout)
+    data = response.json() or []
+    users = [item for item in data if isinstance(item, dict)] if isinstance(data, list) else []
+    return users[0] if users else {}
+
+
 def get_current_user() -> dict:
     """令牌所属的账号。"""
     response = _gitlab_get("/user")

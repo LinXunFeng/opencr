@@ -1002,6 +1002,52 @@ class RepoOwnerStorageTests(FixTestCase):
         self.assertIsNone(self.repo.save_repo_owner("team/x", ["a"], owner_id=999))
         self.assertTrue(self.repo.delete_repo_owner(other["id"]))
 
+    def test_name_snapshot_follows_usernames(self):
+        """姓名快照与用户名同序返回；没查到的人沿用原有快照，移除的人连同名字一起去掉。"""
+        saved = self.repo.save_repo_owner("team/app", ["10086", "10010"], user_names={"10086": "张三", "10010": "李四"})
+        self.assertEqual(saved["users"], [{"username": "10086", "name": "张三"}, {"username": "10010", "name": "李四"}])
+        # 调换顺序、这次一个都没查到：名字不能被抹掉，顺序跟着用户名走
+        again = self.repo.save_repo_owner("team/app", ["10010", "10086"], owner_id=saved["id"], user_names={})
+        self.assertEqual([u["name"] for u in again["users"]], ["李四", "张三"])
+        dropped = self.repo.save_repo_owner("team/app", ["10010"], owner_id=saved["id"])
+        readded = self.repo.save_repo_owner("team/app", ["10010", "10086"], owner_id=saved["id"])
+        self.assertEqual(dropped["users"], [{"username": "10010", "name": "李四"}])
+        self.assertEqual(readded["users"][1], {"username": "10086", "name": ""})
+
+    def test_fill_names_only_fills_missing(self):
+        """补查只补缺的名字，不改已有的，也不动更新时间。"""
+        a = self.repo.save_repo_owner("team/app", ["u1", "u2"], user_names={"u1": "旧名"})
+        self.repo.save_repo_owner("team/web", ["u2"])
+        self.assertEqual(self.repo.fill_repo_owner_names({"u1": "新名", "u2": "王五"}), 2)
+        items = {i["path"]: i for i in self.repo.list_repo_owners()}
+        self.assertEqual([u["name"] for u in items["team/app"]["users"]], ["旧名", "王五"])
+        self.assertEqual(items["team/web"]["users"][0]["name"], "王五")
+        self.assertEqual(items["team/app"]["updated_at"], a["updated_at"])
+        self.assertEqual(self.repo.fill_repo_owner_names({"u2": "王五"}), 0)
+
+    def test_add_owner_to_paths(self):
+        """按负责人填写：已有配置追加到末尾，已在列表里的不动，没有的新建；备注只写给新建的。"""
+        self.repo.save_repo_owner("team/app", ["lead"], note="原备注")
+        self.repo.save_repo_owner("team/web", ["carol", "lead"])
+        result = self.repo.add_repo_owner_paths("@carol", ["Team/App", "team/web", "team/new.git", "team/app"], "新备注", name="Carol")
+        self.assertEqual(result, {"created": ["team/new"], "appended": ["team/app"], "unchanged": ["team/web"]})
+        items = {i["path"]: i for i in self.repo.list_repo_owners()}
+        self.assertEqual(items["team/app"]["usernames"], ["lead", "carol"])
+        self.assertEqual(items["team/app"]["note"], "原备注")
+        self.assertEqual(items["team/app"]["users"][1], {"username": "carol", "name": "Carol"})
+        self.assertEqual(items["team/web"]["usernames"], ["carol", "lead"])
+        self.assertEqual((items["team/new"]["usernames"], items["team/new"]["note"]), (["carol"], "新备注"))
+
+    def test_add_owner_to_paths_is_all_or_nothing(self):
+        """有一条路径不合法就整批不写。"""
+        with self.assertRaises(ValueError):
+            self.repo.add_repo_owner_paths("carol", ["team/a", "  "])
+        with self.assertRaises(ValueError):
+            self.repo.add_repo_owner_paths("", ["team/a"])
+        with self.assertRaises(ValueError):
+            self.repo.add_repo_owner_paths("carol", [])
+        self.assertEqual(self.repo.list_repo_owners(), [])
+
 
 class ConfiguredOwnerTests(FixTestCase):
     """原始作者不可用时找配置的负责人，找不到就不指派。"""
@@ -1077,8 +1123,24 @@ class FixTriggerRouteTests(FixRouteTestCase):
         updated = self.client.patch(f"/api/admin/surveys/{uid}", json={"fix_mode": "auto", "fix_min_severity": "critical"}).json
         self.assertEqual((updated["fix_mode"], updated["fix_min_severity"]), ("auto", "critical"))
 
+    def _mock_user_lookup(self, names=None, error=None):
+        """按用户名查姓名的平台接口：names 里有的返回对应姓名，error 不为空时每次都抛它。"""
+        names = names or {}
+
+        def lookup(username, timeout=30):
+            """模拟精确查找用户。"""
+            if error:
+                raise error
+            return {"username": username, "name": names[username]} if username in names else {}
+
+        patch = mock.patch("backend.admin.routes.get_user_by_username", side_effect=lookup)
+        started = patch.start()
+        self.addCleanup(patch.stop)
+        return started
+
     def test_repo_owner_crud(self):
         """只对 Admin 开放；路径可以填地址，用户名可以是逗号分隔的字符串。"""
+        self._mock_user_lookup()
         self.assertEqual(self.client.get("/api/admin/repo-owners").status_code, 401)
         self._login()
         created = self.client.post(
@@ -1093,6 +1155,80 @@ class FixTriggerRouteTests(FixRouteTestCase):
         self.assertEqual(self.client.patch("/api/admin/repo-owners/999", json={"path": "x", "usernames": ["a"]}).status_code, 404)
         self.assertEqual(self.client.delete(f"/api/admin/repo-owners/{owner_id}").json, {"removed": True})
         self.assertEqual(self.client.get("/api/admin/repo-owners").json["items"], [])
+
+    def test_repo_owner_names_looked_up_and_backfilled(self):
+        """保存时查姓名；已有配置缺名字的在加载列表时补查并写回，之后不再查。"""
+        self._login()
+        lookup = self._mock_user_lookup({"10086": "张三", "10010": "李四"})
+        created = self.client.post("/api/admin/repo-owners", json={"path": "team/app", "usernames": ["10086", "nobody"]}).json
+        self.assertEqual(created["users"], [{"username": "10086", "name": "张三"}, {"username": "nobody", "name": ""}])
+        # 模拟姓名快照出现之前保存的配置
+        self.repo.save_repo_owner("team/web", ["10010"])
+        lookup.reset_mock()
+        items = {i["path"]: i for i in self.client.get("/api/admin/repo-owners").json["items"]}
+        self.assertEqual(items["team/web"]["users"], [{"username": "10010", "name": "李四"}])
+        # nobody 保存时已查过、查无此人，不再补查
+        self.assertEqual([c.args[0] for c in lookup.call_args_list], ["10010"])
+        lookup.reset_mock()
+        self.client.get("/api/admin/repo-owners")
+        # 查到的与查无此人的都记进了快照，之后不再查：否则查无此人的永远占着补查名额
+        lookup.assert_not_called()
+
+    def test_repo_owner_backfill_not_starved_by_unknown_users(self):
+        """补查名额被查无此人的人占满时，下一次加载轮到排在后面的人。"""
+        from backend.admin import routes
+
+        self._login()
+        lookup = self._mock_user_lookup({"z-known": "Zed"})
+        self.repo.save_repo_owner("team/a", [f"gone{i}" for i in range(routes.OWNER_NAME_BACKFILL_MAX)])
+        self.repo.save_repo_owner("team/b", ["z-known"])
+        first = {i["path"]: i for i in self.client.get("/api/admin/repo-owners").json["items"]}
+        self.assertEqual(first["team/b"]["users"][0]["name"], "")
+        self.assertEqual(lookup.call_count, routes.OWNER_NAME_BACKFILL_MAX)
+        second = {i["path"]: i for i in self.client.get("/api/admin/repo-owners").json["items"]}
+        self.assertEqual(second["team/b"]["users"][0]["name"], "Zed")
+
+    def test_repo_owner_paths_from_browser_urls(self):
+        """从地址栏粘贴的组织页与项目子页面地址剥成路径；用户名带 @ 与空格时清洗后再查姓名。"""
+        self._login()
+        lookup = self._mock_user_lookup({"alice": "Alice"})
+        response = self.client.post("/api/admin/repo-owners/batch", json={"username": "alice", "paths": [
+            "https://g.com/groups/Team/Mobile", "https://g.com/team/app/-/tree/main?ref_type=heads", "https://g.com/team/web/-/",
+        ]})
+        self.assertEqual(response.json["created"], ["team/mobile", "team/app", "team/web"])
+        created = self.client.post("/api/admin/repo-owners", json={"path": "team/x", "usernames": " @alice ，ALICE"}).json
+        self.assertEqual(created["users"], [{"username": "alice", "name": "Alice"}])
+        self.assertIn("alice", [c.args[0] for c in lookup.call_args_list])
+
+    def test_repo_owner_name_lookup_failure_does_not_block(self):
+        """平台不可达时照常保存与列出，只是没有名字；遇到一次网络错误就停，不逐个等超时。"""
+        self._login()
+        lookup = self._mock_user_lookup(error=ConnectionError("down"))
+        created = self.client.post("/api/admin/repo-owners", json={"path": "team/app", "usernames": ["a", "b", "c"]})
+        self.assertEqual(created.status_code, 201)
+        self.assertEqual([u["name"] for u in created.json["users"]], ["", "", ""])
+        self.assertEqual(lookup.call_count, 1)
+        self.assertEqual(self.client.get("/api/admin/repo-owners").status_code, 200)
+
+    def test_repo_owner_batch_by_person(self):
+        """按负责人填写：只对 Admin 开放；路径可以是换行分隔的地址；不合法时整批拒绝。"""
+        self.assertEqual(self.client.post("/api/admin/repo-owners/batch", json={}).status_code, 401)
+        self._login()
+        self._mock_user_lookup({"carol": "Carol"})
+        self.repo.save_repo_owner("team/app", ["lead"])
+        response = self.client.post(
+            "/api/admin/repo-owners/batch",
+            json={"username": "carol", "paths": "https://g.com/Team/App.git\nteam/web\n\n", "note": "前端"},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json, {"created": ["team/web"], "appended": ["team/app"], "unchanged": []})
+        items = {i["path"]: i for i in self.client.get("/api/admin/repo-owners").json["items"]}
+        self.assertEqual(items["team/app"]["users"][1], {"username": "carol", "name": "Carol"})
+        self.assertEqual(self.client.post("/api/admin/repo-owners/batch", json={"username": "", "paths": ["x"]}).status_code, 400)
+        # 用户名大小写不同算同一个人
+        again = self.client.post("/api/admin/repo-owners/batch", json={"username": "@Carol", "paths": ["team/app"]})
+        self.assertEqual(again.json["unchanged"], ["team/app"])
+        self.assertEqual(self.client.post("/api/admin/repo-owners/batch", json={"username": "carol", "paths": 1}).status_code, 400)
 
 
 class FixMergeRequestListTests(FixRouteTestCase):
