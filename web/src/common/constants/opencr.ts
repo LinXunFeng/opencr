@@ -461,7 +461,19 @@ export const FIX_NOTES = {
   ownerPath: "填项目或组织的路径（或直接粘贴地址）。组织路径对它下面的全部项目生效，同一个项目命中多条时取最具体的那条。",
   ownerSearchPlaceholder: "输入用户名或姓名搜索",
   ownerSearchEmpty: "代码平台上没有匹配的用户",
-  ownerUsernames: "输入用户名或姓名搜索代码平台上的用户，可选多个、按选择顺序排优先级。已封禁或停用的账号与机器人账号不能选；选中的人是否仍在项目里、权限够不够，发起修复时才校验。"
+  ownerUsernames: "输入用户名或姓名搜索代码平台上的用户，可选多个。列表顺序就是优先级，拖动可以调整。已封禁或停用的账号与机器人账号不能选；选中的人是否仍在项目里、权限够不够，发起修复时才校验。",
+  ownerBatchPaths: "一行一个项目或组织的路径（或直接粘贴地址）。已有配置的路径把这个人加到负责人列表末尾，不改变已有的人的顺序；已经在列表里的不重复添加；没有配置的路径新建一条。",
+  ownerBatchNote: "只写给新建的配置，已有配置的备注不变。",
+  ownerBatchPathsPlaceholder: "team/app\nteam/web\nhttps://code.example.com/groups/team/api",
+  ownerBatchMissing: "请选择负责人并填写至少一个路径",
+  ownerNotePlaceholder: "选填，例如：移动端负责人",
+  /** 按负责人填写的结果提示 */
+  ownerBatchDone: (r: { created: string[], appended: string[], unchanged: string[] }) =>
+    [
+      r.created.length ? `新建 ${r.created.length} 条` : "",
+      r.appended.length ? `追加到 ${r.appended.length} 条已有配置的末尾` : "",
+      r.unchanged.length ? `${r.unchanged.length} 条已包含此人、未改动` : ""
+    ].filter(Boolean).join("，")
 }
 
 /** 忽略理由的长度上限，与服务端 SURVEY_IGNORE_NOTE_MAX 一致；超出的部分服务端会静默截掉，所以前端先拦 */

@@ -812,12 +812,21 @@ export function fixAllSurveyRunApi(runUid: string) {
   return request<{ queued: number, total: number }>({ url: `survey-runs/${runUid}/fix-all`, method: "post" })
 }
 
+/** 配置里的一位负责人 */
+export interface RepoOwnerUser {
+  username: string
+  /** 代码平台上的姓名快照，只用于展示；还没查到时为空串 */
+  name: string
+}
+
 /** 仓库负责人配置：一个项目或组织路径指定负责人，按顺序取第一个可用的 */
 export interface RepoOwner {
   id: number
   /** 小写的项目或组织路径；组织路径对它下面的全部项目生效，最具体的那条优先 */
   path: string
   usernames: string[]
+  /** 与 usernames 同序，带姓名 */
+  users: RepoOwnerUser[]
   note: string
   created_at: string
   updated_at: string
@@ -854,6 +863,30 @@ export function addRepoOwnerApi(data: RepoOwnerForm) {
 
 export function updateRepoOwnerApi(id: number, data: RepoOwnerForm) {
   return request<RepoOwner>({ url: `repo-owners/${id}`, method: "patch", data })
+}
+
+/** 按负责人填写：把一个人加为多个项目或组织的负责人 */
+export interface RepoOwnerBatchForm {
+  username: string
+  /** 每一项可以是整条仓库或组织地址 */
+  paths: string[]
+  /** 只写给新建的配置 */
+  note: string
+}
+
+/** 按负责人填写的结果，元素是规整后的路径 */
+export interface RepoOwnerBatchResult {
+  /** 原来没有配置，新建的 */
+  created: string[]
+  /** 已有配置，这个人追加到了末尾 */
+  appended: string[]
+  /** 这个人已经在列表里，没有改动 */
+  unchanged: string[]
+}
+
+/** 按负责人填写：已有配置的路径把这个人追加到末尾，没有的新建；有一条路径不合法就整批不写 */
+export function addRepoOwnerPathsApi(data: RepoOwnerBatchForm) {
+  return request<RepoOwnerBatchResult>({ url: "repo-owners/batch", method: "post", data })
 }
 
 export function deleteRepoOwnerApi(id: number) {

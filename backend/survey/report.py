@@ -164,13 +164,23 @@ def _render_findings(findings: List[dict], include_body: bool) -> str:
     return "\n".join(blocks)
 
 
+def _assignee_text(fix: dict) -> str:
+    """处理人的写法：@用户名 姓名，与后台一致；用户名是工号一类的数字时，光看它认不出是谁。未指派时为空串。"""
+    username = fix.get("assignee_username") or ""
+    if not username:
+        return ""
+    name = fix.get("assignee_name") or ""
+    return f"@{username} {name}" if name else f"@{username}"
+
+
 def _fix_link_lines(fixes: List[dict]) -> List[str]:
     """一条发现下已提出的修复合并请求，每个一行，带上处理人。"""
     lines = []
     for fix in fixes:
         if not fix.get("mr_url"):
             continue
-        who = f"，处理人 @{fix['assignee_username']}" if fix.get("assignee_username") else ""
+        assignee = _assignee_text(fix)
+        who = f"，处理人 {assignee}" if assignee else ""
         lines.append(f"  - 修复合并请求：{fix['mr_url']}{who}")
     return lines
 
@@ -196,12 +206,12 @@ def _render_fixes(fixes: List[dict]) -> List[str]:
         status = FIX_STATUS_LABELS.get(fix.get("status", ""), fix.get("status", ""))
         if fix.get("status") != RUN_SUCCEEDED and fix.get("error_message"):
             status += f"：{fix['error_message']}"
-        assignee = f"@{fix['assignee_username']}" if fix.get("assignee_username") else ("未指派" if fix.get("mr_url") else "-")
+        assignee = _assignee_text(fix) or ("未指派" if fix.get("mr_url") else "-")
         if fix.get("assignee_source") in ASSIGNEE_SOURCE_LABELS:
             assignee += f"（{ASSIGNEE_SOURCE_LABELS[fix['assignee_source']]}）"
         title = _table_cell(fix.get("title") or "")
         lines.append(
-            f"| {title} | {location} | {_table_cell(status)} | {assignee} | {fix.get('mr_url') or '-'} |"
+            f"| {title} | {location} | {_table_cell(status)} | {_table_cell(assignee)} | {fix.get('mr_url') or '-'} |"
         )
     lines.append("")
     return lines

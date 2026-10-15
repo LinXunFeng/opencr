@@ -1,7 +1,15 @@
 <script lang="ts" setup>
-import type { PlatformUser, RepoOwner } from "@@/apis/opencr"
-import { addRepoOwnerApi, deleteRepoOwnerApi, getRepoOwnersApi, searchPlatformUsersApi, updateRepoOwnerApi } from "@@/apis/opencr"
+import type { PlatformUser, RepoOwner, RepoOwnerUser } from "@@/apis/opencr"
+import {
+  addRepoOwnerApi,
+  addRepoOwnerPathsApi,
+  deleteRepoOwnerApi,
+  getRepoOwnersApi,
+  searchPlatformUsersApi,
+  updateRepoOwnerApi
+} from "@@/apis/opencr"
 import { FIX_NOTES, formatTime } from "@@/constants/opencr"
+import { Close, Rank } from "@element-plus/icons-vue"
 
 /**
  * 仓库负责人配置页：给项目或组织指定负责人，修复合并请求在原始作者不可用时指派给他们。
@@ -17,9 +25,24 @@ const dialog = reactive({
   /** 为空表示新增 */
   id: null as number | null,
   path: "",
-  usernames: [] as string[],
+  /** 顺序就是优先级 */
+  users: [] as RepoOwnerUser[],
   note: ""
 })
+/** 按负责人填写的弹窗：一个人、多个路径 */
+const batch = reactive({
+  visible: false,
+  saving: false,
+  user: null as RepoOwnerUser | null,
+  /** 一行一个路径或地址 */
+  paths: "",
+  note: ""
+})
+/**
+ * 搜索框的值。选中后立即清空、把人放进下面的列表：选中的人由列表展示，
+ * 不留在搜索框里——远程搜索的候选项换一批后，框里的已选项就只剩裸用户名了
+ */
+const picked = ref("")
 
 async function load() {
   loading.value = true
@@ -71,11 +94,32 @@ function unavailableReason(user: PlatformUser) {
   return user.state !== "active" ? user.state : ""
 }
 
+/** 一位负责人的展示文字：@用户名 姓名，与搜索候选项的写法一致；还没查到姓名时只有用户名 */
+function ownerText(user: RepoOwnerUser) {
+  return `@${user.username}${user.name ? ` ${user.name}` : ""}`
+}
+
 /** 候选项的文字：@用户名 姓名，不能选的注明原因 */
 function userLabel(user: PlatformUser) {
-  const base = `@${user.username}${user.name ? ` ${user.name}` : ""}`
+  const base = ownerText(user)
   const reason = unavailableReason(user)
   return reason ? `${base}（${reason}）` : base
+}
+
+/** 搜索框里选中的人；在当前候选项里找，找不到（候选项刚好换了一批）时只带用户名 */
+function takePicked(username: string): RepoOwnerUser | null {
+  picked.value = ""
+  if (!username) return null
+  const option = userOptions.value.find(u => u.username === username)
+  return { username, name: option?.name ?? "" }
+}
+
+/** 作废还在途的搜索并清空候选项，免得上一个弹窗的结果落进这个弹窗 */
+function resetSearch() {
+  searchSeq++
+  userOptions.value = []
+  searchingUsers.value = false
+  picked.value = ""
 }
 
 /** 打开编辑弹窗；不传 row 为新增。row 来自 el-table 插槽时类型是 DefaultRow，在这里收窄 */
@@ -83,22 +127,62 @@ function openDialog(raw?: any) {
   const row = raw as RepoOwner | undefined
   dialog.id = row?.id ?? null
   dialog.path = row?.path ?? ""
-  dialog.usernames = row ? [...row.usernames] : []
+  dialog.users = row ? row.users.map(u => ({ ...u })) : []
   dialog.note = row?.note ?? ""
-  // 作废上一个弹窗里还在途的搜索，免得它的结果落进这个弹窗
-  searchSeq++
-  userOptions.value = []
-  searchingUsers.value = false
+  resetSearch()
   dialog.visible = true
 }
 
+/** 这个人是否已在编辑弹窗的列表里；平台上的用户名不区分大小写，与服务端的去重口径一致 */
+function isListed(username: string) {
+  return dialog.users.some(u => u.username.toLowerCase() === username.toLowerCase())
+}
+
+/** 编辑弹窗里选中一个人：加到列表末尾（优先级最低），已在列表里的不重复加 */
+function addPicked(username: string) {
+  const user = takePicked(username)
+  if (user && !isListed(user.username)) dialog.users.push(user)
+}
+
+/** 从编辑弹窗的负责人列表里移除一位 */
+function removeUser(index: number) {
+  dialog.users.splice(index, 1)
+}
+
+/** 正在拖动的那一项的下标；没在拖时为 null */
+const dragIndex = ref<number | null>(null)
+
+/** 开始拖动列表里的一位负责人 */
+function onDragStart(index: number, event: DragEvent) {
+  dragIndex.value = index
+  if (event.dataTransfer) {
+    event.dataTransfer.effectAllowed = "move"
+    // Firefox 不 setData 就不会开始拖动
+    event.dataTransfer.setData("text/plain", String(index))
+  }
+}
+
+/** 拖到另一项上时立即换位，松手前就能看到排好的顺序 */
+function onDragEnter(index: number) {
+  const from = dragIndex.value
+  if (from === null || from === index) return
+  const [moved] = dialog.users.splice(from, 1)
+  dialog.users.splice(index, 0, moved)
+  dragIndex.value = index
+}
+
+/** 松手或取消拖动 */
+function onDragEnd() {
+  dragIndex.value = null
+}
+
 async function save() {
-  if (!dialog.path.trim() || !dialog.usernames.length) {
+  if (!dialog.path.trim() || !dialog.users.length) {
     ElMessage.warning("请填写路径与至少一个负责人")
     return
   }
   dialog.saving = true
-  const data = { path: dialog.path, usernames: dialog.usernames, note: dialog.note }
+  const data = { path: dialog.path, usernames: dialog.users.map(u => u.username), note: dialog.note }
   try {
     if (dialog.id === null) await addRepoOwnerApi(data)
     else await updateRepoOwnerApi(dialog.id, data)
@@ -109,6 +193,40 @@ async function save() {
     ElMessage.error((error as Error).message)
   } finally {
     dialog.saving = false
+  }
+}
+
+/** 打开按负责人填写的弹窗 */
+function openBatch() {
+  batch.user = null
+  batch.paths = ""
+  batch.note = ""
+  resetSearch()
+  batch.visible = true
+}
+
+/** 按负责人填写的弹窗里选中负责人 */
+function pickBatchUser(username: string) {
+  batch.user = takePicked(username)
+}
+
+/** 保存按负责人填写的配置：路径按换行或逗号拆开，与服务端的拆分口径一致 */
+async function saveBatch() {
+  const paths = batch.paths.split(/[\n,，]/).map(p => p.trim()).filter(Boolean)
+  if (!batch.user || !paths.length) {
+    ElMessage.warning(FIX_NOTES.ownerBatchMissing)
+    return
+  }
+  batch.saving = true
+  try {
+    const result = await addRepoOwnerPathsApi({ username: batch.user.username, paths, note: batch.note })
+    ElMessage.success(FIX_NOTES.ownerBatchDone(result))
+    batch.visible = false
+    await load()
+  } catch (error) {
+    ElMessage.error((error as Error).message)
+  } finally {
+    batch.saving = false
   }
 }
 
@@ -139,9 +257,14 @@ onMounted(load)
       <template #header>
         <div class="header">
           <span>仓库负责人</span>
-          <el-button size="small" type="primary" @click="openDialog()">
-            新增
-          </el-button>
+          <div>
+            <el-button size="small" @click="openBatch()">
+              按负责人添加
+            </el-button>
+            <el-button size="small" type="primary" @click="openDialog()">
+              按仓库添加
+            </el-button>
+          </div>
         </div>
       </template>
 
@@ -155,8 +278,8 @@ onMounted(load)
         </el-table-column>
         <el-table-column label="负责人（按优先级）" min-width="220">
           <template #default="{ row }">
-            <el-tag v-for="name in row.usernames" :key="name" size="small" effect="plain" class="mr">
-              @{{ name }}
+            <el-tag v-for="user in row.users" :key="user.username" size="small" effect="plain" class="mr">
+              {{ ownerText(user) }}
             </el-tag>
           </template>
         </el-table-column>
@@ -188,25 +311,39 @@ onMounted(load)
           </div>
         </el-form-item>
         <el-form-item label="负责人">
-          <!-- 选项的 label 用裸用户名：已选的人不在当前候选里时（编辑已有配置），标签显示的就是值本身，两种来源写法一致 -->
           <el-select
-            v-model="dialog.usernames" multiple filterable remote :remote-method="searchUsers"
-            :loading="searchingUsers" :reserve-keyword="false" :placeholder="FIX_NOTES.ownerSearchPlaceholder"
-            :no-match-text="FIX_NOTES.ownerSearchEmpty" :no-data-text="FIX_NOTES.ownerSearchEmpty" style="width: 100%"
+            v-model="picked" filterable remote :remote-method="searchUsers" :loading="searchingUsers"
+            :placeholder="FIX_NOTES.ownerSearchPlaceholder" :no-match-text="FIX_NOTES.ownerSearchEmpty"
+            :no-data-text="FIX_NOTES.ownerSearchEmpty" style="width: 100%" @change="addPicked"
           >
             <el-option
-              v-for="user in userOptions" :key="user.username" :label="user.username" :value="user.username"
-              :disabled="Boolean(unavailableReason(user))"
-            >
-              {{ userLabel(user) }}
-            </el-option>
+              v-for="user in userOptions" :key="user.username" :label="userLabel(user)" :value="user.username"
+              :disabled="Boolean(unavailableReason(user)) || isListed(user.username)"
+            />
           </el-select>
+          <ol v-if="dialog.users.length" class="owner-list">
+            <li
+              v-for="(user, index) in dialog.users" :key="user.username" draggable="true"
+              :class="{ dragging: dragIndex === index }"
+              @dragstart="onDragStart(index, $event)" @dragenter.prevent="onDragEnter(index)"
+              @dragover.prevent @drop.prevent @dragend="onDragEnd"
+            >
+              <el-icon class="handle">
+                <Rank />
+              </el-icon>
+              <span class="order">{{ index + 1 }}</span>
+              <span class="text">{{ ownerText(user) }}</span>
+              <el-icon class="remove" @click="removeUser(index)">
+                <Close />
+              </el-icon>
+            </li>
+          </ol>
           <div class="sub">
             {{ FIX_NOTES.ownerUsernames }}
           </div>
         </el-form-item>
         <el-form-item label="备注">
-          <el-input v-model="dialog.note" type="textarea" :rows="2" placeholder="选填，例如：移动端负责人" />
+          <el-input v-model="dialog.note" type="textarea" :rows="2" :placeholder="FIX_NOTES.ownerNotePlaceholder" />
         </el-form-item>
       </el-form>
       <template #footer>
@@ -214,6 +351,46 @@ onMounted(load)
           取消
         </el-button>
         <el-button type="primary" :loading="dialog.saving" @click="save">
+          保存
+        </el-button>
+      </template>
+    </el-dialog>
+
+    <el-dialog v-model="batch.visible" title="按负责人添加" width="560px">
+      <el-form label-width="90px">
+        <el-form-item label="负责人">
+          <el-select
+            v-model="picked" filterable remote :remote-method="searchUsers" :loading="searchingUsers"
+            :placeholder="FIX_NOTES.ownerSearchPlaceholder" :no-match-text="FIX_NOTES.ownerSearchEmpty"
+            :no-data-text="FIX_NOTES.ownerSearchEmpty" style="width: 100%" @change="pickBatchUser"
+          >
+            <el-option
+              v-for="user in userOptions" :key="user.username" :label="userLabel(user)" :value="user.username"
+              :disabled="Boolean(unavailableReason(user))"
+            />
+          </el-select>
+          <el-tag v-if="batch.user" class="picked" closable effect="plain" @close="batch.user = null">
+            {{ ownerText(batch.user) }}
+          </el-tag>
+        </el-form-item>
+        <el-form-item label="路径">
+          <el-input v-model="batch.paths" type="textarea" :rows="6" :placeholder="FIX_NOTES.ownerBatchPathsPlaceholder" />
+          <div class="sub">
+            {{ FIX_NOTES.ownerBatchPaths }}
+          </div>
+        </el-form-item>
+        <el-form-item label="备注">
+          <el-input v-model="batch.note" type="textarea" :rows="2" :placeholder="FIX_NOTES.ownerNotePlaceholder" />
+          <div class="sub">
+            {{ FIX_NOTES.ownerBatchNote }}
+          </div>
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="batch.visible = false">
+          取消
+        </el-button>
+        <el-button type="primary" :loading="batch.saving" @click="saveBatch">
           保存
         </el-button>
       </template>
@@ -232,6 +409,51 @@ onMounted(load)
 }
 .mr {
   margin-right: 4px;
+}
+.owner-list {
+  width: 100%;
+  margin: 8px 0 0;
+  padding: 0;
+  list-style: none;
+  li {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 8px;
+    margin-bottom: 4px;
+    border: 1px solid var(--el-border-color-lighter);
+    border-radius: 4px;
+    line-height: 22px;
+    cursor: move;
+    &.dragging {
+      opacity: 0.5;
+      border-style: dashed;
+    }
+  }
+  .handle {
+    color: var(--el-text-color-secondary);
+  }
+  .order {
+    min-width: 16px;
+    color: var(--el-text-color-secondary);
+    font-size: 12px;
+  }
+  .text {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .remove {
+    cursor: pointer;
+    color: var(--el-text-color-secondary);
+    &:hover {
+      color: var(--el-color-danger);
+    }
+  }
+}
+.picked {
+  margin-top: 8px;
 }
 .sub {
   font-size: 12px;

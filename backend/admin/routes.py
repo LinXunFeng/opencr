@@ -9,6 +9,7 @@
 
 import json
 import logging
+import time
 from pathlib import Path
 from urllib.parse import quote, urlsplit, urlunsplit
 
@@ -22,7 +23,7 @@ from ..review.config import (
     load_review_config,
     load_storage_config,
 )
-from ..review.gitlab import search_users
+from ..review.gitlab import get_user_by_username, search_users
 from ..storage import repo
 from ..storage.models import FIX_MIN_SEVERITIES, FIX_MODES, FIX_TRIGGER_BATCH, PUSH_TRIGGER_MANUAL
 from ..survey.common import MAX_REPOS_LOWER_BOUND, MAX_REPOS_UPPER_BOUND, SurveyError, slugify
@@ -1284,23 +1285,102 @@ def api_interrupt_survey_fix(run_uid: str):
     return _interrupt_response(outcome, run_uid, "survey fix")
 
 
+def _owner_path_from_input(raw) -> str:
+    """
+    填写的项目或组织路径；可以是整条地址，剥成路径。空白返回空串，交给存储层报错。
+
+    从浏览器地址栏粘贴的地址常带着页面部分：组织页是 /groups/<组织>，项目里的页面是 <项目>/-/tree/main 之类。
+    GitLab 不允许顶层组织叫 groups，"-" 也不会是路径里的一段，所以两者都可以放心剥掉；不剥的话会存下一条
+    永远匹配不上任何项目的配置，而且不报错。
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    path = project_path_from_url(text, load_gitlab_config().get("url", ""))
+    path = path.split("/-/", 1)[0]
+    if path.endswith("/-"):
+        path = path[:-2]
+    return path[len("groups/"):] if path.lower().startswith("groups/") else path
+
+
+def _split_list_input(raw) -> list:
+    """把逗号（含全角）或换行分隔的字符串拆成列表，去掉空项；本来就是列表的原样返回，其他类型返回 None。"""
+    if isinstance(raw, str):
+        return [part for part in raw.replace("，", ",").replace("\n", ",").split(",") if part.strip()]
+    return raw if isinstance(raw, list) else None
+
+
 def _parse_repo_owner_payload(payload: dict) -> tuple:
-    """校验仓库负责人配置的入参，返回 (路径, 用户名列表, 备注)。路径可以填整条仓库地址或组织地址。"""
-    raw_path = str(payload.get("path") or "").strip()
-    path = project_path_from_url(raw_path, load_gitlab_config().get("url", "")) if raw_path else ""
-    raw_names = payload.get("usernames")
-    if isinstance(raw_names, str):
-        raw_names = [part for part in raw_names.replace("，", ",").replace("\n", ",").split(",")]
-    if not isinstance(raw_names, list):
+    """
+    校验仓库负责人配置的入参，返回 (路径, 用户名列表, 备注)。路径可以填整条仓库地址或组织地址。
+
+    用户名在这里就清洗好：查姓名用的键必须和存进去的用户名一模一样，带着 @ 或空格去查，查到了也对不上。
+    """
+    path = _owner_path_from_input(payload.get("path"))
+    raw_names = _split_list_input(payload.get("usernames"))
+    if raw_names is None:
         raise ValueError("usernames 必须是数组")
-    return path, [str(n) for n in raw_names], str(payload.get("note") or "")
+    usernames = [n for n in (repo.clean_owner_username(n) for n in raw_names) if n]
+    return path, usernames, str(payload.get("note") or "")
+
+
+# 查负责人姓名的单次超时。查的是展示用的名字，平台慢时宁可这次不显示，也不能让配置页卡上半分钟
+OWNER_NAME_LOOKUP_TIMEOUT = 5
+# 一次请求里查姓名的总时长上限（秒）。单次超时挡不住"每个都慢、但都没超时"，补查 20 个人会让列表等上一分多钟
+OWNER_NAME_LOOKUP_BUDGET = 8
+# 加载列表时一次最多补查几个人的姓名，挡住配置很多、又都没有快照时的一长串请求；剩下的下次加载再补
+OWNER_NAME_BACKFILL_MAX = 20
+
+
+def _lookup_owner_names(usernames) -> dict:
+    """
+    向代码平台按用户名查姓名，返回 {用户名: 姓名}；平台上查无此人的姓名为空串，没查成的（出错、超时）不在结果里。
+
+    姓名只用于展示，任何失败都不能挡住保存或列表：平台不是 GitLab 时直接不查（精确按用户名查用户只接了 GitLab）；
+    出任何错就停，超过总时长也停——平台不可达或很慢时每个人各等一次只会让页面更慢，查到的结果一样是空。
+    """
+    if load_gitlab_config().get("type") != "gitlab":
+        return {}
+    found = {}
+    deadline = time.monotonic() + OWNER_NAME_LOOKUP_BUDGET
+    for username in dict.fromkeys(usernames):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            # 单次超时也不超过剩余预算，否则最后一次请求会把总时长拖过上限
+            user = get_user_by_username(username, timeout=min(OWNER_NAME_LOOKUP_TIMEOUT, remaining))
+        except Exception:
+            # 后果只是这次显示用户名：保存照常，下次加载列表还会再补查
+            logger.warning("Looking up platform user failed: username=%s", username, exc_info=True)
+            break
+        found[username] = str(user.get("name") or "")
+    return found
 
 
 @admin_bp.route("/api/admin/repo-owners", methods=["GET"])
 @require_admin
 def api_repo_owners():
-    """仓库负责人配置。含具体的人，不对 Guest 开放。"""
+    """
+    仓库负责人配置。含具体的人，不对 Guest 开放。
+
+    还没有姓名快照的负责人（姓名快照出现之前保存的配置，或保存时没查到）在这里补查并写回，
+    之后的加载直接读快照。GET 带写入是有意的：写的只是展示缓存，重复执行结果相同。
+    平台上查无此人的也记进快照，不再反复查。
+    """
+    pending = repo.repo_owner_usernames_to_look_up()[:OWNER_NAME_BACKFILL_MAX]
+    found = _lookup_owner_names(pending) if pending else {}
+    if found:
+        repo.fill_repo_owner_names(found)
     return jsonify({"items": repo.list_repo_owners()})
+
+
+def _save_repo_owner_from_request(owner_id=None):
+    """新增（owner_id 为空）或修改一条配置的公共部分：解析入参、查姓名、保存。入参不合法时抛 ValueError。"""
+    path, usernames, note = _parse_repo_owner_payload(request.get_json(silent=True) or {})
+    # 路径或负责人缺失时存储层会拒绝，先别去平台白查一趟
+    names = _lookup_owner_names(usernames) if path and usernames else {}
+    return repo.save_repo_owner(path, usernames, note, owner_id=owner_id, user_names=names)
 
 
 @admin_bp.route("/api/admin/repo-owners", methods=["POST"])
@@ -1308,11 +1388,35 @@ def api_repo_owners():
 def api_add_repo_owner():
     """新增一条仓库负责人配置；同一路径已有配置时覆盖它。"""
     try:
-        path, usernames, note = _parse_repo_owner_payload(request.get_json(silent=True) or {})
-        item = repo.save_repo_owner(path, usernames, note)
+        item = _save_repo_owner_from_request()
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
     return jsonify(item), 201
+
+
+@admin_bp.route("/api/admin/repo-owners/batch", methods=["POST"])
+@require_admin
+def api_add_repo_owner_paths():
+    """
+    按负责人填写：把一个人加为多个项目或组织的负责人。
+
+    已有配置的路径把这个人追加到末尾，没有的新建；返回各路径的处理结果。
+    paths 可以是数组，也可以是换行或逗号分隔的字符串，每一项都可以是整条地址。
+    """
+    payload = request.get_json(silent=True) or {}
+    raw_paths = _split_list_input(payload.get("paths"))
+    if raw_paths is None:
+        return jsonify({"error": "paths 必须是数组"}), 400
+    username = repo.clean_owner_username(payload.get("username"))
+    try:
+        paths = [_owner_path_from_input(p) for p in raw_paths]
+        # 存储层一定会拒绝的入参先挡住，别去平台白查一趟
+        valid = username and paths and all(paths) and len(paths) <= repo.REPO_OWNER_BATCH_MAX
+        name = _lookup_owner_names([username]).get(username) if valid else None
+        result = repo.add_repo_owner_paths(username, paths, str(payload.get("note") or ""), name=name)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify(result)
 
 
 @admin_bp.route("/api/admin/repo-owners/<int:owner_id>", methods=["PATCH"])
@@ -1320,8 +1424,7 @@ def api_add_repo_owner():
 def api_update_repo_owner(owner_id: int):
     """修改一条仓库负责人配置。"""
     try:
-        path, usernames, note = _parse_repo_owner_payload(request.get_json(silent=True) or {})
-        item = repo.save_repo_owner(path, usernames, note, owner_id=owner_id)
+        item = _save_repo_owner_from_request(owner_id)
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
     if item is None:

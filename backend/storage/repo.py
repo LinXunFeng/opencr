@@ -3023,25 +3023,29 @@ def list_survey_fixes_for_issues(survey_uid: str, issues: List[dict], stale_afte
         ]
 
 
-def survey_fix_links(survey_id: int) -> Dict[str, List[str]]:
+def survey_fix_merge_requests(survey_id: int) -> Dict[str, List[dict]]:
     """
-    一个巡检下每个指纹已提出的修复合并请求链接，按发起时间排列。供台账镜像使用。
+    一个巡检下每个指纹已提出的修复合并请求，按发起时间排列。供台账镜像使用。
 
+    每项是 {"url", "assignee_username", "assignee_name"}，未指派时两个处理人字段为空串。
+    链接与处理人在这里一起产出：台账里两列逐行对齐，分开查、分开去重迟早会错位。
+    处理人是提出合并请求时指派的人，之后在代码平台上改派不会反映到这里。
     只收已提出合并请求的：失败与跳过的没有链接可附，进行中的还没有结果。
     """
     from .models import SurveyFix
 
-    links: Dict[str, List[str]] = {}
+    merge_requests: Dict[str, List[dict]] = {}
     with session_scope() as session:
         rows = session.execute(
-            select(SurveyFix.fingerprint, SurveyFix.mr_url)
+            select(SurveyFix.fingerprint, SurveyFix.mr_url, SurveyFix.assignee_username, SurveyFix.assignee_name)
             .where(SurveyFix.survey_id == int(survey_id), SurveyFix.status == RUN_SUCCEEDED)
             .order_by(SurveyFix.id.asc())
         ).all()
-    for fingerprint, url in rows:
-        if url and url not in links.setdefault(fingerprint, []):
-            links[fingerprint].append(url)
-    return links
+    for fingerprint, url, username, name in rows:
+        listed = merge_requests.setdefault(fingerprint, [])
+        if url and all(mr["url"] != url for mr in listed):
+            listed.append({"url": url, "assignee_username": username or "", "assignee_name": name or ""})
+    return merge_requests
 
 
 # 「修复合并请求」列表里代表"未指派"的处理人取值。平台用户名只含字母、数字、点、横线与下划线，不会撞上它
@@ -3062,7 +3066,7 @@ def _like_pattern(text: str) -> str:
 
 
 def _merge_request_fixes_stmt(survey_uid: str):
-    """提出了合并请求的修复运行（可限定巡检）的查询，口径与 survey_fix_links 一致：成功且有链接。"""
+    """提出了合并请求的修复运行（可限定巡检）的查询，口径与 survey_fix_merge_requests 一致：成功且有链接。"""
     from .models import Survey, SurveyFix
 
     stmt = select(SurveyFix).where(
@@ -3205,6 +3209,10 @@ def list_survey_fix_candidates(run_uid: str, min_severity: str) -> List[int]:
 # --------------------------------------------------------------------------
 
 REPO_OWNER_NOTE_MAX = 2000
+# 姓名快照的长度上限，只为挡住异常数据；平台上的姓名远短于此
+REPO_OWNER_NAME_MAX = 255
+# 按负责人填写时一次最多几个路径：一个人负责的仓库再多也到不了这个数，超了多半是贴错了内容
+REPO_OWNER_BATCH_MAX = 200
 
 
 def normalize_owner_path(raw: str) -> str:
@@ -3217,16 +3225,80 @@ def normalize_owner_path(raw: str) -> str:
     return text[:-4] if text.endswith(".git") else text
 
 
-def _repo_owner_to_dict(owner: "RepoOwner") -> dict:
-    """仓库负责人配置的接口数据。"""
+def _owner_usernames(owner: "RepoOwner") -> List[str]:
+    """一条配置里按优先级排好的用户名；存的内容坏了时当作空列表。"""
     try:
         usernames = json.loads(owner.usernames or "[]")
     except (ValueError, TypeError):
-        usernames = []
+        return []
+    return [str(n) for n in usernames] if isinstance(usernames, list) else []
+
+
+def _owner_names(owner: "RepoOwner") -> Dict[str, str]:
+    """
+    一条配置里 用户名 → 姓名 的快照；存的内容坏了时当作空。
+
+    值为空串表示在平台上查过、查无此人；不在快照里的人是还没查过。两者要分开：
+    查无此人的不再补查，否则他们永远占着每次补查的名额，排在后面的人就一直补不上。
+    """
+    try:
+        names = json.loads(owner.user_names or "{}")
+    except (ValueError, TypeError):
+        return {}
+    return {str(k): str(v or "") for k, v in names.items()} if isinstance(names, dict) else {}
+
+
+def _merge_owner_names(known: Dict[str, str], looked_up: Optional[Dict[str, str]]) -> Dict[str, str]:
+    """把这次查到的结果并进已有快照。这次查无此人不覆盖已有的名字：账号被删前的名字仍比一个裸用户名有用。"""
+    merged = dict(known)
+    for username, name in (looked_up or {}).items():
+        if name or not merged.get(username):
+            merged[username] = name
+    return merged
+
+
+def _set_owner_users(owner: "RepoOwner", usernames: List[str], names: Dict[str, str]) -> None:
+    """写入负责人列表与姓名快照。快照只留列表里还有的人：移除的人不该在下次加回来时带出一个旧名字。"""
+    owner.usernames = json.dumps(usernames, ensure_ascii=False)
+    kept = {u: str(names[u])[:REPO_OWNER_NAME_MAX] for u in usernames if u in names}
+    owner.user_names = json.dumps(kept, ensure_ascii=False) if kept else None
+
+
+def _dedupe_usernames(usernames: List[str]) -> List[str]:
+    """保持顺序去重，大小写不同的算同一个人、留第一次出现的写法：平台上的用户名不区分大小写。"""
+    seen: Set[str] = set()
+    result = []
+    for name in usernames:
+        if name.lower() not in seen:
+            seen.add(name.lower())
+            result.append(name)
+    return result
+
+
+def clean_owner_username(raw) -> str:
+    """填写的用户名去掉首尾空白与 @ 前缀。"""
+    return str(raw or "").strip().lstrip("@")
+
+
+def _clean_owner_note(note) -> Optional[str]:
+    """备注去掉首尾空白并截到上限，空的存 None。"""
+    return str(note or "").strip()[:REPO_OWNER_NOTE_MAX] or None
+
+
+def _repo_owner_to_dict(owner: "RepoOwner") -> dict:
+    """
+    仓库负责人配置的接口数据。
+
+    users 与 usernames 同序；保留 usernames 是为了不破坏已有的调用方（处理人追溯只读它）。
+    还没查到姓名的人 name 为空串，由调用方决定显示什么。
+    """
+    usernames = _owner_usernames(owner)
+    names = _owner_names(owner)
     return {
         "id": owner.id,
         "path": owner.path,
-        "usernames": usernames if isinstance(usernames, list) else [],
+        "usernames": usernames,
+        "users": [{"username": u, "name": names.get(u, "")} for u in usernames],
         "note": owner.note or "",
         "created_at": owner.created_at.isoformat() if owner.created_at else "",
         "updated_at": owner.updated_at.isoformat() if owner.updated_at else "",
@@ -3242,17 +3314,24 @@ def list_repo_owners() -> List[dict]:
         return [_repo_owner_to_dict(r) for r in rows]
 
 
-def save_repo_owner(path: str, usernames: List[str], note: str = "", owner_id: Optional[int] = None) -> Optional[dict]:
+def save_repo_owner(
+    path: str,
+    usernames: List[str],
+    note: str = "",
+    owner_id: Optional[int] = None,
+    user_names: Optional[Dict[str, str]] = None,
+) -> Optional[dict]:
     """
     新增或修改一条仓库负责人配置，返回保存后的数据。
 
     owner_id 为空时按路径新增，路径已存在则覆盖它的负责人与备注（同一个路径只有一条，不会出现两条互相打架）；
     owner_id 不存在时返回 None。路径与别的配置冲突时抛 ValueError。
+    user_names 是这次向平台查询的结果（空串表示查无此人），没查的人沿用这条配置里原有的快照。
     """
     from .models import RepoOwner
 
     normalized = normalize_owner_path(path)
-    names = [str(n).strip().lstrip("@") for n in usernames or [] if str(n).strip().lstrip("@")]
+    names = [clean_owner_username(n) for n in usernames or [] if clean_owner_username(n)]
     if not normalized:
         raise ValueError("路径不能为空")
     if not names:
@@ -3267,14 +3346,96 @@ def save_repo_owner(path: str, usernames: List[str], note: str = "", owner_id: O
                 return None
             if same_path is not None and same_path.id != owner.id:
                 raise ValueError(f"已有路径为 {normalized} 的配置")
+        # 查不到姓名时不能把原有快照抹掉：平台一时不可达不该让列表退回一排用户名
+        known = _merge_owner_names(_owner_names(owner), user_names)
         owner.path = normalized
         # 保持填写顺序去重：顺序就是优先级
-        owner.usernames = json.dumps(list(dict.fromkeys(names)), ensure_ascii=False)
-        owner.note = (note or "").strip()[:REPO_OWNER_NOTE_MAX] or None
+        _set_owner_users(owner, _dedupe_usernames(names), known)
+        owner.note = _clean_owner_note(note)
         owner.updated_at = utcnow()
         session.add(owner)
         session.flush()
         return _repo_owner_to_dict(owner)
+
+
+def add_repo_owner_paths(username: str, paths: List[str], note: str = "", name: Optional[str] = None) -> dict:
+    """
+    把一个人加为多个项目或组织的负责人（按负责人填写），返回各路径的处理结果。
+
+    路径已有配置时把这个人追加到末尾：已有的优先级是别人排好的，新加的人不该悄悄插到他们前面；
+    已经在列表里的人位置不动。没有配置的路径新建一条，备注只写给新建的，不覆盖已有配置的备注。
+    整批在一个事务里：有一条路径不合法就整批不写，免得一半生效、一半要人去对。
+    name 是这次向平台查到的姓名：空串表示查无此人，None 表示没查成。
+    返回 {"created": [...], "appended": [...], "unchanged": [...]}，元素是规整后的路径。
+    """
+    from .models import RepoOwner
+
+    who = clean_owner_username(username)
+    if not who:
+        raise ValueError("请选择负责人")
+    normalized = list(dict.fromkeys(normalize_owner_path(p) for p in paths or []))
+    if "" in normalized:
+        raise ValueError("路径不能为空")
+    if not normalized:
+        raise ValueError("至少填写一个路径")
+    if len(normalized) > REPO_OWNER_BATCH_MAX:
+        raise ValueError(f"一次最多填写 {REPO_OWNER_BATCH_MAX} 个路径")
+    result: Dict[str, List[str]] = {"created": [], "appended": [], "unchanged": []}
+    with session_scope() as session:
+        existing = {r.path: r for r in session.scalars(select(RepoOwner).where(RepoOwner.path.in_(normalized))).all()}
+        now = utcnow()
+        for path in normalized:
+            owner = existing.get(path)
+            if owner is None:
+                owner = RepoOwner(path=path, created_at=now, note=_clean_owner_note(note))
+                current: List[str] = []
+                result["created"].append(path)
+            else:
+                current = _owner_usernames(owner)
+                if who.lower() in {c.lower() for c in current}:
+                    result["unchanged"].append(path)
+                    continue
+                result["appended"].append(path)
+            known = _merge_owner_names(_owner_names(owner), None if name is None else {who: name})
+            _set_owner_users(owner, current + [who], known)
+            owner.updated_at = now
+            session.add(owner)
+    return result
+
+
+def fill_repo_owner_names(user_names: Dict[str, str]) -> int:
+    """
+    给还没查过姓名的负责人记下查询结果（空串表示查无此人），返回改了几条配置。
+
+    只补没查过的，不改已有的名字，也不动 updated_at：这是展示用的缓存，不是谁改了配置。
+    """
+    from .models import RepoOwner
+
+    found = dict(user_names or {})
+    if not found:
+        return 0
+    changed = 0
+    with session_scope() as session:
+        for owner in session.scalars(select(RepoOwner)).all():
+            usernames = _owner_usernames(owner)
+            names = _owner_names(owner)
+            missing = {u: found[u] for u in usernames if u not in names and u in found}
+            if missing:
+                _set_owner_users(owner, usernames, {**names, **missing})
+                changed += 1
+    return changed
+
+
+def repo_owner_usernames_to_look_up() -> List[str]:
+    """全部配置里还没查过姓名的负责人，按配置的路径与优先级排序、去重。"""
+    from .models import RepoOwner
+
+    with session_scope() as session:
+        pending: List[str] = []
+        for owner in session.scalars(select(RepoOwner).order_by(RepoOwner.path.asc())).all():
+            names = _owner_names(owner)
+            pending.extend(u for u in _owner_usernames(owner) if u not in names)
+    return list(dict.fromkeys(pending))
 
 
 def delete_repo_owner(owner_id: int) -> bool:
