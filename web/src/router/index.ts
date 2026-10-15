@@ -131,19 +131,19 @@ export const constantRoutes: RouteRecordRaw[] = [
         path: "fixes",
         component: () => import("@/pages/surveys/merge-requests.vue"),
         name: "SurveyFixMergeRequests",
-        meta: { title: "修复合并请求", elIcon: "Connection", surveyGated: true, adminOnly: true }
+        meta: { title: "修复合并请求", elIcon: "Connection", surveyGated: true, guestSwitch: "survey_fix_guest_read" }
       },
       {
         path: "owners",
         component: () => import("@/pages/surveys/owners.vue"),
         name: "RepoOwners",
-        meta: { title: "仓库负责人", elIcon: "User", surveyGated: true, adminOnly: true }
+        meta: { title: "仓库负责人", elIcon: "User", surveyGated: true, guestSwitch: "repo_owner_guest_read" }
       },
       {
         path: "fixes/:runUid",
         component: () => import("@/pages/surveys/fix.vue"),
         name: "SurveyFixDetail",
-        meta: { title: "修复详情", hidden: true, activeMenu: "/surveys/fixes", surveyGated: true, adminOnly: true }
+        meta: { title: "修复详情", hidden: true, activeMenu: "/surveys/fixes", surveyGated: true, guestSwitch: "survey_fix_guest_read" }
       },
       {
         path: "list/:surveyUid/ignores",

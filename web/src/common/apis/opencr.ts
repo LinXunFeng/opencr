@@ -9,6 +9,10 @@ export interface MeInfo {
   guest_read: boolean
   /** 巡检模块是否对 Guest 开放。嵌套在 guest_read 之下，两者都开才生效 */
   survey_guest_read: boolean
+  /** 「修复合并请求」是否对 Guest 开放，再嵌套在 survey_guest_read 之下，默认关闭 */
+  survey_fix_guest_read?: boolean
+  /** 「仓库负责人」是否对 Guest 开放，再嵌套在 survey_guest_read 之下，默认关闭 */
+  repo_owner_guest_read?: boolean
   /** 巡检调度是否启用（config.yaml 决定），关闭时菜单仍在但不会自动触发 */
   survey_enabled: boolean
   /** Guest 浏览关闭且未登录时为 true，前端应直接跳登录页 */
@@ -127,6 +131,8 @@ export interface SettingsData {
     guest_read: boolean
     guest_retry: boolean
     survey_guest_read: boolean
+    survey_fix_guest_read: boolean
+    repo_owner_guest_read: boolean
     /** 单次巡检的仓库上限，超出部分截掉并记一条 repos_truncated 降级 */
     survey_max_repos: number
     /** 修复合并请求标题的前缀，空串表示不加 */
@@ -327,7 +333,8 @@ export interface SurveyFix {
   error_message: string
   /** 原始作者：问题代码行最近一次实质改动（排除只改格式的改动）的作者 */
   author_name: string
-  author_email: string
+  /** Guest 拿不到原始作者邮箱，字段直接不存在（服务端剔除，不是前端隐藏） */
+  author_email?: string
   /** author = 原始作者；configured = 原始作者不可用，改派配置的仓库负责人；空串 = 未指派 */
   assignee_source: "" | "author" | "configured"
   assignee_username: string
@@ -357,7 +364,8 @@ export interface SurveyFixDetail extends SurveyFix {
   survey_uid: string
   survey_name: string
   repo_url: string
-  body: string
+  /** Guest 拿不到问题正文，字段直接不存在（服务端剔除，不是前端隐藏） */
+  body?: string
   base_sha: string
   summary: string
   diff: string

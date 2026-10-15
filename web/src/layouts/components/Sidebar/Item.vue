@@ -2,6 +2,7 @@
 import type { RouteRecordRaw } from "vue-router"
 import { isExternal } from "@@/utils/validate"
 import path from "path-browserify"
+import { useUserStore } from "@/pinia/stores/user"
 import Link from "./Link.vue"
 
 interface Props {
@@ -14,8 +15,12 @@ const { item, basePath = "" } = defineProps<Props>()
 /** 是否始终显示根菜单 */
 const alwaysShowRootMenu = computed(() => item.meta?.alwaysShow)
 
-/** 显示的子菜单 */
-const showingChildren = computed(() => item.children?.filter(child => !child.meta?.hidden) ?? [])
+const userStore = useUserStore()
+
+/** 显示的子菜单：与顶层菜单同一套身份过滤，否则游客会看到一个点进去就跳登录页的菜单项 */
+const showingChildren = computed(() => item.children?.filter(
+  child => !child.meta?.hidden && userStore.routeVisible(child.meta)
+) ?? [])
 
 /** 显示的子菜单数量 */
 const showingChildNumber = computed(() => showingChildren.value.length)

@@ -33,6 +33,11 @@ declare module "vue-router" {
     /** 巡检模块：游客可见性由后台开关决定，只控制显隐不是安全边界 */
     surveyGated?: boolean
     /**
+     * @description 巡检模块里单独一页的游客开关（设置项的键名），在 surveyGated 之上再加一层
+     * @description 同样只控制显隐，对应的服务端档位是 require_survey_fix_viewer / require_repo_owner_viewer
+     */
+    guestSwitch?: "survey_fix_guest_read" | "repo_owner_guest_read"
+    /**
      * @description 默认 true，如果设置为 false，则不会在面包屑中显示
      */
     breadcrumb?: boolean

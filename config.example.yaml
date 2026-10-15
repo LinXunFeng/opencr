@@ -194,21 +194,29 @@ admin:
   # 是否只允许本机访问后台。Webhook 端口通常内网可达，开启这项可缩小暴露面。
   bind_local_only: false
 
-# Three runtime switches live in the console/database, not in this file:
-#   guest_read        browse the console without logging in  (default on)
-#   guest_retry       retry a failed run as a guest          (default off)
-#   survey_guest_read see the scheduled-survey module        (default on)
+# Five runtime switches live in the console/database, not in this file:
+#   guest_read            browse the console without logging in     (default on)
+#   guest_retry           retry a failed run as a guest             (default off)
+#   survey_guest_read     see the scheduled-survey module           (default on)
+#   survey_fix_guest_read see survey fix merge requests and details (default off)
+#   repo_owner_guest_read see the repo owner settings, read-only     (default off)
 # guest_retry and survey_guest_read are both nested under guest_read: with
 # browsing off, neither has any effect. survey_guest_read only controls whether
 # the module is visible - finding bodies and summaries stay stripped either way.
-# 三个运行期开关由后台界面控制，**不在这个文件里**：
-#   guest_read        未登录浏览后台        （默认开启）
-#   guest_retry       游客重新触发失败运行  （默认关闭）
-#   survey_guest_read 游客可见定期巡检模块  （默认开启）
-# 后两者都嵌套在 guest_read 之下：浏览关掉时它们都不起作用。
+# The last two are nested under survey_guest_read as well, and they DO widen
+# what guests see (fix diffs and verification, named owners), hence off by default.
+# 五个运行期开关由后台界面控制，**不在这个文件里**：
+#   guest_read            未登录浏览后台                （默认开启）
+#   guest_retry           游客重新触发失败运行          （默认关闭）
+#   survey_guest_read     游客可见定期巡检模块          （默认开启）
+#   survey_fix_guest_read 游客可见修复合并请求与修复详情（默认关闭）
+#   repo_owner_guest_read 游客只读查看仓库负责人        （默认关闭）
+# guest_retry 与 survey_guest_read 嵌套在 guest_read 之下：浏览关掉时它们都不起作用。
 # survey_guest_read 只控制"看不看得到巡检模块"——打开后，发现正文与整合叙述
 # 依然会被服务端剔除。
-# 三者都存在数据库中、改动立即生效 —— 因为它们的使用场景天然是临时性的
+# 最后两个再嵌套在 survey_guest_read 之下，而且它们**确实扩大了游客可见范围**
+# （修复的 diff 与验证过程、具体的负责人），因此默认关闭。
+# 五者都存在数据库中、改动立即生效 —— 因为它们的使用场景天然是临时性的
 # （"今天有外部人员来，先关一下"），要求改文件加重启就等于没人会用。
 # 游客能看到运行状态与聚合统计，但看不到审查发现的正文；
 # 完整取舍见 docs/adr/0002-guest-read-scope.md。

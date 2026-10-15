@@ -31,6 +31,10 @@ IDENTITY_GUEST = "guest"
 
 SESSION_IDENTITY_KEY = "identity"
 
+# 巡检模块里两页各自的游客开关。与 guest_read 一样存数据库，理由见 ADR-0002
+SETTING_SURVEY_FIX_GUEST_READ = "survey_fix_guest_read"
+SETTING_REPO_OWNER_GUEST_READ = "repo_owner_guest_read"
+
 # Werkzeug 生成的哈希前缀；据此判断 config.yaml 里写的是明文还是已处理过的哈希
 HASH_PREFIXES = ("scrypt:", "pbkdf2:", "argon2", "bcrypt")
 
@@ -204,6 +208,26 @@ def survey_guest_read_enabled() -> bool:
     return value == "1"
 
 
+def survey_fix_guest_read_enabled() -> bool:
+    """
+    是否允许 Guest 查看修复合并请求（列表与修复详情）。
+
+    默认关闭：修复记录带着问题标题、文件位置、修改的 diff 与验证过程，超出了 ADR-0002 划给 Guest 的
+    "状态与聚合统计"，扩大可见范围就不能沿用默认开启。嵌套在 guest_read 与 survey_guest_read 之下。
+    """
+    return repo.get_setting(SETTING_SURVEY_FIX_GUEST_READ) == "1"
+
+
+def repo_owner_guest_read_enabled() -> bool:
+    """
+    是否允许 Guest 查看仓库负责人配置。
+
+    默认关闭：配置列出的是具体的人，与正文一样不属于"看状态"所需的内容。
+    嵌套在 guest_read 与 survey_guest_read 之下。
+    """
+    return repo.get_setting(SETTING_REPO_OWNER_GUEST_READ) == "1"
+
+
 def current_identity() -> str:
     """
     当前请求的身份：admin 或 guest。
@@ -297,6 +321,44 @@ def require_survey_viewer(f):
         return _reject("Authentication required", 401)
 
     return decorated
+
+
+def _require_survey_page_viewer(page_guest_enabled):
+    """
+    巡检模块里单独一页的访问档位：Admin 恒可访问；Guest 需要 guest_read、survey_guest_read
+    与这一页自己的开关同时打开。page_guest_enabled 是读取这一页开关的函数。
+    """
+
+    def decorator(f):
+        """把档位套到路由函数上。"""
+
+        @wraps(f)
+        def decorated(*args, **kwargs):
+            """先过后台可用性，再按身份与开关放行。"""
+            available, rejection = admin_console_available()
+            if not available:
+                return rejection
+            if is_admin():
+                return f(*args, **kwargs)
+            # 开关在请求时现读，不在装饰时取值：游客开关要即改即生效
+            if guest_read_enabled() and survey_guest_read_enabled() and page_guest_enabled():
+                return f(*args, **kwargs)
+            return _reject("Authentication required", 401)
+
+        return decorated
+
+    return decorator
+
+
+def require_survey_fix_viewer(f):
+    """修复合并请求（列表与详情）的读接口档位。只放开读；发起、中断修复仍是 require_admin。"""
+    # 包一层 lambda 而不是直接传函数对象：开关按名字现查，mock.patch 替换模块里的开关函数时这里跟着生效
+    return _require_survey_page_viewer(lambda: survey_fix_guest_read_enabled())(f)
+
+
+def require_repo_owner_viewer(f):
+    """仓库负责人配置的读接口档位。只放开读；增删改与搜索平台用户仍是 require_admin。"""
+    return _require_survey_page_viewer(lambda: repo_owner_guest_read_enabled())(f)
 
 
 def require_viewer(f):
