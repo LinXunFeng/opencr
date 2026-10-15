@@ -1382,3 +1382,108 @@ class PlatformUserSearchTests(FixRouteTestCase):
         self.assertNotIn("10.0.0.5", response.json["error"])
         with mock.patch("backend.admin.routes.fix_unsupported_reason", return_value="修复目前只支持 GitLab"):
             self.assertEqual(self.client.get("/api/admin/platform-users?q=al").status_code, 409)
+
+
+# ---------------------------------------------------------------------------
+# 游客开关：修复合并请求与仓库负责人
+# ---------------------------------------------------------------------------
+
+class GuestPageSwitchTests(FixRouteTestCase):
+    """「修复合并请求」「仓库负责人」两页各自的游客开关：默认关闭，嵌套在游客浏览与游客可见巡检之下，只放开读。"""
+
+    def _merge_request(self):
+        """一条已提出合并请求、带原始作者邮箱与 diff 的修复，返回 run_uid。"""
+        _, finding_id = self._run_with_finding()
+        _, uid = self.repo.start_survey_fix(finding_id)
+        self.repo.update_survey_fix(
+            uid, mr_iid=7, mr_url="https://g.com/a/app/-/merge_requests/7", diff="--- a/calc.py\n+++ b/calc.py\n",
+            author_name="Alice", author_email="alice@example.com", assignee_username="alice",
+        )
+        self.repo.finish_survey_fix(uid, "succeeded")
+        return uid
+
+    def _set(self, **values):
+        """直接写游客开关，绕过接口：这里要测的是读接口的档位。"""
+        for key, value in values.items():
+            self.repo.set_setting(key, "1" if value else "0")
+
+    def test_fix_pages_closed_to_guest_by_default(self):
+        """游客浏览与游客可见巡检默认开着，修复合并请求的开关默认关着：游客读不到。"""
+        uid = self._merge_request()
+        self.assertEqual(self.client.get("/api/admin/survey-fixes").status_code, 401)
+        self.assertEqual(self.client.get(f"/api/admin/survey-fixes/{uid}").status_code, 401)
+
+    def test_fix_switch_opens_reads_only_without_email(self):
+        """打开后游客能看列表与详情（含 diff），但没有原始作者邮箱；发起、中断修复仍只对 Admin。"""
+        uid = self._merge_request()
+        _, other_finding = self._run_with_finding(title="另一个问题")
+        self._set(survey_fix_guest_read=True)
+        listed = self.client.get("/api/admin/survey-fixes")
+        self.assertEqual(listed.status_code, 200)
+        self.assertEqual(listed.json["total"], 1)
+        self.assertNotIn("author_email", listed.json["items"][0])
+        self.assertEqual(listed.json["items"][0]["author_name"], "Alice")
+        detail = self.client.get(f"/api/admin/survey-fixes/{uid}").json
+        self.assertNotIn("author_email", detail)
+        # 问题正文就是发现正文，ADR-0002 的硬性边界不因这个开关松动
+        self.assertNotIn("body", detail)
+        self.assertIn("calc.py", detail["diff"])
+        self.assertEqual(self.client.post(f"/api/admin/survey-fixes/{uid}/interrupt").status_code, 401)
+        self.assertEqual(self.client.post(f"/api/admin/survey-findings/{other_finding}/fix").status_code, 401)
+        # 报告页里挂的修复记录不跟着放开：这个开关只管这两页
+        run_uid, _ = self._run_with_finding()
+        self.assertNotIn("fixes", self.client.get(f"/api/admin/survey-runs/{run_uid}").json)
+        # Admin 照常看得到邮箱与正文
+        self._login()
+        admin_view = self.client.get(f"/api/admin/survey-fixes/{uid}").json
+        self.assertEqual(admin_view["author_email"], "alice@example.com")
+        self.assertEqual(admin_view["body"], "price 可能为 None")
+
+    def test_page_switches_nested_under_guest_and_survey(self):
+        """上层的游客浏览或游客可见巡检任何一个关着，这两页的开关都不起作用。"""
+        uid = self._merge_request()
+        for upper in ("guest_read", "survey_guest_read"):
+            self._set(survey_fix_guest_read=True, repo_owner_guest_read=True, guest_read=True, survey_guest_read=True)
+            self._set(**{upper: False})
+            self.assertEqual(self.client.get(f"/api/admin/survey-fixes/{uid}").status_code, 401, upper)
+            self.assertEqual(self.client.get("/api/admin/repo-owners").status_code, 401, upper)
+
+    def test_switches_independent(self):
+        """两个开关互不牵连：只开一个，另一页仍然读不到。"""
+        self._set(repo_owner_guest_read=True)
+        self.assertEqual(self.client.get("/api/admin/repo-owners").status_code, 200)
+        self.assertEqual(self.client.get("/api/admin/survey-fixes").status_code, 401)
+        self._set(repo_owner_guest_read=False, survey_fix_guest_read=True)
+        self.assertEqual(self.client.get("/api/admin/repo-owners").status_code, 401)
+        self.assertEqual(self.client.get("/api/admin/survey-fixes").status_code, 200)
+
+    def test_owner_switch_opens_reads_only_and_skips_backfill(self):
+        """打开后游客能看配置，但不触发向平台补查姓名；增删改与搜索平台用户仍只对 Admin。"""
+        self.repo.save_repo_owner("team/app", ["alice"], "主力")
+        self._set(repo_owner_guest_read=True)
+        with mock.patch("backend.admin.routes.get_user_by_username") as lookup:
+            response = self.client.get("/api/admin/repo-owners")
+        lookup.assert_not_called()
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual([i["path"] for i in response.json["items"]], ["team/app"])
+        owner_id = response.json["items"][0]["id"]
+        self.assertEqual(self.client.post("/api/admin/repo-owners", json={"path": "x", "usernames": ["a"]}).status_code, 401)
+        self.assertEqual(self.client.post("/api/admin/repo-owners/batch", json={"username": "a", "paths": ["x"]}).status_code, 401)
+        self.assertEqual(self.client.patch(f"/api/admin/repo-owners/{owner_id}", json={"path": "x", "usernames": ["a"]}).status_code, 401)
+        self.assertEqual(self.client.delete(f"/api/admin/repo-owners/{owner_id}").status_code, 401)
+        self.assertEqual(self.client.get("/api/admin/platform-users?q=al").status_code, 401)
+
+    def test_settings_and_me_expose_switches(self):
+        """两个开关默认关闭，Admin 可在设置里改，只接受布尔值；/me 带出当前值供前端决定菜单。"""
+        me = self.client.get("/api/admin/me").json
+        self.assertEqual((me["survey_fix_guest_read"], me["repo_owner_guest_read"]), (False, False))
+        self.assertEqual(self.client.patch("/api/admin/settings", json={"survey_fix_guest_read": True}).status_code, 401)
+        self._login()
+        writable = self.client.get("/api/admin/settings").json["writable"]
+        self.assertEqual((writable["survey_fix_guest_read"], writable["repo_owner_guest_read"]), (False, False))
+        self.assertEqual(self.client.patch("/api/admin/settings", json={"repo_owner_guest_read": 1}).status_code, 400)
+        updated = self.client.patch("/api/admin/settings", json={"survey_fix_guest_read": True, "repo_owner_guest_read": True})
+        self.assertEqual(updated.status_code, 200)
+        self.assertTrue(updated.json["writable"]["survey_fix_guest_read"])
+        self.assertTrue(updated.json["writable"]["repo_owner_guest_read"])
+        self.assertTrue(self.client.get("/api/admin/me").json["repo_owner_guest_read"])

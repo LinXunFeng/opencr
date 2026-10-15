@@ -56,14 +56,20 @@ from ..survey.workspace import delete_workspace, workspace_size_bytes
 from .auth import (
     IDENTITY_ADMIN,
     SESSION_IDENTITY_KEY,
+    SETTING_REPO_OWNER_GUEST_READ,
+    SETTING_SURVEY_FIX_GUEST_READ,
     admin_console_available,
     current_identity,
     guest_read_enabled,
     guest_retry_enabled,
     is_admin,
+    repo_owner_guest_read_enabled,
     require_admin,
+    require_repo_owner_viewer,
+    require_survey_fix_viewer,
     require_survey_viewer,
     require_viewer,
+    survey_fix_guest_read_enabled,
     survey_guest_read_enabled,
     verify_password,
 )
@@ -85,6 +91,9 @@ WRITABLE_SETTINGS = {
     # 嵌套在 guest_read 之下：guest_read 关着时它没有意义。
     # 默认开启，与 MR 审查一致；打开后巡检发现的正文与整合叙述**依然剔除**。
     "survey_guest_read": {"type": "bool"},
+    # 再嵌套在 survey_guest_read 之下，默认关闭：这两页的内容超出了 ADR-0002 划给游客的范围
+    SETTING_SURVEY_FIX_GUEST_READ: {"type": "bool"},
+    SETTING_REPO_OWNER_GUEST_READ: {"type": "bool"},
     SETTING_MAX_REPOS: {"type": "int", "min": MAX_REPOS_LOWER_BOUND, "max": MAX_REPOS_UPPER_BOUND},
     # 允许空串：表示修复合并请求的标题不加前缀
     SETTING_FIX_MR_TITLE_PREFIX: {"type": "str", "max_len": FIX_MR_TITLE_PREFIX_MAX},
@@ -97,6 +106,8 @@ def _writable_settings() -> dict:
         "guest_read": guest_read_enabled(),
         "guest_retry": guest_retry_enabled(),
         "survey_guest_read": survey_guest_read_enabled(),
+        SETTING_SURVEY_FIX_GUEST_READ: survey_fix_guest_read_enabled(),
+        SETTING_REPO_OWNER_GUEST_READ: repo_owner_guest_read_enabled(),
         SETTING_MAX_REPOS: load_max_repos(),
         SETTING_FIX_MR_TITLE_PREFIX: load_fix_mr_title_prefix(),
     }
@@ -220,6 +231,9 @@ def api_me():
             "username": cfg["username"] if is_admin() else "",
             "guest_read": guest_enabled,
             "survey_guest_read": survey_guest_read_enabled(),
+            # 只决定菜单显隐；三个开关要同时打开才对游客生效，组合判断在前端与 require_* 各做一次
+            SETTING_SURVEY_FIX_GUEST_READ: survey_fix_guest_read_enabled(),
+            SETTING_REPO_OWNER_GUEST_READ: repo_owner_guest_read_enabled(),
             "survey_enabled": load_survey_config()["enabled"],
             # Guest 开关关闭且未登录时，前端应直接跳登录页
             "requires_login": not is_admin() and not guest_enabled,
@@ -1241,15 +1255,27 @@ def api_fix_all_survey_run(run_uid: str):
 MAX_ASSIGNEE_FILTERS = 50
 
 
+def _strip_fix_for_guest(fix: dict) -> dict:
+    """
+    Guest 视角的修复记录：返回去掉原始作者邮箱与问题正文的副本。
+
+    开关打开即表示管理员同意游客看修复本身（标题、diff、验证过程），但两样东西仍然剔除：
+    邮箱是个人信息，看懂一次修复用不到它；问题正文就是发现正文，ADR-0002 的硬性边界不因这个开关松动。
+    原始作者的姓名保留，处理人一栏本来就显示具体的人。
+    """
+    return {k: v for k, v in fix.items() if k not in ("author_email", "body")}
+
+
 @admin_bp.route("/api/admin/survey-fixes", methods=["GET"])
-@require_admin
+@require_survey_fix_viewer
 def api_survey_fix_merge_requests():
     """
     修复提出的合并请求列表（跨巡检），可按巡检、处理人（可多选，含未指派）与关键字筛选。
 
-    只对 Admin：修复记录带问题标题、文件路径与处理人，属于正文一侧（见 ADR-0002）。
+    修复记录带问题标题、文件路径与处理人，属于正文一侧（见 ADR-0002）：
+    默认只对 Admin，Guest 要等管理员打开「游客可见修复」。
     """
-    return jsonify(repo.list_fix_merge_requests(
+    result = repo.list_fix_merge_requests(
         survey_uid=(request.args.get("survey_uid") or "").strip(),
         # 逗号分隔而不是重复参数：前端请求库默认把数组序列化成 assignee[]=a 的形式，两边容易对不上；
         # 平台用户名不含逗号
@@ -1258,18 +1284,26 @@ def api_survey_fix_merge_requests():
         limit=_int_arg("limit", 50, 200),
         offset=_int_arg("offset", 0, 100000),
         stale_after_seconds=_stale_after(),
-    ))
+    )
+    if not is_admin():
+        result["items"] = [_strip_fix_for_guest(item) for item in result["items"]]
+    return jsonify(result)
 
 
 @admin_bp.route("/api/admin/survey-fixes/<run_uid>", methods=["GET"])
-@require_admin
+@require_survey_fix_viewer
 def api_survey_fix_detail(run_uid: str):
-    """单次修复运行的完整记录：修改的 diff、每轮验证、原始作者与处理人、合并请求。"""
+    """
+    单次修复运行的完整记录：修改的 diff、每轮验证、原始作者与处理人、合并请求。
+
+    合并请求说明里的「修复运行详情」链接指向这里，点进来的多半是没有后台账号的处理人，
+    这正是游客开关存在的理由；Guest 看到的与 Admin 相同，只少原始作者的邮箱与问题正文。
+    """
     fix = repo.get_survey_fix(run_uid, stale_after_seconds=_stale_after())
     if fix is None:
         return jsonify({"error": "修复记录不存在"}), 404
     fix.pop("survey_id", None)
-    return jsonify(fix)
+    return jsonify(fix if is_admin() else _strip_fix_for_guest(fix))
 
 
 @admin_bp.route("/api/admin/survey-fixes/<run_uid>/interrupt", methods=["POST"])
@@ -1359,16 +1393,18 @@ def _lookup_owner_names(usernames) -> dict:
 
 
 @admin_bp.route("/api/admin/repo-owners", methods=["GET"])
-@require_admin
+@require_repo_owner_viewer
 def api_repo_owners():
     """
-    仓库负责人配置。含具体的人，不对 Guest 开放。
+    仓库负责人配置。含具体的人，默认只对 Admin，Guest 要等管理员打开「游客可见负责人」。
 
     还没有姓名快照的负责人（姓名快照出现之前保存的配置，或保存时没查到）在这里补查并写回，
     之后的加载直接读快照。GET 带写入是有意的：写的只是展示缓存，重复执行结果相同。
     平台上查无此人的也记进快照，不再反复查。
     """
-    pending = repo.repo_owner_usernames_to_look_up()[:OWNER_NAME_BACKFILL_MAX]
+    # 补查只由 Admin 触发：游客无需登录，放开后任何人刷新列表都能让服务端去代码平台连查一串用户，
+    # 而游客少看到几个姓名的代价只是暂时显示用户名
+    pending = repo.repo_owner_usernames_to_look_up()[:OWNER_NAME_BACKFILL_MAX] if is_admin() else []
     found = _lookup_owner_names(pending) if pending else {}
     if found:
         repo.fill_repo_owner_names(found)

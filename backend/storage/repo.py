@@ -2921,7 +2921,8 @@ def confirm_survey_fix_interrupted(run_uid: str, stale_after_seconds: int) -> st
 
 def _survey_fix_to_dict(fix: "SurveyFix", stale_after_seconds: int, include_detail: bool) -> dict:
     """
-    修复运行的接口数据。整条都属于正文一侧（标题、作者、合并请求），只对 Admin 返回。
+    修复运行的接口数据。整条都属于正文一侧（标题、作者、合并请求），默认只对 Admin 返回；
+    「游客可见修复」打开后 Guest 也能读到，原始作者邮箱与问题正文由路由层剔除（见 ADR-0002 末节）。
 
     include_detail=False 时省掉 diff、验证过程与原问题正文，用于列表。
     """

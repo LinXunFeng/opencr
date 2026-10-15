@@ -41,14 +41,9 @@ export function registerNavigationGuard(router: Router) {
     // 已登录还去登录页，直接回首页
     if (to.path === LOGIN_PATH && userStore.isAdmin) return "/"
 
-    // 仅 Admin 可见的页面
-    if (to.meta.adminOnly && !userStore.isAdmin) {
-      return `${LOGIN_PATH}?redirect=${encodeURIComponent(to.fullPath)}`
-    }
-
-    // 巡检模块：游客需要 guest_read 与 survey_guest_read 同时打开。
+    // 仅 Admin 可见的页面、对游客关着的巡检模块或其中单独一页。
     // 这里挡住只是为了不让人点进一个必然 401 的页面，真正的边界在服务端。
-    if (to.meta.surveyGated && !userStore.surveyVisible) {
+    if (!userStore.routeVisible(to.meta)) {
       return `${LOGIN_PATH}?redirect=${encodeURIComponent(to.fullPath)}`
     }
 

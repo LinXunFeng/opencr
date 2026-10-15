@@ -16,6 +16,10 @@ vi.mock("../src/common/apis/opencr", () => ({
   searchPlatformUsersApi: api.search
 }))
 
+// 页面按身份决定显不显示增删改入口；默认以 Admin 身份挂载，游客用例里改成 false
+const user = vi.hoisted(() => ({ isAdmin: true }))
+vi.mock("../src/pinia/stores/user", () => ({ useUserStore: () => user }))
+
 let wrapper: VueWrapper
 const owner: RepoOwner = {
   id: 7,
@@ -58,6 +62,7 @@ function listedOwners() {
 
 beforeEach(() => {
   vi.clearAllMocks()
+  user.isAdmin = true
 })
 afterEach(() => {
   wrapper?.unmount()
@@ -113,5 +118,14 @@ describe("仓库负责人", () => {
     expect(api.batch).toHaveBeenCalledWith({ username: "carol", paths: ["team/app", "https://g.com/team/web"], note: "" })
     expect(document.body.textContent).toContain("新建 1 条，追加到 1 条已有配置的末尾")
     expect(api.list).toHaveBeenCalledTimes(2)
+  })
+
+  it("游客打开「游客可见负责人」后只读：看得到配置，没有添加、编辑与删除入口", async () => {
+    user.isAdmin = false
+    await render()
+    const tags = Array.from(document.querySelectorAll(".el-table .el-tag")).map(el => el.textContent?.trim())
+    expect(tags).toEqual(["@10086 张三", "@10010 李四", "@legacy"])
+    const labels = Array.from(document.querySelectorAll("button")).map(b => b.textContent?.trim())
+    for (const label of ["按负责人添加", "按仓库添加", "编辑", "删除"]) expect(labels).not.toContain(label)
   })
 })

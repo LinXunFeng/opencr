@@ -1,4 +1,5 @@
 import type { Identity } from "@@/apis/opencr"
+import type { RouteMeta } from "vue-router"
 import { getMeApi, loginApi, logoutApi } from "@@/apis/opencr"
 import { pinia } from "@/pinia"
 import { router } from "@/router"
@@ -14,6 +15,11 @@ export const useUserStore = defineStore("user", () => {
   const username = ref<string>("")
   const guestRead = ref<boolean>(true)
   const surveyGuestRead = ref<boolean>(true)
+  /** 巡检模块里单独一页的游客开关，键与 RouteMeta.guestSwitch 一致 */
+  const guestSwitches = ref<Record<NonNullable<RouteMeta["guestSwitch"]>, boolean>>({
+    survey_fix_guest_read: false,
+    repo_owner_guest_read: false
+  })
   const surveyEnabled = ref<boolean>(true)
   const requiresLogin = ref<boolean>(false)
   const version = ref<string>("")
@@ -30,6 +36,19 @@ export const useUserStore = defineStore("user", () => {
    */
   const surveyVisible = computed(() => isAdmin.value || surveyGuestRead.value)
 
+  /**
+   * 当前身份能否看到这个路由。菜单与导航守卫共用，避免两处判断漂移。
+   *
+   * 同样只是体验层：这里放行的页面，数据能不能拿到仍由服务端的 require_* 决定。
+   */
+  const routeVisible = (meta?: RouteMeta) => {
+    if (!meta) return true
+    if (meta.adminOnly && !isAdmin.value) return false
+    if (meta.surveyGated && !surveyVisible.value) return false
+    if (meta.guestSwitch && !isAdmin.value && !guestSwitches.value[meta.guestSwitch]) return false
+    return true
+  }
+
   /** 向服务端询问当前身份。这是前端唯一的入口探针。 */
   const fetchMe = async () => {
     const info = await getMeApi()
@@ -37,6 +56,10 @@ export const useUserStore = defineStore("user", () => {
     username.value = info.username
     guestRead.value = info.guest_read
     surveyGuestRead.value = info.survey_guest_read ?? true
+    guestSwitches.value = {
+      survey_fix_guest_read: info.survey_fix_guest_read ?? false,
+      repo_owner_guest_read: info.repo_owner_guest_read ?? false
+    }
     surveyEnabled.value = info.survey_enabled ?? true
     requiresLogin.value = info.requires_login
     version.value = info.version
@@ -73,6 +96,7 @@ export const useUserStore = defineStore("user", () => {
     loaded,
     isAdmin,
     surveyVisible,
+    routeVisible,
     fetchMe,
     login,
     logout

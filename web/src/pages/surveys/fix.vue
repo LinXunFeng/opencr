@@ -14,12 +14,14 @@ import {
   SEVERITY_LABEL,
   SEVERITY_TAG
 } from "@@/constants/opencr"
+import { useUserStore } from "@/pinia/stores/user"
 
 /**
  * 修复详情：一次修复运行的修改、每轮验证、原始作者与处理人、合并请求。
  * 合并请求说明里的「修复运行详情」链接指向这里，所以它要能脱离报告页单独打开。
  */
 const route = useRoute()
+const userStore = useUserStore()
 const loading = ref(true)
 const detail = ref<SurveyFixDetail | null>(null)
 const runUid = computed(() => String(route.params.runUid || ""))
@@ -97,7 +99,7 @@ onMounted(() => load())
             <el-tag v-if="detail.is_stale" size="small" type="warning" effect="plain" class="ml">
               疑似中断
             </el-tag>
-            <el-tooltip v-if="detail.is_stale" :content="INTERRUPT_NOTES.buttonTip" placement="top">
+            <el-tooltip v-if="detail.is_stale && userStore.isAdmin" :content="INTERRUPT_NOTES.buttonTip" placement="top">
               <el-button type="warning" size="small" plain class="ml" :loading="interrupting" @click="confirmInterrupt">
                 {{ INTERRUPT_NOTES.button }}
               </el-button>
@@ -158,7 +160,10 @@ onMounted(() => load())
         <div class="title">
           {{ detail.title }}
         </div>
-        <pre class="body">{{ detail.body }}</pre>
+        <pre v-if="detail.body" class="body">{{ detail.body }}</pre>
+        <div v-else class="sub">
+          问题正文仅管理员可见
+        </div>
       </el-card>
 
       <el-card v-if="detail.verification.length" shadow="never" class="mb">

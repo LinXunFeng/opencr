@@ -1,5 +1,6 @@
 <script lang="ts" setup>
 import type { SettingsData } from "@@/apis/opencr"
+import type { RouteMeta } from "vue-router"
 import { getSettingsApi, updateSettingsApi } from "@@/apis/opencr"
 import { useUserStore } from "@/pinia/stores/user"
 
@@ -10,6 +11,14 @@ const data = ref<SettingsData | null>(null)
 const guestRead = ref(true)
 const guestRetry = ref(false)
 const surveyGuestRead = ref(true)
+/** 巡检模块里单独一页的游客开关，键与设置项一致 */
+type PageGuestKey = NonNullable<RouteMeta["guestSwitch"]>
+const pageGuest = reactive<Record<PageGuestKey, boolean>>({ survey_fix_guest_read: false, repo_owner_guest_read: false })
+/** 每页的名称与开启后游客能看到的内容，确认框与说明文字共用 */
+const PAGE_GUEST: Record<PageGuestKey, { page: string, exposes: string }> = {
+  survey_fix_guest_read: { page: "修复合并请求", exposes: "问题标题与位置、原始作者与处理人、修改说明、diff 与验证过程" },
+  repo_owner_guest_read: { page: "仓库负责人", exposes: "每个项目或组织配置的负责人与备注" }
+}
 const surveyMaxRepos = ref<number | null>(200)
 const fixTitlePrefix = ref("")
 
@@ -21,6 +30,8 @@ async function load() {
     guestRead.value = data.value.writable.guest_read
     guestRetry.value = data.value.writable.guest_retry
     surveyGuestRead.value = data.value.writable.survey_guest_read
+    pageGuest.survey_fix_guest_read = data.value.writable.survey_fix_guest_read
+    pageGuest.repo_owner_guest_read = data.value.writable.repo_owner_guest_read
     surveyMaxRepos.value = data.value.writable.survey_max_repos
     fixTitlePrefix.value = data.value.writable.survey_fix_mr_title_prefix
   } catch (error) {
@@ -104,6 +115,41 @@ async function toggleSurveyGuest(value: string | number | boolean) {
 }
 
 /**
+ * 巡检模块里单独一页对游客的可见性：修复合并请求或仓库负责人。
+ *
+ * 再嵌套在游客可见巡检之下，默认关闭。开启前先确认：这两页的内容超出了游客默认能看到的范围，
+ * 误开的代价（内容暴露）远大于多点一次确认。关闭不需要确认，收紧权限没有风险。
+ */
+async function togglePageGuest(key: PageGuestKey, value: string | number | boolean) {
+  const next = Boolean(value)
+  const { page, exposes } = PAGE_GUEST[key]
+  if (next) {
+    try {
+      await ElMessageBox.confirm(
+        `开启后，未登录的访问者可以查看「${page}」：${exposes}。确定开启吗？`,
+        `游客可见${page}`,
+        { type: "warning", confirmButtonText: "开启", cancelButtonText: "取消" }
+      )
+    } catch {
+      pageGuest[key] = false
+      return
+    }
+  }
+  saving.value = true
+  try {
+    const res = await updateSettingsApi({ [key]: next })
+    pageGuest[key] = res.writable[key]
+    await userStore.fetchMe()
+    ElMessage.success(next ? `「${page}」已对游客开放` : `「${page}」已对游客隐藏`)
+  } catch (error) {
+    pageGuest[key] = !next
+    ElMessage.error((error as Error).message)
+  } finally {
+    saving.value = false
+  }
+}
+
+/**
  * 保存单次巡检的仓库上限。
  *
  * 数字输入不像开关那样即改即存：逐个按键保存会在输入过程中写进 1、12 这类中间值。
@@ -176,6 +222,29 @@ onMounted(load)
             控制未登录访问者能否看到<b>定期巡检</b>模块。开启后他们能看到巡检的运行状态与聚合统计，
             但同样<b>看不到发现正文与整体结论</b>——巡检正文描述的是整个代码库的架构与弱点。
             该开关嵌套在「游客浏览」之下：上面关掉时它不起作用。
+          </div>
+        </el-form-item>
+
+        <el-form-item label="游客可见修复">
+          <el-switch
+            v-model="pageGuest.survey_fix_guest_read" :loading="saving" :disabled="saving || !guestRead || !surveyGuestRead"
+            @change="(v: string | number | boolean) => togglePageGuest('survey_fix_guest_read', v)"
+          />
+          <div class="hint">
+            默认关闭。开启后，未登录的访问者可以只读查看「修复合并请求」列表与修复详情：{{ PAGE_GUEST.survey_fix_guest_read.exposes }}（问题正文与原始作者邮箱依然剔除）。
+            这些内容<b>超出了上面「看不到正文」的边界</b>——diff 就是代码本身。合并请求说明里的修复详情链接，
+            处理人不登录也能打开，这是开启它的主要理由。发起、中断修复仍只有管理员能做。
+            嵌套在「游客浏览」与「游客可见巡检」之下：任何一个关着时它不起作用。
+          </div>
+        </el-form-item>
+        <el-form-item label="游客可见负责人">
+          <el-switch
+            v-model="pageGuest.repo_owner_guest_read" :loading="saving" :disabled="saving || !guestRead || !surveyGuestRead"
+            @change="(v: string | number | boolean) => togglePageGuest('repo_owner_guest_read', v)"
+          />
+          <div class="hint">
+            默认关闭。开启后，未登录的访问者可以只读查看「仓库负责人」：{{ PAGE_GUEST.repo_owner_guest_read.exposes }}，方便同事自查某个仓库的修复会指派给谁。
+            增删改仍只有管理员能做。同样嵌套在「游客浏览」与「游客可见巡检」之下。
           </div>
         </el-form-item>
 

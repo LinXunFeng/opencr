@@ -29,13 +29,10 @@ const settingsStore = useSettingsStore()
 
 const activeMenu = computed(() => route.meta.activeMenu || route.path)
 
-// 菜单按身份过滤：Guest 看不到「系统设置」。
-// 这只是体验层——数据边界由服务端保证，见 ADR-0002。
+// 菜单按身份过滤：Guest 看不到「系统设置」，巡检模块及其中单独一页按后台开关显隐。
+// 这只是体验层——数据边界由服务端保证，见 ADR-0002。子菜单在 Item.vue 里按同一规则过滤。
 const noHiddenRoutes = computed(() => constantRoutes.filter(
-  item => !item.meta?.hidden
-    && (!item.meta?.adminOnly || userStore.isAdmin)
-    // 巡检模块对游客的显隐由后台开关决定，与 adminOnly 是两回事
-    && (!item.meta?.surveyGated || userStore.surveyVisible)
+  item => !item.meta?.hidden && userStore.routeVisible(item.meta)
 ))
 
 const isCollapse = computed(() => !appStore.sidebar.opened)

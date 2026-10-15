@@ -10,13 +10,16 @@ import {
 } from "@@/apis/opencr"
 import { FIX_NOTES, formatTime } from "@@/constants/opencr"
 import { Close, Rank } from "@element-plus/icons-vue"
+import { useUserStore } from "@/pinia/stores/user"
 
 /**
  * 仓库负责人配置页：给项目或组织指定负责人，修复合并请求在原始作者不可用时指派给他们。
  *
  * 全局配置，不挂在某个巡检下：负责人是仓库本身的属性，多个巡检覆盖同一个仓库时用的是同一份。
- * 只对 Admin 开放（路由 meta.adminOnly 只管显隐，接口本身也是 require_admin）。
+ * 默认只对 Admin 开放；管理员打开「游客可见仓库负责人」后游客可以只读查看，增删改仍只有 Admin 能做。
+ * 路由 meta.guestSwitch 与这里的按钮显隐都只是体验层，接口本身按 require_repo_owner_viewer / require_admin 校验。
  */
+const userStore = useUserStore()
 const loading = ref(true)
 const items = ref<RepoOwner[]>([])
 const dialog = reactive({
@@ -257,7 +260,7 @@ onMounted(load)
       <template #header>
         <div class="header">
           <span>仓库负责人</span>
-          <div>
+          <div v-if="userStore.isAdmin">
             <el-button size="small" @click="openBatch()">
               按负责人添加
             </el-button>
@@ -289,7 +292,7 @@ onMounted(load)
             {{ formatTime(row.updated_at) }}
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="120" fixed="right">
+        <el-table-column v-if="userStore.isAdmin" label="操作" width="120" fixed="right">
           <template #default="{ row }">
             <el-button link type="primary" size="small" @click="openDialog(row)">
               编辑
