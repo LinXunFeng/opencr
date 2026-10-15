@@ -530,17 +530,49 @@ class StartFixTests(FixTestCase):
         listed = self._fixes_for(latest)
         self.assertEqual([f["run_uid"] for f in listed], [failed_uid, uid])
         self.assertNotIn("diff", listed[0])
-        links = self.repo.survey_fix_links(self._survey_id())
-        self.assertEqual(list(links.values()), [["https://g.com/a/app/-/merge_requests/7"]])
+        links = self.repo.survey_fix_merge_requests(self._survey_id())
+        self.assertEqual(
+            list(links.values()),
+            [[{"url": "https://g.com/a/app/-/merge_requests/7", "assignee_username": "", "assignee_name": ""}]],
+        )
 
         # 台账状态不受影响，链接只是带上
         from backend.survey.ledger import build_ledger_rows
 
         entries = self.repo.list_survey_ledger(self._survey_id())
         self.assertEqual(entries[0]["state"], "present")
-        row = build_ledger_rows(self.survey, entries, "", False, fix_links=links)[0]
+        row = build_ledger_rows(self.survey, entries, "", False, fix_merge_requests=links)[0]
         self.assertEqual(row.values["fix_links"], "https://g.com/a/app/-/merge_requests/7")
+        # 未指派时处理人不填
+        self.assertEqual(row.values["fix_assignees"], "")
         self.assertEqual(row.values["state"], "存在")
+
+    def test_ledger_assignees_align_with_merge_requests(self):
+        """台账的「修复处理人」与「修复合并请求」逐行对齐：未指派的那一行留空，没有姓名时退回 @用户名。"""
+        from backend.survey.ledger import build_ledger_rows, ledger_columns
+
+        _, finding_id = self._run_with_finding()
+        fixes = [
+            ("https://g.com/a/app/-/merge_requests/1", "", ""),
+            ("https://g.com/a/app/-/merge_requests/2", "10086", "张三"),
+            ("https://g.com/a/app/-/merge_requests/3", "10010", ""),
+            ("https://g.com/a/app/-/merge_requests/4", "", ""),
+        ]
+        for url, username, name in fixes:
+            _, uid = self.repo.start_survey_fix(finding_id)
+            self.repo.update_survey_fix(uid, mr_url=url, mr_iid=1, assignee_username=username or None,
+                                        assignee_name=name or None)
+            self.repo.finish_survey_fix(uid, "succeeded")
+        merge_requests = self.repo.survey_fix_merge_requests(self._survey_id())
+        entries = self.repo.list_survey_ledger(self._survey_id())
+        row = build_ledger_rows(self.survey, entries, "", False, fix_merge_requests=merge_requests)[0]
+        self.assertEqual(row.values["fix_links"].split("\n"), [f[0] for f in fixes])
+        # 第一行空着占位，末尾未指派的那行不留看不见的换行
+        self.assertEqual(row.values["fix_assignees"], "\n张三\n@10010")
+        headers = [c.header for c in ledger_columns(include_link=False)]
+        # 不能叫"处理人"：那是用户常自建的人工列，同名会被推送覆盖
+        self.assertEqual(headers[headers.index("修复合并请求") + 1], "修复处理人")
+        self.assertNotIn("处理人", headers)
 
     def test_markdown_lists_fix_links(self):
         """Markdown 导出在问题下方与单独一节都列出合并请求链接与处理人。"""
@@ -551,16 +583,16 @@ class StartFixTests(FixTestCase):
         _, uid = self.repo.start_survey_fix(finding_id)
         self.repo.update_survey_fix(
             uid, mr_url="https://g.com/a/app/-/merge_requests/7", mr_iid=7,
-            assignee_username="alice", assignee_source="author",
+            assignee_username="alice", assignee_name="Alice", assignee_source="author",
         )
         self.repo.finish_survey_fix(uid, "succeeded")
         detail = self.repo.get_survey_run_detail(run_uid)
         detail["fixes"] = self._fixes_for(run_uid)
         attach_fixes(detail["findings"], detail["fixes"])
         markdown = render_run_markdown(detail)
-        self.assertIn("修复合并请求：https://g.com/a/app/-/merge_requests/7，处理人 @alice", markdown)
+        self.assertIn("修复合并请求：https://g.com/a/app/-/merge_requests/7，处理人 @alice Alice", markdown)
         self.assertIn("## 修复合并请求", markdown)
-        self.assertIn("@alice（原始作者）", markdown)
+        self.assertIn("@alice Alice（原始作者）", markdown)
 
 
 class ExecuteFixTests(FixTestCase):

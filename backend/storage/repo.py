@@ -3023,25 +3023,29 @@ def list_survey_fixes_for_issues(survey_uid: str, issues: List[dict], stale_afte
         ]
 
 
-def survey_fix_links(survey_id: int) -> Dict[str, List[str]]:
+def survey_fix_merge_requests(survey_id: int) -> Dict[str, List[dict]]:
     """
-    一个巡检下每个指纹已提出的修复合并请求链接，按发起时间排列。供台账镜像使用。
+    一个巡检下每个指纹已提出的修复合并请求，按发起时间排列。供台账镜像使用。
 
+    每项是 {"url", "assignee_username", "assignee_name"}，未指派时两个处理人字段为空串。
+    链接与处理人在这里一起产出：台账里两列逐行对齐，分开查、分开去重迟早会错位。
+    处理人是提出合并请求时指派的人，之后在代码平台上改派不会反映到这里。
     只收已提出合并请求的：失败与跳过的没有链接可附，进行中的还没有结果。
     """
     from .models import SurveyFix
 
-    links: Dict[str, List[str]] = {}
+    merge_requests: Dict[str, List[dict]] = {}
     with session_scope() as session:
         rows = session.execute(
-            select(SurveyFix.fingerprint, SurveyFix.mr_url)
+            select(SurveyFix.fingerprint, SurveyFix.mr_url, SurveyFix.assignee_username, SurveyFix.assignee_name)
             .where(SurveyFix.survey_id == int(survey_id), SurveyFix.status == RUN_SUCCEEDED)
             .order_by(SurveyFix.id.asc())
         ).all()
-    for fingerprint, url in rows:
-        if url and url not in links.setdefault(fingerprint, []):
-            links[fingerprint].append(url)
-    return links
+    for fingerprint, url, username, name in rows:
+        listed = merge_requests.setdefault(fingerprint, [])
+        if url and all(mr["url"] != url for mr in listed):
+            listed.append({"url": url, "assignee_username": username or "", "assignee_name": name or ""})
+    return merge_requests
 
 
 # 「修复合并请求」列表里代表"未指派"的处理人取值。平台用户名只含字母、数字、点、横线与下划线，不会撞上它
@@ -3062,7 +3066,7 @@ def _like_pattern(text: str) -> str:
 
 
 def _merge_request_fixes_stmt(survey_uid: str):
-    """提出了合并请求的修复运行（可限定巡检）的查询，口径与 survey_fix_links 一致：成功且有链接。"""
+    """提出了合并请求的修复运行（可限定巡检）的查询，口径与 survey_fix_merge_requests 一致：成功且有链接。"""
     from .models import Survey, SurveyFix
 
     stmt = select(SurveyFix).where(

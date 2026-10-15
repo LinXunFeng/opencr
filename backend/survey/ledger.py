@@ -69,6 +69,10 @@ LEDGER_COLUMNS = (
     # 这一行下已提出的修复合并请求，一行一个链接。合并请求是按问题提的，一行（指纹）可能有好几个。
     # 不用 url 类型：url 列只能放一个链接
     Column("fix_links", "修复合并请求", COLUMN_LONG_TEXT),
+    # 与「修复合并请求」逐行对齐：第 n 行是第 n 个合并请求的处理人，未指派的那一行留空。
+    # 不合进链接列写成"链接 处理人"：那样整列就不再是纯链接，表格里点不开，也没法按人筛选。
+    # 表头不叫"处理人"：列按表头名称定位，用户在表格里自建的"处理人"人工列很常见，同名会被每次推送静默覆盖
+    Column("fix_assignees", "修复处理人", COLUMN_LONG_TEXT),
 )
 LINK_COLUMN = Column("link", "运行详情", COLUMN_URL)
 
@@ -327,18 +331,42 @@ def _to_zone(value: Optional[datetime], zone) -> Optional[datetime]:
     return value.replace(tzinfo=timezone.utc).astimezone(zone)
 
 
+def assignee_display_name(name: str, username: str) -> str:
+    """
+    处理人在台账里的写法：姓名；平台没给姓名时退回 @用户名；未指派时为空串。
+
+    不像后台与 Markdown 导出那样写"@用户名 姓名"：表格是给不登录后台的人看、按人筛选的，
+    一格里混着工号一类的用户名，筛选和阅读都多一层噪音；重名时可以顺着同一行的合并请求链接点进去看。
+    """
+    if name:
+        return name
+    return f"@{username}" if username else ""
+
+
+def fix_assignees_cell(merge_requests: List[dict]) -> str:
+    """
+    「修复处理人」一格：与「修复合并请求」逐行对齐，未指派的那一行留空。
+
+    中间的空行不能省：省掉后下面的名字会往上挪，对到别的合并请求上。
+    末尾的空行去掉：全部未指派时这一格就是空的，而不是几个看不见的换行。
+    """
+    names = [assignee_display_name(mr.get("assignee_name") or "", mr.get("assignee_username") or "")
+             for mr in merge_requests]
+    return "\n".join(names).rstrip("\n")
+
+
 def build_ledger_rows(
     survey: dict,
     entries: List[dict],
     public_url: str,
     first_push: bool,
-    fix_links: Optional[Dict[str, List[str]]] = None,
+    fix_merge_requests: Optional[Dict[str, List[dict]]] = None,
 ) -> List[LedgerRow]:
     """
     把 Ledger 条目转成镜像行。
 
-    fix_links：指纹 → 已提出的修复合并请求链接（repo.survey_fix_links）。提了合并请求不改变行的状态，
-    只是把链接带上；状态仍然只由后续 SurveyRun 的复核决定。
+    fix_merge_requests：指纹 → 已提出的修复合并请求（repo.survey_fix_merge_requests）。提了合并请求不改变行的状态，
+    只是把链接与处理人带上；状态仍然只由后续 SurveyRun 的复核决定。
 
     first_push：该 Binding 是否从未成功推送过。
     - 从未推送过 = 这是一张新表，所有行都要写进去（包括本轮未发现与已忽略）；
@@ -350,6 +378,7 @@ def build_ledger_rows(
     rows: List[LedgerRow] = []
     for entry in entries:
         lines = entry.get("lines") or []
+        merge_requests = (fix_merge_requests or {}).get(entry["fingerprint"]) or []
         values = {
             "key": ledger_key(survey["slug"], entry["fingerprint"]),
             "survey": survey.get("name") or "",
@@ -364,7 +393,8 @@ def build_ledger_rows(
             "first_seen": _to_zone(entry.get("first_seen_at"), zone),
             "last_seen": _to_zone(entry.get("last_seen_at"), zone),
             "count": int(entry.get("finding_count") or 0),
-            "fix_links": "\n".join((fix_links or {}).get(entry["fingerprint"]) or []),
+            "fix_links": "\n".join(mr["url"] for mr in merge_requests),
+            "fix_assignees": fix_assignees_cell(merge_requests),
             "link": run_detail_link(public_url, entry.get("last_run_uid") or ""),
         }
         rows.append(LedgerRow(
