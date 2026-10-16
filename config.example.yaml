@@ -228,14 +228,16 @@ admin:
 #                     the next survey run, no restart needed.
 #   survey_fix_mr_title_prefix  prefix of survey fix merge request titles
 #                     (default "[OpenCR]", up to 40 characters; empty means no prefix).
-#                     Takes effect on the next fix.
+#                     Takes effect on the next fix. A survey with a merge request
+#                     title template uses the template instead and skips this prefix.
 # 另有两个运行期设置同样在后台「设置」页修改、存在数据库中：
 #   survey_max_repos  单次巡检的仓库上限，按组织展开、去重之后计数
 #                     （默认 200，可填 1~1000）。超出的仓库不参与本轮，
 #                     运行记一条 repos_truncated 降级。下一次巡检生效，无需重启。
 #   survey_fix_mr_title_prefix  巡检修复合并请求标题的前缀（默认 "[OpenCR]"，最多 40 个字符，
 #                     留空表示不加前缀）。下一个修复生效。放在数据库里是因为要能设成空，
-#                     而这个文件分不清"留空"与"没写"。
+#                     而这个文件分不清"留空"与"没写"。巡检配置了合并请求标题模板时以模板为准，
+#                     不再加这个前缀。
 
 # Persistence settings for review history and acceptance statistics.
 # 审查历史与采纳统计的持久化配置。

@@ -582,6 +582,8 @@ MAX_SURVEY_SOURCES = 30
 MAX_SURVEY_BINDINGS = 10
 # 修复提示词的长度上限。它每次修复要随生成与复核各发一遍，写成长文档只会稀释"只改一个文件、只改必需代码"这些硬要求
 MAX_FIX_PROMPT_CHARS = 2000
+# 合并请求标题模板的长度上限。平台标题上限 255，留出至少 55 个字给问题标题，否则标题只剩模板、分不出是哪个问题
+MAX_FIX_MR_TITLE_TEMPLATE_CHARS = 200
 
 
 def _parse_sources(raw) -> list:
@@ -659,6 +661,16 @@ def _parse_survey_payload(payload: dict, partial: bool) -> tuple:
             # 不截断：截掉的可能恰好是一句"不要……"，模型照着半句话改，比报错难察觉得多
             raise ValueError(f"修复提示词不能超过 {MAX_FIX_PROMPT_CHARS} 个字符")
         fields["fix_prompt"] = prompt or None
+    if "fix_mr_title_template" in payload:
+        template = str(payload.get("fix_mr_title_template") or "").strip()
+        if len(template) > MAX_FIX_MR_TITLE_TEMPLATE_CHARS:
+            # 不截断：截掉的往往是末尾的需求链接，标题照样提出去，依赖链接的自动合并却静默失效
+            raise ValueError(f"合并请求标题模板不能超过 {MAX_FIX_MR_TITLE_TEMPLATE_CHARS} 个字符")
+        # 与全局前缀同样的规则：换行、制表符会把标题拆坏，宁可拒绝也不悄悄改掉
+        if any(ch in template for ch in "\r\n\t"):
+            raise ValueError("合并请求标题模板不能包含换行或制表符")
+        # 与读取时（fix.mr_title）的规整一致：连续空白压成一个，存的就是实际生效的
+        fields["fix_mr_title_template"] = " ".join(template.split()) or None
 
     if "excluded_skills" in payload:
         raw = payload["excluded_skills"]
@@ -747,6 +759,7 @@ def _decorate_survey(survey: dict) -> dict:
     Guest 看不到 Binding 的目标位置：表格 ID 本身就是访问入口，
     推送出去的内容又恰恰是 Guest 看不到的发现正文。实例名与类型可见，说明"结果推到了哪类地方"。
     Guest 也看不到修复提示词：它是 Admin 写给模型的要求，可能写着仓库内部的约定，不在 ADR-0002 划给游客的范围里。
+    合并请求标题模板同理：里面通常是内部需求单的链接，属于配置而不是运行状态。
     """
     destinations = load_destinations()
     admin = is_admin()
@@ -780,6 +793,7 @@ def _decorate_survey(survey: dict) -> dict:
     }
     if not admin:
         decorated.pop("fix_prompt", None)
+        decorated.pop("fix_mr_title_template", None)
     return decorated
 
 

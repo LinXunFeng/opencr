@@ -1029,6 +1029,7 @@ def _survey_to_dict(survey: "Survey") -> dict:
         "fix_mode": survey.fix_mode,
         "fix_min_severity": survey.fix_min_severity,
         "fix_prompt": survey.fix_prompt or "",
+        "fix_mr_title_template": survey.fix_mr_title_template or "",
         "last_run_at": survey.last_run_at.isoformat() if survey.last_run_at else "",
         "next_run_at": survey.next_run_at.isoformat() if survey.next_run_at else "",
         "created_at": survey.created_at.isoformat() if survey.created_at else "",
@@ -1140,6 +1141,7 @@ def create_survey(
             fix_mode=options.get("fix_mode") or FIX_MODE_MANUAL,
             fix_min_severity=options.get("fix_min_severity") or SEVERITY_WARNING,
             fix_prompt=options.get("fix_prompt") or None,
+            fix_mr_title_template=options.get("fix_mr_title_template") or None,
         )
         session.add(survey)
         session.flush()

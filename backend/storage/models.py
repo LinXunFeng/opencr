@@ -441,6 +441,9 @@ class Survey(Base):
     # 修复提示词：Admin 给这个巡检的修复附加的写法要求（例如注释与文案用繁体中文），生成与复核修改时都交给模型。
     # 放在 Survey 上而不是 config.yaml：同一个部署下各巡检覆盖的仓库，用语与习惯各不相同。NULL 表示没有
     fix_prompt: Mapped[Optional[str]] = mapped_column(Text)
+    # 修复合并请求的标题模板，{title} 换成问题标题。填了就决定整个标题，后台设置里的全局前缀不再加；NULL 表示沿用前缀加问题标题。
+    # 放在 Survey 上：不同巡检对应不同团队，合并请求要挂到各自的需求单上（例如自动合并要求标题带需求链接）
+    fix_mr_title_template: Mapped[Optional[str]] = mapped_column(Text)
 
     # 保留最近多少次 SurveyRun。清理永远不会删掉最近一次（见 repo.purge_survey_runs）。
     retention_runs: Mapped[int] = mapped_column(Integer, nullable=False, default=20)

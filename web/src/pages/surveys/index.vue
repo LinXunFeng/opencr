@@ -15,6 +15,7 @@ import {
 import {
   FIX_MIN_SEVERITY_OPTIONS,
   FIX_MODE_LABEL,
+  FIX_MR_TITLE_TEMPLATE_MAX_CHARS,
   FIX_NOTES,
   FIX_PROMPT_MAX_CHARS,
   formatTime,
@@ -67,6 +68,7 @@ const form = reactive({
   fix_mode: "manual" as Survey["fix_mode"],
   fix_min_severity: "warning" as Survey["fix_min_severity"],
   fix_prompt: "",
+  fix_mr_title_template: "",
   budget_wall_clock_minutes: null as number | null,
   budget_l2_max_focus: null as number | null,
   sources: [] as SurveySource[],
@@ -119,6 +121,7 @@ function resetForm() {
   form.fix_mode = "manual"
   form.fix_min_severity = "warning"
   form.fix_prompt = ""
+  form.fix_mr_title_template = ""
   form.budget_wall_clock_minutes = null
   form.budget_l2_max_focus = null
   form.sources = [{ kind: "repo", url: "", branch: "", exclude_patterns: [] }]
@@ -156,6 +159,7 @@ function openEdit(row: any) {
   form.fix_mode = row.fix_mode
   form.fix_min_severity = row.fix_min_severity
   form.fix_prompt = row.fix_prompt ?? ""
+  form.fix_mr_title_template = row.fix_mr_title_template ?? ""
   form.budget_wall_clock_minutes = row.budget_wall_clock_minutes
   form.budget_l2_max_focus = row.budget_l2_max_focus
   form.sources = row.sources.length
@@ -270,6 +274,7 @@ async function save() {
       fix_mode: form.fix_mode,
       fix_min_severity: form.fix_min_severity,
       fix_prompt: form.fix_prompt,
+      fix_mr_title_template: form.fix_mr_title_template,
       budget_wall_clock_minutes: form.budget_wall_clock_minutes,
       budget_l2_max_focus: form.budget_l2_max_focus,
       sources,
@@ -670,6 +675,16 @@ onMounted(load)
           />
           <div class="sub">
             {{ FIX_NOTES.promptHelp }}
+          </div>
+        </el-form-item>
+
+        <el-form-item label="合并请求标题">
+          <el-input
+            v-model="form.fix_mr_title_template" :maxlength="FIX_MR_TITLE_TEMPLATE_MAX_CHARS" show-word-limit
+            :placeholder="FIX_NOTES.titleTemplatePlaceholder"
+          />
+          <div class="sub">
+            {{ FIX_NOTES.titleTemplateHelp }}
           </div>
         </el-form-item>
 
