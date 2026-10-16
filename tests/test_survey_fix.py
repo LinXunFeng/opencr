@@ -613,7 +613,8 @@ class ExecuteFixTests(FixTestCase):
         self._point_repo_to(self._remote())
         _, uid = self.repo.start_survey_fix(finding_id)
         create = mock.Mock(return_value={"iid": 7, "web_url": "https://g.com/a/app/-/merge_requests/7"})
-        with mock.patch.object(fix, "_call_model", side_effect=replies), \
+        self.model = mock.Mock(side_effect=replies)
+        with mock.patch.object(fix, "_call_model", self.model), \
                 mock.patch.object(fix, "create_merge_request", create), \
                 mock.patch.object(assignee, "list_project_members", return_value=members or self.MEMBERS), \
                 mock.patch.object(assignee, "get_current_user", return_value={"id": 100}), \
@@ -720,6 +721,28 @@ class ExecuteFixTests(FixTestCase):
             self._proposal(), '{"resolved":false,"problems":["没解决"]}', '{"applicable":false,"reason":"算了"}',
         ])
         self.assertEqual((result["status"], result["error_kind"]), ("failed", "verify_failed"))
+
+    def test_fix_prompt_reaches_generation_and_review(self):
+        """巡检的修复提示词随生成与复核一起交给模型；复核按它打回时，下一轮带着意见重来。"""
+        self.repo.update_survey(self.survey["survey_uid"], {"fix_prompt": "註解與文案一律使用繁體中文"})
+        result, create = self._execute([
+            self._proposal(), '{"resolved":true,"problems":["新增的注释用了简体字"]}',
+            self._proposal(), '{"resolved":true,"problems":[]}',
+        ])
+        self.assertEqual(result["status"], "succeeded", result["error_message"])
+        prompts = [c.args[0] for c in self.model.call_args_list]
+        self.assertEqual(len(prompts), 4)
+        for prompt in prompts:
+            self.assertIn("註解與文案一律使用繁體中文", prompt)
+        # 第二轮生成带上了复核按提示词打回的原因
+        self.assertIn("新增的注释用了简体字", prompts[2])
+        create.assert_called_once()
+
+    def test_no_fix_prompt_leaves_prompts_unchanged(self):
+        """没有配置修复提示词时，交给模型的内容里没有补充要求那一段。"""
+        self._execute([self._proposal(), '{"resolved":true,"problems":[]}'])
+        for call in self.model.call_args_list:
+            self.assertNotIn("管理员对修改另有以下要求", call.args[0])
 
     def test_crlf_preserved(self):
         """CRLF 文件改完仍是 CRLF，不能整个文件都显示被改过。"""
@@ -1154,6 +1177,30 @@ class FixTriggerRouteTests(FixRouteTestCase):
         self.assertEqual(self.client.patch(f"/api/admin/surveys/{uid}", json={"fix_min_severity": "unknown"}).status_code, 400)
         updated = self.client.patch(f"/api/admin/surveys/{uid}", json={"fix_mode": "auto", "fix_min_severity": "critical"}).json
         self.assertEqual((updated["fix_mode"], updated["fix_min_severity"]), ("auto", "critical"))
+
+    def test_fix_prompt_saved_and_hidden_from_guest(self):
+        """修复提示词去掉首尾空白保存，清空即为没有；超长直接拒绝而不是截断；Guest 看不到它。"""
+        from backend.admin import routes
+
+        self._login()
+        uid = self.survey["survey_uid"]
+        self.assertEqual(self.client.get(f"/api/admin/surveys/{uid}").json["fix_prompt"], "")
+        saved = self.client.patch(f"/api/admin/surveys/{uid}", json={"fix_prompt": "  使用繁體中文\n"}).json
+        self.assertEqual(saved["fix_prompt"], "使用繁體中文")
+        too_long = "字" * (routes.MAX_FIX_PROMPT_CHARS + 1)
+        self.assertEqual(self.client.patch(f"/api/admin/surveys/{uid}", json={"fix_prompt": too_long}).status_code, 400)
+        self.assertEqual(self.repo.get_survey(uid)["fix_prompt"], "使用繁體中文")
+        # 其他字段的修改不会动到它
+        self.client.patch(f"/api/admin/surveys/{uid}", json={"fix_mode": "manual"})
+        self.assertEqual(self.repo.get_survey(uid)["fix_prompt"], "使用繁體中文")
+        with mock.patch.object(routes, "is_admin", return_value=False), \
+                mock.patch("backend.admin.auth.guest_read_enabled", return_value=True), \
+                mock.patch("backend.admin.auth.survey_guest_read_enabled", return_value=True):
+            detail = self.client.get(f"/api/admin/surveys/{uid}").json
+            items = self.client.get("/api/admin/surveys").json["items"]
+        self.assertNotIn("fix_prompt", detail)
+        self.assertTrue(items and all("fix_prompt" not in item for item in items))
+        self.assertEqual(self.client.patch(f"/api/admin/surveys/{uid}", json={"fix_prompt": ""}).json["fix_prompt"], "")
 
     def _mock_user_lookup(self, names=None, error=None):
         """按用户名查姓名的平台接口：names 里有的返回对应姓名，error 不为空时每次都抛它。"""

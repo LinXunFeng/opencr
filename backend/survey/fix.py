@@ -254,9 +254,27 @@ def _issue_block(fix: dict) -> str:
     )
 
 
-def propose_fix(fix: dict, source: str, feedback: List[str]) -> dict:
+def fix_prompt_block(fix_prompt: str) -> str:
     """
-    让模型针对问题给出修改，返回 {"applicable", "reason", "summary", "edits"}。
+    把巡检的修复提示词包成交给模型的一段补充要求；没有配置时返回空串。
+
+    生成与复核用同一段文字：复核看不到这些要求，就会把"按要求改成繁体"当成改了无关代码打回，
+    也拦不住没照要求写的修改。
+    """
+    text = fix_prompt.strip()
+    if not text:
+        return ""
+    # 写明它管不到边界：Admin 写一句"顺便把整个文件统一一下"，模型照做就会改出几百行无关修改
+    return (
+        "\n这个巡检的管理员对修改另有以下要求。它们约束修改的代码与修改说明（summary）怎么写，"
+        "与「只改这一个文件、只改修复问题所必需的代码」冲突时，以后者为准：\n"
+        f"<<<\n{text}\n>>>\n"
+    )
+
+
+def propose_fix(fix: dict, source: str, feedback: List[str], fix_prompt: str = "") -> dict:
+    """
+    让模型针对问题给出修改，返回 {"applicable", "reason", "summary", "edits"}。fix_prompt 是巡检的修复提示词。
 
     发现可能是几周前的，代码已经变了，所以允许模型说"最新代码里已经没有这个问题"，而不是硬改一处。
     """
@@ -270,7 +288,7 @@ def propose_fix(fix: dict, source: str, feedback: List[str]) -> dict:
     prompt = f"""你是资深工程师。代码巡检在下面这个文件里报告了一个问题，请给出修复它的最小修改。
 
 {_issue_block(fix)}
-{retry_block}
+{retry_block}{fix_prompt_block(fix_prompt)}
 要求：
 1. 只改这一个文件，只改修复这个问题所必需的代码；不要顺手重构、改格式或修别的问题。
 2. 先确认问题在下面的最新代码里是否仍然存在。已经不存在、或必须改别的文件才能修时，applicable 填 false 并说明原因。
@@ -301,9 +319,9 @@ def propose_fix(fix: dict, source: str, feedback: List[str]) -> dict:
     }
 
 
-def review_fix(fix: dict, diff: str, new_source: str) -> List[str]:
+def review_fix(fix: dict, diff: str, new_source: str, fix_prompt: str = "") -> List[str]:
     """
-    让模型复核修改，返回发现的问题；空列表表示通过。
+    让模型复核修改，返回发现的问题；空列表表示通过。fix_prompt 是巡检的修复提示词，修改不符合它也算问题。
 
     复核要回答两件事：原问题解决了没有、有没有引入新问题。输出解析不了也算没通过 ——
     验证没跑成不能当成验证通过。
@@ -311,7 +329,7 @@ def review_fix(fix: dict, diff: str, new_source: str) -> List[str]:
     prompt = f"""你是严格的代码审查者。下面是针对一个已知问题提出的修改，请复核它。
 
 {_issue_block(fix)}
-
+{fix_prompt_block(fix_prompt)}
 修改（unified diff）：
 ```diff
 {diff}
@@ -324,7 +342,8 @@ def review_fix(fix: dict, diff: str, new_source: str) -> List[str]:
 
 请判断：
 1. 这个修改是否真正解决了上面的问题；
-2. 是否引入了新的缺陷（语法错误、逻辑错误、行为变化、遗漏的分支、改了无关代码等）。
+2. 是否引入了新的缺陷（语法错误、逻辑错误、行为变化、遗漏的分支、改了无关代码等）；
+3. 上面有管理员的补充要求时，修改的部分是否符合它们。
 
 只输出 JSON 对象，形如：{{"resolved":true,"problems":[]}}
 problems 列出每个具体问题，一句话一条；没有问题时为空数组。
@@ -373,9 +392,9 @@ def _write_source(repo_dir: Path, file_path: str, text: str, crlf: bool) -> None
     (repo_dir / file_path).write_bytes(data.encode("utf-8"))
 
 
-def _generate_verified(run_uid: str, fix: dict, source: str) -> Tuple[str, str, List[dict]]:
+def _generate_verified(run_uid: str, fix: dict, source: str, fix_prompt: str) -> Tuple[str, str, List[dict]]:
     """
-    生成修改并验证，最多 MAX_ATTEMPTS 轮。返回 (修改后的全文, 修改说明, 每轮的验证记录)。
+    生成修改并验证，最多 MAX_ATTEMPTS 轮。返回 (修改后的全文, 修改说明, 每轮的验证记录)。fix_prompt 是巡检的修复提示词。
 
     没有一轮通过时抛 FixFailure(verify_failed)；模型一开始就认为不需要改时抛 FixFailure(not_applicable)。
     """
@@ -383,7 +402,7 @@ def _generate_verified(run_uid: str, fix: dict, source: str) -> Tuple[str, str, 
     feedback: List[str] = []
     for index in range(MAX_ATTEMPTS):
         repo.update_survey_fix(run_uid, phase=FIX_PHASE_GENERATING, verification=attempts)
-        proposal = propose_fix(fix, source, feedback)
+        proposal = propose_fix(fix, source, feedback, fix_prompt)
         if not proposal["applicable"]:
             if index == 0:
                 raise FixFailure(
@@ -408,7 +427,9 @@ def _generate_verified(run_uid: str, fix: dict, source: str) -> Tuple[str, str, 
         attempt["checks"].extend(static_checks(fix["file_path"], source, new_source))
         if all(c["passed"] for c in attempt["checks"]):
             # 静态检查没过就不必再花一次模型调用复核
-            attempt["problems"] = review_fix(fix, unified_diff(fix["file_path"], source, new_source), new_source)
+            attempt["problems"] = review_fix(
+                fix, unified_diff(fix["file_path"], source, new_source), new_source, fix_prompt
+            )
         attempt["passed"] = verdict_passed(attempt)
         attempts.append(attempt)
         if attempt["passed"]:
@@ -523,7 +544,8 @@ def _execute(run_uid: str, fix: dict) -> None:
     repo.update_survey_fix(run_uid, target_branch=branch, base_sha=sha)
     source, crlf = _read_source(repo_dir, fix["file_path"], budget["l2_max_chars_per_focus"])
 
-    new_source, summary, attempts = _generate_verified(run_uid, fix, source)
+    # 修复提示词在执行时读取而不是登记时快照：批量修复排队期间 Admin 改了提示词，排在后面的应当按新的来
+    new_source, summary, attempts = _generate_verified(run_uid, fix, source, survey["fix_prompt"])
     _write_source(repo_dir, fix["file_path"], new_source, crlf)
     repo.update_survey_fix(
         run_uid, phase=FIX_PHASE_ASSIGNING, summary=summary, verification=attempts,

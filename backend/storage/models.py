@@ -438,6 +438,9 @@ class Survey(Base):
     fix_min_severity: Mapped[str] = mapped_column(
         String(16), nullable=False, default=SEVERITY_WARNING, server_default=SEVERITY_WARNING
     )
+    # 修复提示词：Admin 给这个巡检的修复附加的写法要求（例如注释与文案用繁体中文），生成与复核修改时都交给模型。
+    # 放在 Survey 上而不是 config.yaml：同一个部署下各巡检覆盖的仓库，用语与习惯各不相同。NULL 表示没有
+    fix_prompt: Mapped[Optional[str]] = mapped_column(Text)
 
     # 保留最近多少次 SurveyRun。清理永远不会删掉最近一次（见 repo.purge_survey_runs）。
     retention_runs: Mapped[int] = mapped_column(Integer, nullable=False, default=20)

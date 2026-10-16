@@ -16,6 +16,7 @@ import {
   FIX_MIN_SEVERITY_OPTIONS,
   FIX_MODE_LABEL,
   FIX_NOTES,
+  FIX_PROMPT_MAX_CHARS,
   formatTime,
   SCHEDULE_KIND_LABEL,
   SURVEY_NOTES,
@@ -65,6 +66,7 @@ const form = reactive({
   retention_runs: 20,
   fix_mode: "manual" as Survey["fix_mode"],
   fix_min_severity: "warning" as Survey["fix_min_severity"],
+  fix_prompt: "",
   budget_wall_clock_minutes: null as number | null,
   budget_l2_max_focus: null as number | null,
   sources: [] as SurveySource[],
@@ -116,6 +118,7 @@ function resetForm() {
   form.retention_runs = 20
   form.fix_mode = "manual"
   form.fix_min_severity = "warning"
+  form.fix_prompt = ""
   form.budget_wall_clock_minutes = null
   form.budget_l2_max_focus = null
   form.sources = [{ kind: "repo", url: "", branch: "", exclude_patterns: [] }]
@@ -152,6 +155,7 @@ function openEdit(row: any) {
   form.retention_runs = row.retention_runs
   form.fix_mode = row.fix_mode
   form.fix_min_severity = row.fix_min_severity
+  form.fix_prompt = row.fix_prompt ?? ""
   form.budget_wall_clock_minutes = row.budget_wall_clock_minutes
   form.budget_l2_max_focus = row.budget_l2_max_focus
   form.sources = row.sources.length
@@ -265,6 +269,7 @@ async function save() {
       retention_runs: form.retention_runs,
       fix_mode: form.fix_mode,
       fix_min_severity: form.fix_min_severity,
+      fix_prompt: form.fix_prompt,
       budget_wall_clock_minutes: form.budget_wall_clock_minutes,
       budget_l2_max_focus: form.budget_l2_max_focus,
       sources,
@@ -655,6 +660,16 @@ onMounted(load)
           </el-select>
           <div class="sub">
             {{ FIX_NOTES.minSeverityHelp }}
+          </div>
+        </el-form-item>
+
+        <el-form-item label="修复提示词">
+          <el-input
+            v-model="form.fix_prompt" type="textarea" :autosize="{ minRows: 2, maxRows: 8 }"
+            :maxlength="FIX_PROMPT_MAX_CHARS" show-word-limit :placeholder="FIX_NOTES.promptPlaceholder"
+          />
+          <div class="sub">
+            {{ FIX_NOTES.promptHelp }}
           </div>
         </el-form-item>
 

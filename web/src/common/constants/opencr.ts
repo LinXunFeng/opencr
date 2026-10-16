@@ -421,6 +421,9 @@ export const FIX_MIN_SEVERITY_OPTIONS = [
   { value: "advice", label: "全部（含建议）" }
 ]
 
+/** 修复提示词的长度上限，与后端 routes.MAX_FIX_PROMPT_CHARS 保持一致 */
+export const FIX_PROMPT_MAX_CHARS = 2000
+
 /**
  * 修复相关的口径文案。
  * 「提了合并请求 ≠ 问题已解决」要在每个入口都说清；文案集中在这里，各处才不会说出不一样的口径。
@@ -445,6 +448,8 @@ export const FIX_NOTES = {
     manual: "只在 Admin 点「提出修复」或报告页「一键全部修复」时发起。",
     auto: "每轮巡检成功结束后，自动对尚未修复过、且不低于下面门槛的问题发起修复（每批有上限，后台逐个执行），每个都会在代码平台上推分支、提合并请求。"
   } as Record<string, string>,
+  promptPlaceholder: "例如：新增或修改的注释、日志与界面文案一律使用繁体中文",
+  promptHelp: "这个巡检的每次修复都会把它交给模型，生成修改与复核修改时都按它把关，不符合的修改不会提出合并请求。它只对修复新增或改动的代码与修改说明生效：文件里原有的内容不会因此被统一改写，也不能让修复改别的文件；合并请求标题沿用问题标题，不受它影响。留空表示没有。",
   minSeverityHelp: "一键全部修复与巡检后自动发起的修复只处理不低于这个严重度的问题，严重度未知的不处理；单条「提出修复」不受限制。",
   fixAllTitle: "一键修复这一轮的问题？",
   fixAll: (count: number, severity: string) => [

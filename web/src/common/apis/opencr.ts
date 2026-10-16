@@ -230,6 +230,8 @@ export interface Survey {
   fix_mode: "manual" | "auto"
   /** 一键全部修复与巡检后自动发起的修复只处理不低于它的问题；单条手动修复不受限制 */
   fix_min_severity: "critical" | "warning" | "advice"
+  /** 修复提示词：生成与复核修改时附给模型的补充要求，空串表示没有。只有 Admin 拿得到 */
+  fix_prompt?: string
   last_run_at: string
   next_run_at: string
   created_at: string
