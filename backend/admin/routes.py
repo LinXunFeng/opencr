@@ -580,6 +580,8 @@ def api_update_settings():
 
 MAX_SURVEY_SOURCES = 30
 MAX_SURVEY_BINDINGS = 10
+# 修复提示词的长度上限。它每次修复要随生成与复核各发一遍，写成长文档只会稀释"只改一个文件、只改必需代码"这些硬要求
+MAX_FIX_PROMPT_CHARS = 2000
 
 
 def _parse_sources(raw) -> list:
@@ -651,6 +653,12 @@ def _parse_survey_payload(payload: dict, partial: bool) -> tuple:
         if severity not in FIX_MIN_SEVERITIES:
             raise ValueError(f"fix_min_severity 只能是 {' / '.join(FIX_MIN_SEVERITIES)}")
         fields["fix_min_severity"] = severity
+    if "fix_prompt" in payload:
+        prompt = str(payload.get("fix_prompt") or "").strip()
+        if len(prompt) > MAX_FIX_PROMPT_CHARS:
+            # 不截断：截掉的可能恰好是一句"不要……"，模型照着半句话改，比报错难察觉得多
+            raise ValueError(f"修复提示词不能超过 {MAX_FIX_PROMPT_CHARS} 个字符")
+        fields["fix_prompt"] = prompt or None
 
     if "excluded_skills" in payload:
         raw = payload["excluded_skills"]
@@ -738,6 +746,7 @@ def _decorate_survey(survey: dict) -> dict:
 
     Guest 看不到 Binding 的目标位置：表格 ID 本身就是访问入口，
     推送出去的内容又恰恰是 Guest 看不到的发现正文。实例名与类型可见，说明"结果推到了哪类地方"。
+    Guest 也看不到修复提示词：它是 Admin 写给模型的要求，可能写着仓库内部的约定，不在 ADR-0002 划给游客的范围里。
     """
     destinations = load_destinations()
     admin = is_admin()
@@ -761,7 +770,7 @@ def _decorate_survey(survey: dict) -> dict:
             item["target_url"] = url if url.startswith("https://") else ""
             item["last_succeeded_push_at"] = binding["last_succeeded_push_at"]
         bindings.append(item)
-    return {
+    decorated = {
         **survey,
         "bindings": bindings,
         "schedule_desc": describe_schedule(
@@ -769,6 +778,9 @@ def _decorate_survey(survey: dict) -> dict:
         ),
         "workspace_bytes": workspace_size_bytes(survey["slug"]),
     }
+    if not admin:
+        decorated.pop("fix_prompt", None)
+    return decorated
 
 
 @admin_bp.route("/api/admin/destinations", methods=["GET"])
