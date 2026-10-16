@@ -572,8 +572,8 @@ class StartFixTests(FixTestCase):
         self.assertEqual(row.values["fix_assignees"], "")
         self.assertEqual(row.values["state"], "存在")
 
-    def test_ledger_assignees_align_with_merge_requests(self):
-        """台账的「修复处理人」与「修复合并请求」逐行对齐：未指派的那一行留空，没有姓名时退回 @用户名。"""
+    def test_ledger_assignees_list_each_person_once(self):
+        """台账的「修复处理人」每人只写一次：同一个人的多个合并请求不重复列名，未指派的不占行，没有姓名时退回 @用户名。"""
         from backend.survey.ledger import build_ledger_rows, ledger_columns
 
         _, finding_id = self._run_with_finding()
@@ -581,7 +581,8 @@ class StartFixTests(FixTestCase):
             ("https://g.com/a/app/-/merge_requests/1", "", ""),
             ("https://g.com/a/app/-/merge_requests/2", "10086", "张三"),
             ("https://g.com/a/app/-/merge_requests/3", "10010", ""),
-            ("https://g.com/a/app/-/merge_requests/4", "", ""),
+            ("https://g.com/a/app/-/merge_requests/4", "10086", "张三"),
+            ("https://g.com/a/app/-/merge_requests/5", "", ""),
         ]
         for url, username, name in fixes:
             _, uid = self.repo.start_survey_fix(finding_id)
@@ -591,13 +592,35 @@ class StartFixTests(FixTestCase):
         merge_requests = self.repo.survey_fix_merge_requests(self._survey_id())
         entries = self.repo.list_survey_ledger(self._survey_id())
         row = build_ledger_rows(self.survey, entries, "", False, fix_merge_requests=merge_requests)[0]
+        # 链接一个不少，处理人按首次出现的顺序各写一次
         self.assertEqual(row.values["fix_links"].split("\n"), [f[0] for f in fixes])
-        # 第一行空着占位，末尾未指派的那行不留看不见的换行
-        self.assertEqual(row.values["fix_assignees"], "\n张三\n@10010")
+        self.assertEqual(row.values["fix_assignees"], "张三\n@10010")
         headers = [c.header for c in ledger_columns(include_link=False)]
         # 不能叫"处理人"：那是用户常自建的人工列，同名会被推送覆盖
         self.assertEqual(headers[headers.index("修复合并请求") + 1], "修复处理人")
         self.assertNotIn("处理人", headers)
+
+    def test_fix_assignees_cell_dedupes_by_username(self):
+        """按用户名认人：同名的两个人各写一次并补上用户名；同一个人改过名，写最近一次合并请求上的姓名。"""
+        from backend.survey.ledger import fix_assignees_cell
+
+        cell = fix_assignees_cell([
+            {"url": "1", "assignee_username": "zs1", "assignee_name": "张三"},
+            {"url": "2", "assignee_username": "zs2", "assignee_name": "张三"},
+            {"url": "3", "assignee_username": "ls", "assignee_name": "李四"},
+            {"url": "4", "assignee_username": "ls", "assignee_name": "李思"},
+            {"url": "5", "assignee_username": "zs1", "assignee_name": "张三"},
+        ])
+        self.assertEqual(cell, "张三（@zs1）\n张三（@zs2）\n李思")
+        # 最近一次没给姓名时沿用已知的姓名；先没姓名、后来有了，换成姓名
+        self.assertEqual(fix_assignees_cell([
+            {"url": "1", "assignee_username": "ww", "assignee_name": "王五"},
+            {"url": "2", "assignee_username": "ww", "assignee_name": ""},
+            {"url": "3", "assignee_username": "zl", "assignee_name": ""},
+            {"url": "4", "assignee_username": "zl", "assignee_name": "赵六"},
+        ]), "王五\n赵六")
+        self.assertEqual(fix_assignees_cell([{"url": "1", "assignee_username": "", "assignee_name": ""}]), "")
+        self.assertEqual(fix_assignees_cell([]), "")
 
     def test_markdown_lists_fix_links(self):
         """Markdown 导出在问题下方与单独一节都列出合并请求链接与处理人。"""
