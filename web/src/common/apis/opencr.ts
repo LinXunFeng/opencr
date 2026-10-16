@@ -232,6 +232,8 @@ export interface Survey {
   fix_min_severity: "critical" | "warning" | "advice"
   /** 修复提示词：生成与复核修改时附给模型的补充要求，空串表示没有。只有 Admin 拿得到 */
   fix_prompt?: string
+  /** 修复合并请求的标题模板，{title} 换成问题标题；空串表示沿用全局前缀加问题标题。只有 Admin 拿得到 */
+  fix_mr_title_template?: string
   last_run_at: string
   next_run_at: string
   created_at: string

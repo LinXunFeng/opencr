@@ -115,6 +115,31 @@ class MrTitleTests(unittest.TestCase):
         self.assertEqual(mr_title("  ", "空指针"), "空指针")
         self.assertEqual(len(mr_title("[Bot]", "长" * 400)), 255)
 
+    def test_template_replaces_prefix(self):
+        """有模板时由模板决定整个标题，不再加前缀；其他花括号与问题标题里的占位符原样保留。"""
+        from backend.survey.fix import mr_title
+
+        link = "https://www.tapd.cn/123/prong/stories/view/456"
+        self.assertEqual(mr_title("[OpenCR]", "空指针", f"{{title}} {link}"), f"空指针 {link}")
+        self.assertEqual(mr_title("[OpenCR]", "空指针", f"--story=456 {link}"), f"--story=456 {link}")
+        self.assertEqual(mr_title("", "{title} 未转义", "[{x}] {title}"), "[{x}] {title} 未转义")
+        # 空白模板等于没有模板；模板与问题标题里的换行压成空格
+        self.assertEqual(mr_title("[OpenCR]", "空指针", "  "), "[OpenCR] 空指针")
+        self.assertEqual(mr_title("", "空\n指针", "{title}\n修复"), "空 指针 修复")
+
+    def test_template_truncates_only_issue_title(self):
+        """超出平台上限时只截问题标题，模板里的固定部分（例如需求链接）完整保留。"""
+        from backend.survey.fix import mr_title
+
+        link = "https://www.tapd.cn/" + "9" * 150
+        title = mr_title("", "长" * 400, f"{{title}} {link}")
+        self.assertEqual(len(title), 255)
+        self.assertTrue(title.endswith(f" {link}"))
+        # 多个占位符平分剩下的长度，总长仍不超过上限
+        twice = mr_title("", "长" * 400, f"{{title}} {link} {{title}}")
+        self.assertLessEqual(len(twice), 255)
+        self.assertIn(f" {link} ", twice)
+
 
 class CommitAuthorTests(unittest.TestCase):
     """修复提交的作者：配置优先，其次令牌账号，最后兜底身份。"""
@@ -664,6 +689,18 @@ class ExecuteFixTests(FixTestCase):
         _, create = self._execute([self._proposal(), '{"resolved":true,"problems":[]}'])
         self.assertEqual(create.call_args.args[3], "求和没有处理空价格")
 
+    def test_mr_title_template_follows_survey(self):
+        """巡检配置了标题模板时按模板出标题，全局前缀不再加；提交信息不受影响。"""
+        link = "https://www.tapd.cn/123/prong/stories/view/456"
+        self.repo.update_survey(self.survey["survey_uid"], {"fix_mr_title_template": f"{{title}} {link}"})
+        result, create = self._execute([self._proposal(), '{"resolved":true,"problems":[]}'])
+        self.assertEqual(create.call_args.args[3], f"求和没有处理空价格 {link}")
+        message = _git(self.root / "remote.git", "log", "-1", "--format=%s", result["source_branch"])
+        self.assertEqual(message.strip(), "fix: 求和没有处理空价格")
+        # 模板不交给模型
+        for call in self.model.call_args_list:
+            self.assertNotIn(link, call.args[0])
+
     def test_configured_commit_author_wins(self):
         """配置了提交作者时用配置的，只配了名字时邮箱仍跟随令牌账号。"""
         with mock.patch.dict(os.environ, {"OPENCR_SURVEY_FIX_COMMIT_NAME": "Quality Bot"}):
@@ -1201,6 +1238,48 @@ class FixTriggerRouteTests(FixRouteTestCase):
         self.assertNotIn("fix_prompt", detail)
         self.assertTrue(items and all("fix_prompt" not in item for item in items))
         self.assertEqual(self.client.patch(f"/api/admin/surveys/{uid}", json={"fix_prompt": ""}).json["fix_prompt"], "")
+
+    def test_fix_mr_title_template_saved_and_hidden_from_guest(self):
+        """标题模板去掉首尾空白保存，清空即为没有；超长或含换行直接拒绝；Guest 看不到它。"""
+        from backend.admin import routes
+
+        self._login()
+        uid = self.survey["survey_uid"]
+        self.assertEqual(self.client.get(f"/api/admin/surveys/{uid}").json["fix_mr_title_template"], "")
+        template = "{title} https://www.tapd.cn/123/prong/stories/view/456"
+        saved = self.client.patch(
+            f"/api/admin/surveys/{uid}", json={"fix_mr_title_template": "  {title}   https://www.tapd.cn/123/prong/stories/view/456 "}
+        ).json
+        # 连续空白压成一个，存的就是实际生效的
+        self.assertEqual(saved["fix_mr_title_template"], template)
+        too_long = "字" * (routes.MAX_FIX_MR_TITLE_TEMPLATE_CHARS + 1)
+        for bad in (too_long, "{title}\nhttps://www.tapd.cn/1", "{title}\thttps://www.tapd.cn/1"):
+            self.assertEqual(
+                self.client.patch(f"/api/admin/surveys/{uid}", json={"fix_mr_title_template": bad}).status_code, 400
+            )
+        self.assertEqual(self.repo.get_survey(uid)["fix_mr_title_template"], template)
+        self.client.patch(f"/api/admin/surveys/{uid}", json={"fix_mode": "manual"})
+        self.assertEqual(self.repo.get_survey(uid)["fix_mr_title_template"], template)
+        with mock.patch.object(routes, "is_admin", return_value=False), \
+                mock.patch("backend.admin.auth.guest_read_enabled", return_value=True), \
+                mock.patch("backend.admin.auth.survey_guest_read_enabled", return_value=True):
+            detail = self.client.get(f"/api/admin/surveys/{uid}").json
+            items = self.client.get("/api/admin/surveys").json["items"]
+        self.assertNotIn("fix_mr_title_template", detail)
+        self.assertTrue(items and all("fix_mr_title_template" not in item for item in items))
+        cleared = self.client.patch(f"/api/admin/surveys/{uid}", json={"fix_mr_title_template": ""}).json
+        self.assertEqual(cleared["fix_mr_title_template"], "")
+
+    def test_fix_mr_title_template_saved_on_create(self):
+        """新建巡检时一并填写的标题模板同样保存下来。"""
+        self._login()
+        template = "{title} https://www.tapd.cn/123/prong/stories/view/456"
+        created = self.client.post("/api/admin/surveys", json={
+            "name": "带标题模板的巡检", "sources": [{"kind": "repo", "url": "https://g.com/a/other.git"}],
+            "fix_mr_title_template": template,
+        })
+        self.assertEqual(created.status_code, 201, created.json)
+        self.assertEqual(self.repo.get_survey(created.json["survey_uid"])["fix_mr_title_template"], template)
 
     def _mock_user_lookup(self, names=None, error=None):
         """按用户名查姓名的平台接口：names 里有的返回对应姓名，error 不为空时每次都抛它。"""

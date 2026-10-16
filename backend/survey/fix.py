@@ -72,6 +72,8 @@ _REPUBLISH_BUSY_RETRIES = 6
 _REPUBLISH_BUSY_WAIT_SECONDS = 20
 # 平台合并请求标题的长度上限
 _MR_TITLE_MAX = 255
+# 标题模板里代表问题标题的占位符。只认这一个，模板里其他花括号原样保留
+MR_TITLE_PLACEHOLDER = "{title}"
 # 修复提交的兜底作者：既没有配置、也查不到令牌账号的名字或邮箱时使用
 FALLBACK_COMMIT_AUTHOR = CommitAuthor("OpenCR", "opencr@noreply.invalid")
 
@@ -141,10 +143,27 @@ def resolve_commit_author() -> CommitAuthor:
     return pick_commit_author(name, email, account)
 
 
-def mr_title(prefix: str, title: str) -> str:
-    """修复合并请求的标题：前缀加问题标题，前缀为空时只有问题标题；超出平台上限的部分截掉。"""
-    prefix = str(prefix or "").strip()
-    return (f"{prefix} {title}" if prefix else title)[:_MR_TITLE_MAX]
+def mr_title(prefix: str, title: str, template: str = "") -> str:
+    """
+    修复合并请求的标题，不超过平台上限。
+
+    template 是巡检的标题模板，非空时由它决定整个标题（MR_TITLE_PLACEHOLDER 换成问题标题，不再加 prefix）；
+    为空时是 prefix 加问题标题，prefix 为空时只有问题标题。
+    """
+    title = " ".join(str(title or "").split())
+    # 库里的脏值（手改过库）按接口的规则收拾：换行会把标题拆坏
+    template = " ".join(str(template or "").split())
+    if not template:
+        prefix = str(prefix or "").strip()
+        return (f"{prefix} {title}" if prefix else title)[:_MR_TITLE_MAX]
+    count = template.count(MR_TITLE_PLACEHOLDER)
+    if not count:
+        return template[:_MR_TITLE_MAX]
+    # 超长时只截问题标题，模板里的固定部分一个字不动：它往往是需求链接，截掉半个链接，
+    # 依赖它的自动合并与需求关联会静默失效。模板本身有长度上限，固定部分不会把问题标题挤没
+    room = max(_MR_TITLE_MAX - (len(template) - count * len(MR_TITLE_PLACEHOLDER)), 0) // count
+    # 用 replace 而不是 str.format：链接里的花括号、问题标题里碰巧出现的占位符都应当原样保留
+    return template.replace(MR_TITLE_PLACEHOLDER, title[:room])
 
 
 def attach_fixes(findings: List[dict], fixes: List[dict]) -> None:
@@ -584,7 +603,8 @@ def _execute(run_uid: str, fix: dict) -> None:
     repo.update_survey_fix(run_uid, source_branch=source_branch)
     mr = create_merge_request(
         project_path, source_branch, branch,
-        mr_title(load_fix_mr_title_prefix(), title),
+        # 标题模板与修复提示词一样在执行时读取：排队期间改了模板，之后提出的合并请求按新的来
+        mr_title(load_fix_mr_title_prefix(), title, survey["fix_mr_title_template"]),
         _mr_description(fix, survey.get("name") or "", summary, attempts, assignee),
         assignee_id=assignee["id"],
     )
