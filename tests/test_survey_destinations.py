@@ -1229,12 +1229,44 @@ class DestinationRouteTests(PushTestCase):
 
         survey = self.client.get(f"/api/admin/surveys/{self.survey['survey_uid']}").json
         self.assertEqual(survey["bindings"][0]["destination"], "fake-1")
+        self.assertEqual(survey["bindings"][0]["destination_type"], "fake")
         self.assertNotIn("target", survey["bindings"][0])
+        self.assertNotIn("target_url", survey["bindings"][0])
 
         self._admin()
         detail = self.client.get(f"/api/admin/survey-runs/{self.run_uid}").json
         self.assertIn("secret", detail["pushes"][0]["error_message"])
         self.assertTrue(detail["pushable"])
+
+    def test_admin_gets_target_url_from_destination_type(self):
+        """Admin 拿到由类型算出的链接；类型不提供或实例已删除时为空串。"""
+        from backend.survey import destinations
+
+        self._admin()
+        url = f"/api/admin/surveys/{self.survey['survey_uid']}"
+        # 类型没提供链接时给空串，前端据此只展示图标
+        self.assertEqual(self.client.get(url).json["bindings"][0]["target_url"], "")
+
+        fake = destinations.DESTINATION_TYPES["fake"]
+        with mock.patch.object(fake, "target_url", classmethod(lambda cls, target: f"https://x/{target['table']}")):
+            self.assertEqual(self.client.get(url).json["bindings"][0]["target_url"], "https://x/T")
+            listed = self.client.get("/api/admin/surveys").json["items"][0]["bindings"][0]
+            self.assertEqual(listed["target_url"], "https://x/T")
+
+            # 实例配置有误但类型已知：照样给链接，推送失败不影响表格本身能打开
+            with mock.patch.object(fake, "validate_options", classmethod(lambda cls, options: (_ for _ in ()).throw(
+                    destinations.DestinationError("缺少凭据")))):
+                binding = self.client.get(url).json["bindings"][0]
+            self.assertEqual((binding["available"], binding["target_url"]), (False, "https://x/T"))
+
+        # 只放行 https：插件透传出来的 javascript: 链接放进 href 就能执行
+        with mock.patch.object(fake, "target_url", classmethod(lambda cls, target: "javascript:alert(1)")):
+            self.assertEqual(self.client.get(url).json["bindings"][0]["target_url"], "")
+
+        # 实例从 config.yaml 删掉后类型未知，既不给链接也不给类型
+        with mock.patch.object(destinations, "load_file_config", return_value={"destinations": {}}):
+            binding = self.client.get(url).json["bindings"][0]
+        self.assertEqual((binding["destination_type"], binding["target_url"], binding["available"]), ("", "", False))
 
     def test_manual_push_is_admin_only_even_with_guest_retry(self):
         self.repo.set_setting("guest_retry", "1")
@@ -1382,6 +1414,18 @@ class GoogleSheetTests(unittest.TestCase):
             GoogleSheetDestination.normalize_target({"spreadsheet": "not an id"}, "x")
         with self.assertRaises(ValueError):
             GoogleSheetDestination.normalize_target({}, "x")
+
+    def test_target_url_opens_spreadsheet(self):
+        """链接指向整张表格；目标位置里取不出合法表格 ID 时给空串。"""
+        from backend.survey.destinations.google_sheet import GoogleSheetDestination
+
+        self.assertEqual(
+            GoogleSheetDestination.target_url({"spreadsheet": "1AbC_defGhijklmnopqrstuvwxyz0123", "worksheet": "巡检"}),
+            "https://docs.google.com/spreadsheets/d/1AbC_defGhijklmnopqrstuvwxyz0123/edit",
+        )
+        # 原样保留的旧绑定里可能是任何东西，拼不出合法 ID 时不给链接，而不是拼一个打不开的
+        self.assertEqual(GoogleSheetDestination.target_url({"spreadsheet": "not an id"}), "")
+        self.assertEqual(GoogleSheetDestination.target_url({}), "")
 
     def test_missing_credentials_file_is_a_config_error(self):
         from backend.survey.destinations import DestinationError

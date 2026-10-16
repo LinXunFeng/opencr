@@ -162,12 +162,16 @@ export interface SurveySource {
 export interface SurveyBinding {
   id?: number
   destination: string
+  /** Destination 类型名，前端据此选图标；实例已从 config.yaml 删除时为空串 */
+  destination_type?: string
   destination_label?: string
   /** 实例已从 config.yaml 删除或配置有误时为 false；绑定保留，推送会记失败 */
   available?: boolean
   /** Guest 拿不到目标位置：表格 ID 本身就是访问入口（服务端剔除，不是前端隐藏） */
   target?: Record<string, string>
   target_desc?: string
+  /** 目标位置的浏览链接，与 target 同属 Admin 可见范围；类型拼不出链接时为空串 */
+  target_url?: string
   last_succeeded_push_at?: string
 }
 

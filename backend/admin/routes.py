@@ -748,12 +748,17 @@ def _decorate_survey(survey: dict) -> dict:
         item = {
             "id": binding["id"],
             "destination": binding["destination"],
+            "destination_type": cls.type_name if cls else "",
             "destination_label": cls.label if cls else "",
             "available": bool(info and not info.error),
         }
         if admin:
             item["target"] = binding["target"]
             item["target_desc"] = cls.describe_target(binding["target"]) if cls else ""
+            # 链接由目标位置推出，与目标位置同属 Admin 可见范围
+            url = cls.target_url(binding["target"]) if cls else ""
+            # 前端直接把它放进 href，插件若把用户填写的内容透传出来，javascript: 链接点一下就会执行
+            item["target_url"] = url if url.startswith("https://") else ""
             item["last_succeeded_push_at"] = binding["last_succeeded_push_at"]
         bindings.append(item)
     return {
