@@ -1,5 +1,6 @@
 <script lang="ts" setup>
 import type { DestinationCheckResult, DestinationItem, Survey, SurveyBinding, SurveySource } from "@@/apis/opencr"
+import type { SvgName } from "~virtual/svg-component"
 import {
   checkDestinationApi,
   clearSurveyWorkspaceApi,
@@ -20,6 +21,7 @@ import {
   SURVEY_NOTES,
   WEEKDAY_OPTIONS
 } from "@@/constants/opencr"
+import { Link } from "@element-plus/icons-vue"
 import { useUserStore } from "@/pinia/stores/user"
 
 const userStore = useUserStore()
@@ -219,6 +221,18 @@ async function checkBinding(binding: BindingForm) {
   }
 }
 
+/**
+ * 各 Destination 类型在列表里的图标（preserve-color 目录下的 SvgIcon 名）。
+ * 没有登记的类型、以及实例已从 config.yaml 删除而查不到类型的绑定，退回通用链接图标。
+ */
+const DESTINATION_ICON: Record<string, SvgName> = {
+  google_sheet: "preserve-color/google-sheet"
+}
+
+function destinationIcon(binding: SurveyBinding): SvgName | undefined {
+  return DESTINATION_ICON[binding.destination_type ?? ""]
+}
+
 const CHECK_ALERT_TYPE = { ok: "success", warn: "warning", error: "error" } as const
 
 /** 实例已从 config.yaml 删除时，原样展示旧的目标位置，保存时原样提交 */
@@ -385,14 +399,35 @@ onMounted(load)
         </el-table-column>
         <el-table-column label="输出目标" min-width="140">
           <template #default="{ row }">
-            <el-tooltip
-              v-for="b in row.bindings" :key="b.id"
-              :content="b.target_desc || b.destination_label || b.destination"
-              placement="top"
-            >
-              <el-tag size="small" effect="plain" :type="b.available ? 'info' : 'danger'" class="binding-tag">
-                {{ b.destination }}
-              </el-tag>
+            <el-tooltip v-for="b in row.bindings" :key="b.id" placement="top">
+              <template #content>
+                <div>{{ [b.destination, b.destination_label].filter(Boolean).join(" · ") }}</div>
+                <div v-if="b.target_desc">
+                  {{ b.target_desc }}
+                </div>
+                <div v-if="!b.available">
+                  config.yaml 中已没有这个实例或配置有误，推送会失败
+                </div>
+                <div v-if="userStore.isAdmin">
+                  上次成功推送：{{ formatTime(b.last_succeeded_push_at) }}
+                </div>
+                <div v-if="b.target_url">
+                  点击在新标签页打开
+                </div>
+              </template>
+              <!-- 没有链接时不给 href：Guest 拿不到链接（服务端剔除），没有链接的类型也不该看起来能点 -->
+              <a
+                :href="b.target_url || undefined"
+                target="_blank"
+                rel="noopener noreferrer"
+                class="binding-icon"
+                :class="{ clickable: !!b.target_url, unavailable: !b.available }"
+              >
+                <SvgIcon v-if="destinationIcon(b)" :name="destinationIcon(b)!" />
+                <el-icon v-else><Link /></el-icon>
+                <!-- 同一类型可以绑多个实例，只看图标分不出是哪个 -->
+                <span class="binding-name">{{ b.destination }}</span>
+              </a>
             </el-tooltip>
             <span v-if="!row.bindings.length" class="sub">—</span>
           </template>
@@ -722,8 +757,35 @@ onMounted(load)
   margin-bottom: 6px;
 }
 
-.binding-tag {
-  margin: 0 4px 4px 0;
+.binding-icon {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin: 0 10px 4px 0;
+  font-size: 16px;
+  vertical-align: middle;
+  color: var(--el-text-color-secondary);
+  text-decoration: none;
+  cursor: default;
+
+  &.clickable {
+    cursor: pointer;
+    color: var(--el-text-color-regular);
+
+    &:hover .binding-name {
+      color: var(--el-color-primary);
+    }
+  }
+
+  // 实例不可用时褪色，与表单里「推送会失败」的提示同义
+  &.unavailable {
+    filter: grayscale(1);
+    opacity: 0.45;
+  }
+}
+
+.binding-name {
+  font-size: 12px;
 }
 
 .degraded {

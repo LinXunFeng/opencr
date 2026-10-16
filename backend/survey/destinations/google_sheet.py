@@ -223,6 +223,18 @@ class GoogleSheetDestination(Destination):
             raise ValueError(f"工作表名称不能超过 {MAX_WORKSHEET_TITLE} 个字符")
         return {"spreadsheet": parse_spreadsheet_id(spreadsheet), "worksheet": worksheet}
 
+    @classmethod
+    def target_url(cls, target: Dict[str, Any]) -> str:
+        """表格的浏览链接，定位到整张表格而不是某个工作表。"""
+        # 直达工作表要用数值 sheetId（#gid=），而落库的只有工作表名。为此在列表页逐行调
+        # spreadsheets.get，或在推送时额外存一份 sheetId 都不划算，工作表名由后台在链接旁展示。
+        try:
+            spreadsheet = parse_spreadsheet_id((target or {}).get("spreadsheet") or "")
+        except ValueError:
+            # 实例从 config.yaml 删除后原样保留的旧绑定可能存的是任意内容，拼不出就不给链接
+            return ""
+        return f"https://docs.google.com/spreadsheets/d/{spreadsheet}/edit"
+
     # ------------------------------------------------------------------
     # 连通性测试
     # ------------------------------------------------------------------

@@ -164,6 +164,16 @@ class Destination(ABC):
                 parts.append(f"{item.label}：{value}")
         return " / ".join(parts)
 
+    @classmethod
+    def target_url(cls, target: Dict[str, Any]) -> str:
+        """
+        目标位置在平台上的浏览链接，用于后台列表一键打开；拼不出时返回空串。
+
+        只能由已落库的目标位置推出，不得为此请求平台：列表页每次刷新都会调用，
+        一行一次网络请求会把列表拖慢到被限流。只接受 https 链接，其余一律按空串处理。默认不提供链接。
+        """
+        return ""
+
     def check(self, target: Dict[str, str], columns: Sequence[Column]) -> List[CheckItem]:
         """
         连通性测试：凭据能否加载、目标位置能否读写。**不得写入任何台账行。**
