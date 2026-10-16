@@ -69,7 +69,8 @@ LEDGER_COLUMNS = (
     # 这一行下已提出的修复合并请求，一行一个链接。合并请求是按问题提的，一行（指纹）可能有好几个。
     # 不用 url 类型：url 列只能放一个链接
     Column("fix_links", "修复合并请求", COLUMN_LONG_TEXT),
-    # 与「修复合并请求」逐行对齐：第 n 行是第 n 个合并请求的处理人，未指派的那一行留空。
+    # 这个问题的修复落在谁身上，一行一人，同一个人的多个合并请求只写一次。
+    # 不与「修复合并请求」逐行对齐：同一个人反复出现读起来像重复数据，而哪个合并请求指派给谁，点开链接就能看到。
     # 不合进链接列写成"链接 处理人"：那样整列就不再是纯链接，表格里点不开，也没法按人筛选。
     # 表头不叫"处理人"：列按表头名称定位，用户在表格里自建的"处理人"人工列很常见，同名会被每次推送静默覆盖
     Column("fix_assignees", "修复处理人", COLUMN_LONG_TEXT),
@@ -336,7 +337,7 @@ def assignee_display_name(name: str, username: str) -> str:
     处理人在台账里的写法：姓名；平台没给姓名时退回 @用户名；未指派时为空串。
 
     不像后台与 Markdown 导出那样写"@用户名 姓名"：表格是给不登录后台的人看、按人筛选的，
-    一格里混着工号一类的用户名，筛选和阅读都多一层噪音；重名时可以顺着同一行的合并请求链接点进去看。
+    一格里混着工号一类的用户名，筛选和阅读都多一层噪音；重名时由 fix_assignees_cell 补上用户名区分。
     """
     if name:
         return name
@@ -345,14 +346,29 @@ def assignee_display_name(name: str, username: str) -> str:
 
 def fix_assignees_cell(merge_requests: List[dict]) -> str:
     """
-    「修复处理人」一格：与「修复合并请求」逐行对齐，未指派的那一行留空。
+    「修复处理人」一格：已提出的修复合并请求的处理人，按首次出现的顺序一行一人；重名的写成"姓名（@用户名）"；
+    未指派的不占行，全部未指派时为空串。
 
-    中间的空行不能省：省掉后下面的名字会往上挪，对到别的合并请求上。
-    末尾的空行去掉：全部未指派时这一格就是空的，而不是几个看不见的换行。
+    merge_requests 按发起时间排列（repo.survey_fix_merge_requests）。
     """
-    names = [assignee_display_name(mr.get("assignee_name") or "", mr.get("assignee_username") or "")
-             for mr in merge_requests]
-    return "\n".join(names).rstrip("\n")
+    # 按用户名认人而不是按显示的姓名：重名的两个人是两个处理人，按姓名去重会把其中一个吞掉。
+    # 同一个人在两次指派之间改了名，写最近一次的姓名 —— 先前的名字已经对不上平台上的人了。
+    # 但最近一次平台没给姓名时沿用之前的：退回 @用户名 只是没有姓名时的兜底，不该盖掉已知的姓名。
+    latest_names: Dict[str, str] = {}
+    for mr in merge_requests:
+        username = mr.get("assignee_username") or ""
+        if not username:
+            continue
+        name = mr.get("assignee_name") or ""
+        if name or username not in latest_names:
+            latest_names[username] = assignee_display_name(name, username)
+    # dict 保留首次插入的顺序，后面的赋值只更新姓名、不挪位置
+    names = list(latest_names.values())
+    # 重名的人补上用户名：只写姓名时两行一模一样，读起来就是没去干净的重复，而这一格已不和链接对齐，没法顺着链接分辨
+    return "\n".join(
+        f"{name}（@{username}）" if names.count(name) > 1 else name
+        for username, name in latest_names.items()
+    )
 
 
 def build_ledger_rows(
