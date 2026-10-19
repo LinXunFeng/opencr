@@ -280,6 +280,20 @@ def prepare_fix_repo(run_uid: str, url: str, branch: str = "", timeout: int = 60
     return repo_dir, actual_branch, sha
 
 
+def prepare_history_repo(key: str, url: str, branch: str = "", commit_sha: str = "", timeout: int = 600) -> Path:
+    """
+    为给台账行追溯原始作者克隆一份带历史的仓库，返回工作区路径；用完由调用方 delete_fix_workspace(key) 删除。
+
+    与修复用同一种部分克隆、同一个目录（key 与修复的 run_uid 不会撞上）：Survey 的工作区是浅克隆，blame 不出作者。
+    commit_sha 是那一轮分析的提交，检出到它，台账里的行号才对得上。检出不了（分支在这期间被强推、本地没有那个提交）时抛 SurveyError，
+    不退回分支最新的提交：行号整体错位时 blame 不会报错，而是安静地归给别人，追溯结果又只写一次，错的人会一直留在台账上。
+    """
+    repo_dir, _branch, head = prepare_fix_repo(key, url, branch, timeout)
+    if commit_sha and commit_sha != head:
+        _run_git(["checkout", "-q", "--detach", commit_sha], repo_dir, load_gitlab_config().get("token", ""), timeout)
+    return repo_dir
+
+
 def read_blame_ignore_revs(repo_dir: Path, timeout: int = 60) -> List[str]:
     """
     读取仓库自带的 .git-blame-ignore-revs，只返回本地能解析成提交的条目。

@@ -467,7 +467,36 @@ export const FIX_NOTES = {
   fixAllStarted: (queued: number, total: number) =>
     queued < total ? `已开始修复 ${queued} 个，另有 ${total - queued} 个超出本批上限，稍后再点一次` : `已开始修复 ${queued} 个`,
   ownerPage: "原始作者不可用时，合并请求指派给这里配置的负责人（按顺序取第一个仍在项目里、账号可用、权限不低于 Developer 的人）；没有配置或配置的人都不可用时不指派——不按项目权限猜一个人，免得合并请求落到不管这个仓库的人名下。未指派的可以在「修复合并请求」里筛出来。",
-  mergeRequestsPage: "修复提出的全部合并请求。原始作者与配置的仓库负责人都不可用时合并请求不指派处理人，可以在这里按「未指派」筛出来，到代码平台上分给合适的人；也可以去「仓库负责人」补上配置，之后的修复就会指派过去。",
+  mergeRequestsPage: "修复提出的全部合并请求。原始作者与配置的仓库负责人都不可用时合并请求不指派处理人，可以在这里按「未指派」筛出来，到代码平台上分给合适的人；也可以去「仓库负责人」补上配置，之后的修复就会指派过去。不再需要的合并请求可以勾选后「清理」：关闭合并请求、删除修复分支，免得分支越堆越多；推了分支、合并请求没提成的修复也列在这里，同样可以清理。",
+  orphanBranchTag: "只推了分支",
+  orphanBranchTip: "修复分支已推送，但合并请求没有提成功。分支留在代码平台上，可以清理掉。",
+  cleanedTag: "已清理",
+  cleanedFilterOptions: [
+    { label: "未清理", value: "no" },
+    { label: "已清理", value: "yes" },
+    { label: "全部", value: "" }
+  ],
+  cleanupTooMany: (max: number) => `一次最多清理 ${max} 个`,
+  cleanupNotDone: "未清理",
+  cleanedTip: "合并请求已关闭、修复分支已删除。记录保留，这个问题仍算修复过，一键全部修复与自动修复不会再给它发起。",
+  cleanupButton: "清理",
+  cleanupSelectedButton: (count: number) => `清理所选（${count}）`,
+  cleanupTitle: (count: number) => count > 1 ? `清理这 ${count} 个修复？` : "清理这个修复？",
+  cleanup: [
+    "会在代码平台上关闭合并请求（已合并或已关闭的不动）并删除 opencr/fix- 修复分支。关闭不是删除，需要时仍可在平台上重新打开，但分支删掉后要恢复只能靠平台的分支恢复功能。",
+    "分支上有不是 OpenCR 推送的提交时（有人接手改了）整条跳过，合并请求也不关。",
+    "OpenCR 里的修复记录保留并标为已清理，台账不再列出它的链接（已合并的除外，那是问题修复过并合入的证据）；这个问题仍算修复过，一键全部修复与自动修复不会再给它发起，要重来请在报告里单条「提出修复」。清理不改变问题台账的状态。"
+  ],
+  cleanupConfirmButton: "清理",
+  /** 清理结果的汇总提示 */
+  cleanupDone: (results: Array<{ outcome: string }>) => {
+    const count = (outcome: string) => results.filter(r => r.outcome === outcome).length
+    return [
+      count("cleaned") ? `已清理 ${count("cleaned")} 个` : "",
+      count("rejected") ? `${count("rejected")} 个未清理` : "",
+      count("failed") ? `${count("failed")} 个失败` : ""
+    ].filter(Boolean).join("，")
+  },
   ownerPath: "填项目或组织的路径（或直接粘贴地址）。组织路径对它下面的全部项目生效，同一个项目命中多条时取最具体的那条。",
   ownerSearchPlaceholder: "输入用户名或姓名搜索",
   ownerSearchEmpty: "代码平台上没有匹配的用户",

@@ -46,6 +46,7 @@ from ..survey.fix import (
     project_path_from_url,
     start_fix_batch,
 )
+from ..survey.fix_cleanup import CLEANUP_CLEANED, MAX_CLEANUP_PER_REQUEST, cleanup_fixes
 from ..survey.profile import codegraph_available
 from ..survey.push import PushRejected, begin_pushes, check_destination, execute_pushes_in_background
 from ..survey.report import render_run_markdown
@@ -1315,7 +1316,7 @@ def _strip_fix_for_guest(fix: dict) -> dict:
 @require_survey_fix_viewer
 def api_survey_fix_merge_requests():
     """
-    修复提出的合并请求列表（跨巡检），可按巡检、处理人（可多选，含未指派）与关键字筛选。
+    修复提出的合并请求列表（跨巡检），可按巡检、处理人（可多选，含未指派）、关键字与清理状态（cleaned=no / yes）筛选。
 
     修复记录带问题标题、文件路径与处理人，属于正文一侧（见 ADR-0002）：
     默认只对 Admin，Guest 要等管理员打开「游客可见修复」。
@@ -1329,6 +1330,7 @@ def api_survey_fix_merge_requests():
         limit=_int_arg("limit", 50, 200),
         offset=_int_arg("offset", 0, 100000),
         stale_after_seconds=_stale_after(),
+        cleaned=(request.args.get("cleaned") or "").strip().lower(),
     )
     if not is_admin():
         result["items"] = [_strip_fix_for_guest(item) for item in result["items"]]
@@ -1362,6 +1364,29 @@ def api_interrupt_survey_fix(run_uid: str):
     """
     outcome = repo.confirm_survey_fix_interrupted(run_uid, _stale_after())
     return _interrupt_response(outcome, run_uid, "survey fix")
+
+
+@admin_bp.route("/api/admin/survey-fixes/cleanup", methods=["POST"])
+@require_admin
+def api_cleanup_survey_fixes():
+    """
+    清理修复运行：关闭合并请求、删除修复分支，记录保留并标为已清理。入参 {"run_uids": [...]}，单条清理也走这里。
+
+    同步执行、逐条返回结果（cleaned / rejected / failed）：清理是对外可见的动作，哪条没清掉、为什么，要当场告诉操作的人。
+    """
+    payload = request.get_json(silent=True) or {}
+    run_uids = payload.get("run_uids")
+    if not isinstance(run_uids, list) or not run_uids:
+        return jsonify({"error": "run_uids 必须是非空数组"}), 400
+    run_uids = [str(u).strip() for u in run_uids if str(u or "").strip()]
+    if len(run_uids) > MAX_CLEANUP_PER_REQUEST:
+        return jsonify({"error": f"一次最多清理 {MAX_CLEANUP_PER_REQUEST} 条"}), 400
+    results = cleanup_fixes(run_uids)
+    logger.info(
+        "Admin cleaned survey fixes: requested=%s cleaned=%s", len(run_uids),
+        sum(1 for r in results if r["outcome"] == CLEANUP_CLEANED),
+    )
+    return jsonify({"results": results})
 
 
 def _owner_path_from_input(raw) -> str:

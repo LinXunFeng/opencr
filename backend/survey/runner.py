@@ -42,6 +42,7 @@ from .analysis import (
     Budget, focus_key, inspect_focus, l1_repo_budget, load_skill_prompt, match_skills, merge_focuses, plan_focus,
     summarize,
 )
+from .assignee import resolve_ledger_assignees
 from .clues import annotate_focuses, summarize_codegraph
 from .common import SurveyError, finding_fingerprint
 from .config import load_max_repos, load_survey_config, resolve_budget
@@ -401,7 +402,7 @@ def _record_codegraph_stats(
 
 def _publish(run_uid: str) -> None:
     """
-    成功的运行结束后：更新 Ledger，再推送到该 Survey 绑定的全部 Destination。
+    成功的运行结束后：更新 Ledger、为台账行确定处理人，再推送到该 Survey 绑定的全部 Destination。
 
     放在运行收尾之后而不是之内：两者的失败都不该改写已经落库的运行状态 ——
     分析产出本身没有受损。台账更新失败时不推送，否则推出去的是一份旧台账，
@@ -412,6 +413,12 @@ def _publish(run_uid: str) -> None:
     except Exception:
         logger.exception("Ledger update failed, skipping push: run=%s", run_uid)
         return
+    # 放在台账更新之后、推送之前：追溯的是这一轮台账里的行，推出去的「修复处理人」才是这一轮定下的
+    try:
+        resolve_ledger_assignees(run_uid)
+    except Exception:
+        # 处理人是附加信息，出错时这一轮台账照常推送，各行沿用上一次定下的处理人
+        logger.exception("Resolving ledger assignees failed: run=%s", run_uid)
 
     try:
         started = begin_pushes(run_uid, PUSH_TRIGGER_AUTO)

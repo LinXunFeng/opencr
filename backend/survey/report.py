@@ -164,6 +164,10 @@ def _render_findings(findings: List[dict], include_body: bool) -> str:
     return "\n".join(blocks)
 
 
+# 已清理（合并请求已关闭、修复分支已删除）的修复在报告里的标注
+CLEANED_MARK = "（已清理）"
+
+
 def _assignee_text(fix: dict) -> str:
     """处理人的写法：@用户名 姓名，与后台一致；用户名是工号一类的数字时，光看它认不出是谁。未指派时为空串。"""
     username = fix.get("assignee_username") or ""
@@ -181,7 +185,9 @@ def _fix_link_lines(fixes: List[dict]) -> List[str]:
             continue
         assignee = _assignee_text(fix)
         who = f"，处理人 {assignee}" if assignee else ""
-        lines.append(f"  - 修复合并请求：{fix['mr_url']}{who}")
+        # 报告是留档，已清理的照样列出、注明一句，读者才知道那个链接为什么是关闭的
+        cleaned = CLEANED_MARK if fix.get("cleaned_at") else ""
+        lines.append(f"  - 修复合并请求：{fix['mr_url']}{cleaned}{who}")
     return lines
 
 
@@ -206,6 +212,8 @@ def _render_fixes(fixes: List[dict]) -> List[str]:
         status = FIX_STATUS_LABELS.get(fix.get("status", ""), fix.get("status", ""))
         if fix.get("status") != RUN_SUCCEEDED and fix.get("error_message"):
             status += f"：{fix['error_message']}"
+        if fix.get("cleaned_at"):
+            status += CLEANED_MARK
         assignee = _assignee_text(fix) or ("未指派" if fix.get("mr_url") else "-")
         if fix.get("assignee_source") in ASSIGNEE_SOURCE_LABELS:
             assignee += f"（{ASSIGNEE_SOURCE_LABELS[fix['assignee_source']]}）"

@@ -476,15 +476,21 @@ def get_note_award_emoji(project_id: int, mr_iid: int, note_id: int) -> List[str
 MAX_MEMBER_PAGES = 10
 
 
-def _gitlab_post(path: str, payload: dict, timeout: int = 30):
-    """GitLab POST 的统一封装。失败时抛 ReviewError，消息里带上平台返回的原因（例如权限不足、分支已有合并请求）。"""
+def _gitlab_send(method: str, path: str, payload: Optional[dict] = None, timeout: int = 30, allow_404: bool = False):
+    """
+    GitLab 写操作（以及需要区分 404 的读操作）的统一封装。
+
+    失败时抛 ReviewError，消息里带上平台返回的原因（例如权限不足、分支已有合并请求）。
+    allow_404=True 时 404 不算失败、返回 None：清理时"分支已经不在了"是正常情况，不是错误。
+    """
     import requests
     import urllib3
 
     cfg = require_gitlab_config()
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
     try:
-        response = requests.post(
+        response = requests.request(
+            method,
             f"{cfg['url']}/api/v4{path}",
             headers={"PRIVATE-TOKEN": cfg["token"]},
             json=payload,
@@ -493,9 +499,16 @@ def _gitlab_post(path: str, payload: dict, timeout: int = 30):
         )
     except requests.RequestException as e:
         raise ReviewError(f"请求 GitLab 失败：{e}") from e
+    if allow_404 and response.status_code == 404:
+        return None
     if response.status_code >= 400:
         raise ReviewError(f"GitLab 返回 {response.status_code}：{response.text[:500]}")
     return response
+
+
+def _gitlab_post(path: str, payload: dict, timeout: int = 30):
+    """GitLab POST 的统一封装，见 _gitlab_send。"""
+    return _gitlab_send("POST", path, payload, timeout)
 
 
 def encode_project_path(project_path: str) -> str:
@@ -584,3 +597,49 @@ def create_merge_request(
     response = _gitlab_post(f"/projects/{encode_project_path(project_path)}/merge_requests", payload)
     data = response.json() or {}
     return data if isinstance(data, dict) else {}
+
+
+# ---------------------------------------------------------------------------
+# 清理修复合并请求用到的接口
+# ---------------------------------------------------------------------------
+
+def _json_object_or_none(response) -> Optional[dict]:
+    """把 allow_404 请求的响应解析成对象：404（response 为 None）返回 None，响应体不是对象时返回空字典。"""
+    if response is None:
+        return None
+    data = response.json() or {}
+    return data if isinstance(data, dict) else {}
+
+
+def get_branch(project_path: str, branch: str) -> Optional[dict]:
+    """读取分支信息（含分支头提交 commit.id 与 commit.parent_ids）；分支不存在时返回 None。"""
+    response = _gitlab_send(
+        "GET", f"/projects/{encode_project_path(project_path)}/repository/branches/{quote(branch, safe='')}",
+        allow_404=True,
+    )
+    return _json_object_or_none(response)
+
+
+def get_merge_request(project_path: str, mr_iid: int) -> Optional[dict]:
+    """读取合并请求（含 state：opened / closed / merged / locked）；不存在（已被删除）时返回 None。"""
+    response = _gitlab_send(
+        "GET", f"/projects/{encode_project_path(project_path)}/merge_requests/{int(mr_iid)}", allow_404=True
+    )
+    return _json_object_or_none(response)
+
+
+def close_merge_request(project_path: str, mr_iid: int) -> None:
+    """关闭合并请求。关闭而不是删除：删除要 Owner 权限，还会把上面的讨论一起抹掉，关闭之后需要时仍能重新打开。"""
+    _gitlab_send(
+        "PUT", f"/projects/{encode_project_path(project_path)}/merge_requests/{int(mr_iid)}",
+        {"state_event": "close"},
+    )
+
+
+def delete_branch(project_path: str, branch: str) -> bool:
+    """删除分支，返回是否删掉了；分支本来就不存在时返回 False。"""
+    response = _gitlab_send(
+        "DELETE", f"/projects/{encode_project_path(project_path)}/repository/branches/{quote(branch, safe='')}",
+        allow_404=True,
+    )
+    return response is not None
