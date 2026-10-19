@@ -353,6 +353,8 @@ export interface SurveyFix {
   assignee_note: string
   mr_iid: number | null
   mr_url: string
+  /** 清理（关闭合并请求、删除修复分支）的时刻；未清理为空串 */
+  cleaned_at: string
   started_at: string
   finished_at: string
 }
@@ -377,6 +379,8 @@ export interface SurveyFixDetail extends SurveyFix {
   /** Guest 拿不到问题正文，字段直接不存在（服务端剔除，不是前端隐藏） */
   body?: string
   base_sha: string
+  /** 推到修复分支上的提交；旧记录与没推送过的为空串 */
+  commit_sha: string
   summary: string
   diff: string
   verification: SurveyFixAttempt[]
@@ -807,6 +811,8 @@ export interface FixMergeRequestQuery {
   /** 处理人用户名，可含 UNASSIGNED_FILTER */
   assignees?: string[]
   q?: string
+  /** no = 未清理；yes = 已清理；不传 = 全部 */
+  cleaned?: "no" | "yes"
   limit?: number
   offset?: number
 }
@@ -824,6 +830,27 @@ export function getFixMergeRequestsApi(query: FixMergeRequestQuery) {
 /** 确认疑似中断的修复运行已中断。只关闭记录，不停止执行 */
 export function interruptSurveyFixApi(runUid: string) {
   return request<{ run_uid: string, status: string }>({ url: `survey-fixes/${runUid}/interrupt`, method: "post" })
+}
+
+/** 一条修复运行的清理结果 */
+export interface SurveyFixCleanupResult {
+  run_uid: string
+  /** cleaned = 已清理；rejected = 不该清理，平台上什么都没动；failed = 平台接口出错，可能做了一半，再清理一次会接着做完 */
+  outcome: "cleaned" | "rejected" | "failed"
+  message: string
+  already_cleaned: boolean
+}
+
+/** 一次最多清理几条，与后端 fix_cleanup.MAX_CLEANUP_PER_REQUEST 一致 */
+export const MAX_CLEANUP_PER_REQUEST = 50
+
+/** 清理修复运行：关闭合并请求、删除修复分支。逐条同步执行，返回每条的结果 */
+export function cleanupSurveyFixesApi(runUids: string[]) {
+  return request<{ results: SurveyFixCleanupResult[] }>({
+    url: "survey-fixes/cleanup",
+    method: "post",
+    data: { run_uids: runUids }
+  })
 }
 
 /** 一键全部修复：后台逐个执行，返回本批排队数与候选总数 */

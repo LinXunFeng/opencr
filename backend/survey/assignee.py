@@ -1,26 +1,32 @@
 #!/usr/bin/env python3
 """
-修复合并请求的处理人：追溯问题代码的原始作者，作者不可用时退回人工配置的仓库负责人，都没有时不指派。
+处理人：追溯问题代码的原始作者，作者不可用时退回人工配置的仓库负责人，都没有时不指派。
+修复合并请求指派给谁（resolve_assignee）、台账行没提修复时写谁（resolve_ledger_assignees）用的是同一套规则。
 
 原始作者不是"最后一次碰过这几行的人"。批量格式化、改缩进、换引号的提交会把整个文件的 blame 都归到
 执行格式化的人名下，指派给他等于把问题丢给一个从没写过这段逻辑的人。所以追溯时跳过只改格式的提交，
 一直追到最后一次实质改动这几行的提交。
 
 判定逻辑（formatting_only_lines / changed_lines / pick_author / match_member / unavailable_reason /
-pick_configured_owner）都是纯函数，不碰 git 与网络；find_original_author 与 resolve_assignee 负责把它们和 git、平台接口串起来。
+pick_configured_owner / plan_ledger_traces）都是纯函数，不碰 git 与网络；find_original_author、resolve_assignee
+与 resolve_ledger_assignees 负责把它们和 git、平台接口串起来。
 """
 
 import bisect
 import difflib
 import logging
 import re
+import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+from ..review.config import load_gitlab_config
 from ..review.gitlab import get_current_user, list_project_members, search_users
 from ..storage import repo
-from ..storage.models import ASSIGNEE_AUTHOR, ASSIGNEE_CONFIGURED
-from .workspace import git_blame, git_show_file, read_blame_ignore_revs
+from ..storage.models import ASSIGNEE_AUTHOR, ASSIGNEE_CONFIGURED, LEDGER_PRESENT, utcnow
+from .common import SurveyError
+from .config import resolve_budget
+from .workspace import delete_fix_workspace, git_blame, git_show_file, prepare_history_repo, read_blame_ignore_revs
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +45,12 @@ _FORMAT_REGION_GAP = 3
 _FORMAT_ALIGN_MAX_CHARS = 20_000
 # 平台为项目/组织访问令牌建的机器人账号，用户名形如 project_123_bot_xxx
 _BOT_USERNAME = re.compile(r"^(project|group)_\d+_bot", re.IGNORECASE)
+# 一轮巡检最多为多少行台账追溯原始作者。每行一次 blame，加上跳过格式化提交时按需取回的历史文件，
+# 部分克隆下都是网络请求；第一次绑定输出目标时整张台账都没追溯过，不设上限会让推送晚上几十分钟。剩下的下一轮接着追溯
+MAX_LEDGER_TRACES_PER_RUN = 100
+# 一轮追溯最多花多少秒，超出后剩下的仓库留给下一轮。行数上限挡不住"仓库多、每个都要克隆"：
+# 追溯排在推送之前，100 行分散在几十个仓库里时，克隆本身就能把推送拖上半小时
+MAX_LEDGER_TRACE_SECONDS = 600
 
 
 def _line_shape(line: str) -> str:
@@ -352,39 +364,82 @@ def _membership_active(member: dict) -> bool:
     return str(member.get("membership_state") or "active").strip().lower() == "active"
 
 
-def resolve_assignee(project_path: str, author: Optional[dict]) -> dict:
+class PlatformLookup:
     """
-    决定修复合并请求的处理人。
+    一次处理人判定过程里对平台的查询，按项目与邮箱缓存。
+
+    给一张台账逐行找处理人时，同一个项目的成员、同一个作者的邮箱会被查上几十遍；
+    每次修复只判定一个人，用一个新的实例即可，效果与不缓存相同。
+    """
+
+    def __init__(self):
+        """缓存为空；查不到的结果（含出错）同样缓存，同一个项目出错一次就不再反复重试。"""
+        self._members: Dict[str, object] = {}
+        self._searched: Dict[str, List[dict]] = {}
+        self._self_loaded = False
+        self._self_id: Optional[int] = None
+
+    def members(self, project_path: str) -> List[dict]:
+        """项目成员（含继承）；读取失败时抛出，与 list_project_members 一致。"""
+        if project_path not in self._members:
+            try:
+                self._members[project_path] = list_project_members(project_path)
+            except Exception as e:
+                self._members[project_path] = e
+        cached = self._members[project_path]
+        if isinstance(cached, Exception):
+            raise cached
+        return cached
+
+    def self_id(self) -> Optional[int]:
+        """令牌所属账号的 id；读不到时为 None。"""
+        if not self._self_loaded:
+            self._self_loaded = True
+            try:
+                self._self_id = get_current_user().get("id")
+            except Exception as e:
+                # 读不到自己是谁的后果只是少了一条排除规则：令牌账号若恰好是原始作者或配置里的人，会被指派给它自己
+                logger.warning("Reading current user failed: %s", e)
+        return self._self_id
+
+    def search(self, email: str) -> List[dict]:
+        """按邮箱搜到的账号；搜索出错时为空列表。"""
+        key = str(email or "").strip().lower()
+        if key not in self._searched:
+            try:
+                self._searched[key] = search_users(email)
+            except Exception as e:
+                # 搜不了就靠用户名与显示名匹配，见 match_member
+                logger.warning("Searching user by email failed: %s", e)
+                self._searched[key] = []
+        return self._searched[key]
+
+
+def resolve_assignee(project_path: str, author: Optional[dict], lookup: Optional[PlatformLookup] = None) -> dict:
+    """
+    决定处理人。lookup 是平台查询的缓存，逐行判定一张台账时由调用方共用一个；不传时新建。
 
     依次尝试：原始作者 → 仓库负责人配置里第一个可用的人。
-    返回 {"source", "id", "username", "name", "note"}：source 为 ASSIGNEE_AUTHOR / ASSIGNEE_CONFIGURED，
+    返回 {"source", "id", "username", "name", "note", "lookup_failed"}：source 为 ASSIGNEE_AUTHOR / ASSIGNEE_CONFIGURED，
     都找不到时为空串、id 为 None（合并请求照常提出，只是不指派）。note 说明为什么没指派给原始作者、为什么没有指派。
+    lookup_failed 表示读不到项目成员、这次根本没能判定：台账据此保留上一次的结果，而不是把人清空。
     平台接口出错不抛出：处理人只是锦上添花，为它让整个修复失败不划算。
     """
-    result = {"source": "", "id": None, "username": "", "name": "", "note": ""}
+    lookup = lookup or PlatformLookup()
+    result = {"source": "", "id": None, "username": "", "name": "", "note": "", "lookup_failed": False}
     try:
-        members = list_project_members(project_path)
+        members = lookup.members(project_path)
     except Exception as e:
         logger.warning("Listing project members failed: project=%s: %s", project_path, e)
         # 不把报错原文写进 note：它会进合并请求说明，项目里所有人都看得到，可能带出内网地址与报错细节
         result["note"] = "读取项目成员失败，未指派处理人"
+        result["lookup_failed"] = True
         return result
-    try:
-        self_id = get_current_user().get("id")
-    except Exception as e:
-        # 读不到自己是谁的后果只是少了一条排除规则：令牌账号若恰好是原始作者或配置里的人，会被指派给它自己
-        logger.warning("Reading current user failed: %s", e)
-        self_id = None
+    self_id = lookup.self_id()
 
     reason = "没有追溯到原始作者"
     if author:
-        searched: List[dict] = []
-        if author.get("email"):
-            try:
-                searched = search_users(author["email"])
-            except Exception as e:
-                # 搜不了就靠用户名与显示名匹配，见 match_member
-                logger.warning("Searching user by email failed: %s", e)
+        searched = lookup.search(author["email"]) if author.get("email") else []
         account, is_member = match_member(author, members, searched)
         reason = unavailable_reason(account, is_member, self_id)
         if not reason:
@@ -450,3 +505,132 @@ def _configured_owner(project_path: str, members: List[dict], self_id: Optional[
     if member is not None:
         return member, f"（按 {entry['path']} 的配置）"
     return None, f"{entry['path']} 配置的负责人都不可用（{'、'.join(skipped)}）"
+
+
+def plan_ledger_traces(
+    entries: List[dict], run_uid: str, repo_slugs: set, limit: int
+) -> Tuple[Dict[str, List[dict]], List[str]]:
+    """
+    这一轮要为哪些台账行追溯原始作者，返回 ({仓库: [台账行]}, 没有行号的行的指纹)。
+
+    只看状态为存在、还没追溯过、本轮（run_uid）重新出现过、所在仓库这一轮拉取成功（repo_slugs）的行；
+    按 entries 的顺序（首次发现的先后）取前 limit 行。
+    没有行号的行 blame 不了，不占名额，直接记为"追溯过、没有原始作者"，处理人退回仓库负责人。
+    """
+    groups: Dict[str, List[dict]] = {}
+    no_lines: List[str] = []
+    taken = 0
+    for entry in entries:
+        if entry.get("state") != LEDGER_PRESENT or entry.get("author_traced_at") is not None:
+            continue
+        # 本轮没重新出现的行，行号还是它上次出现那一轮的；拿去对本轮的提交做 blame，代码挪过位置时
+        # 会安静地归给别人，而追溯结果只写一次。等它下次出现、行号与提交对得上时再追溯
+        if entry.get("last_run_uid") != run_uid:
+            continue
+        if entry.get("repo_slug") not in repo_slugs or not entry.get("file_path"):
+            continue
+        if not [n for n in entry.get("lines") or [] if int(n or 0) > 0]:
+            no_lines.append(entry["fingerprint"])
+            continue
+        if taken >= limit:
+            continue
+        groups.setdefault(entry["repo_slug"], []).append(entry)
+        taken += 1
+    return groups, no_lines
+
+
+def _trace_repo(key: str, target: dict, entries: List[dict], timeout: int) -> Dict[str, dict]:
+    """
+    克隆一个仓库并为其中的台账行追溯原始作者，返回 {指纹: 要写回台账的作者字段}。
+
+    克隆或检出分析时的提交失败时整个仓库返回空，这些行保持"未追溯"、下一轮再试：多半是网络或权限这类一时的问题。
+    单行 blame 失败时那一行记为"追溯过、没有原始作者"。
+    """
+    traced: Dict[str, dict] = {}
+    try:
+        repo_dir = prepare_history_repo(key, target["url"], target.get("branch", ""), target.get("commit_sha", ""), timeout)
+    except SurveyError as e:
+        logger.warning("Cloning for ledger author trace failed: url=%s: %s", target.get("url"), e)
+        delete_fix_workspace(key)
+        return traced
+    try:
+        for entry in entries:
+            try:
+                author = find_original_author(repo_dir, entry["file_path"], [int(n) for n in entry["lines"]])
+            except SurveyError as e:
+                # 记为追溯过、不留到下一轮：单行失败多半每次都失败（行号超出文件长度、路径与仓库里对不上），
+                # 留着的话它们按首次发现排在队首，每轮白克隆一次仓库，攒多了还会占满名额，后面的行永远轮不到。
+                # 代价是一时的失败也不再重试，这一行的处理人退回仓库负责人
+                logger.warning("Ledger author trace failed: fingerprint=%s: %s", entry["fingerprint"], e)
+                author = None
+            traced[entry["fingerprint"]] = {
+                "author_traced_at": utcnow(),
+                "author_name": (author or {}).get("name") or None,
+                "author_email": (author or {}).get("email") or None,
+            }
+    finally:
+        delete_fix_workspace(key)
+    return traced
+
+
+def resolve_ledger_assignees(run_uid: str) -> None:
+    """
+    为一次成功运行之后的台账确定每行的处理人：先给还没追溯过的行追溯原始作者，再按处理人规则为状态为存在的行定下处理人。
+
+    没有提修复的问题同样要有人负责，台账的「修复处理人」一格据此写人（有修复合并请求时以那边实际指派的人为准，见 ledger.py）。
+    只在这个巡检绑定了输出目标、平台是 GitLab 时做：处理人只出现在台账镜像里，没有镜像时为它克隆仓库是白花的成本。
+    只为这一轮拉取成功的仓库判定：项目地址取自这一轮的仓库记录。
+    """
+    from .fix import project_path_from_url  # 延迟导入：fix 依赖本模块
+
+    platform = load_gitlab_config()
+    if platform.get("type") != "gitlab":
+        return
+    context = repo.get_survey_push_context(run_uid)
+    if context is None or not context["survey"].get("bindings"):
+        return
+    survey_id = context["survey_id"]
+    targets = repo.get_survey_run_repo_targets(run_uid)
+    if not targets:
+        return
+
+    groups, no_lines = plan_ledger_traces(
+        repo.list_survey_ledger(survey_id), run_uid, set(targets), MAX_LEDGER_TRACES_PER_RUN
+    )
+    now = utcnow()
+    traced: Dict[str, dict] = {
+        fp: {"author_traced_at": now, "author_name": None, "author_email": None} for fp in no_lines
+    }
+    timeout = resolve_budget(context["survey"]).get("fetch_timeout_seconds", 600)
+    deadline = time.monotonic() + MAX_LEDGER_TRACE_SECONDS
+    for slug, entries in groups.items():
+        if time.monotonic() >= deadline:
+            logger.info("Ledger author trace out of time, rest left for next run: run=%s", run_uid)
+            break
+        traced.update(_trace_repo(f"ledger-{run_uid}-{slug}", targets[slug], entries, timeout))
+    repo.update_survey_ledger_assignees(survey_id, traced)
+
+    lookup = PlatformLookup()
+    changes: Dict[str, dict] = {}
+    for entry in repo.list_survey_ledger(survey_id):
+        if entry["state"] != LEDGER_PRESENT or entry["repo_slug"] not in targets:
+            continue
+        author = {"name": entry["author_name"], "email": entry["author_email"]} \
+            if entry["author_name"] or entry["author_email"] else None
+        project_path = project_path_from_url(targets[entry["repo_slug"]]["url"], platform.get("url", ""))
+        if not project_path:
+            continue
+        result = resolve_assignee(project_path, author, lookup)
+        if result["lookup_failed"]:
+            continue
+        changes[entry["fingerprint"]] = {
+            "assignee_source": result["source"] or None,
+            "assignee_username": result["username"] or None,
+            "assignee_name": result["name"] or None,
+            "assignee_note": result["note"] or None,
+        }
+    repo.update_survey_ledger_assignees(survey_id, changes)
+    logger.info(
+        "Ledger assignees resolved: run=%s traced=%s assigned=%s/%s",
+        run_uid, len(traced), sum(1 for c in changes.values() if c["assignee_username"]), len(changes),
+    )

@@ -668,7 +668,7 @@ class ExecuteFixTests(FixTestCase):
                 mock.patch.object(assignee, "get_current_user", return_value={"id": 100}), \
                 mock.patch.object(assignee, "search_users", return_value=[]), \
                 mock.patch.object(fix, "get_current_user", return_value=TOKEN_ACCOUNT), \
-                mock.patch.object(fix, "_republish") as republish:
+                mock.patch.object(fix, "republish_ledger") as republish:
             fix.execute_survey_fix(uid)
         self.republish = republish
         return self.repo.get_survey_fix(uid), create
@@ -700,6 +700,8 @@ class ExecuteFixTests(FixTestCase):
         # 没有配置提交作者时跟随令牌账号，邮箱取账号的提交邮箱
         self.assertEqual(shown.split("\n")[:3], [
             "Fix Bot|100-fixbot@users.noreply.g.com|Fix Bot|100-fixbot@users.noreply.g.com", "", "calc.py"])
+        # 记下推上去的提交：清理时靠它认出分支有没有被人接手
+        self.assertEqual(result["commit_sha"], _git(self.root / "remote.git", "rev-parse", branch).strip())
         self.republish.assert_called_once()
         # 工作区做完即删
         self.assertFalse((self.root / "ws" / ".fixes").exists() and any((self.root / "ws" / ".fixes").iterdir()))
@@ -833,7 +835,7 @@ class RepublishTests(unittest.TestCase):
                 mock.patch.object(fix, "begin_pushes", begin), \
                 mock.patch.object(fix, "execute_pushes") as execute, \
                 mock.patch.object(fix.time, "sleep"):
-            fix._republish(1)
+            fix.republish_ledger(1)
         self.assertEqual([c.args for c in begin.call_args_list], [("run", "auto", None), ("run", "auto", 2), ("run", "auto", 2)])
         self.assertEqual([c.args[0] for c in execute.call_args_list], [[11], [], [12]])
 
@@ -1012,7 +1014,7 @@ class FixBatchTests(FixTestCase):
             return True
 
         with mock.patch.object(fix, "execute_survey_fix", side_effect=execute), \
-                mock.patch.object(fix, "_republish") as republish:
+                mock.patch.object(fix, "republish_ledger") as republish:
             fix._run_batch(self._survey_id(), ids, FIX_TRIGGER_BATCH)
         self.assertEqual([(f["finding_id"], f["trigger"]) for f in executed], [(ids[0], "batch")])
         republish.assert_called_once_with(self._survey_id())

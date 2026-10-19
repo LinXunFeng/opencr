@@ -25,6 +25,7 @@ from .models import (
     REASON_NOT_TRACKABLE,
     REPO_FETCH_FAILED,
     REPO_IGNORED,
+    REPO_OK,
     REPO_TRUNCATED,
     RUN_FAILED,
     RUN_RUNNING,
@@ -2588,6 +2589,13 @@ def _ledger_entry_to_dict(entry: "SurveyLedgerEntry") -> dict:
         "last_seen_at": entry.last_seen_at,
         "last_run_uid": entry.last_run_uid or "",
         "last_checked_at": entry.last_checked_at,
+        "author_name": entry.author_name or "",
+        "author_email": entry.author_email or "",
+        "author_traced_at": entry.author_traced_at,
+        "assignee_source": entry.assignee_source or "",
+        "assignee_username": entry.assignee_username or "",
+        "assignee_name": entry.assignee_name or "",
+        "assignee_note": entry.assignee_note or "",
     }
 
 
@@ -2676,6 +2684,61 @@ def upsert_survey_ledger(survey_id: int, changes: List[dict]) -> None:
                     value = str(value or "")[:1024] or None
                 setattr(entry, key, value)
             entry.updated_at = now
+
+
+# 处理人追溯能改写的台账字段。只放这几列：台账状态由 ledger.py 统一判定，别的入口改写它会让镜像与判定口径分叉
+LEDGER_ASSIGNEE_FIELDS = (
+    "author_name", "author_email", "author_traced_at",
+    "assignee_source", "assignee_username", "assignee_name", "assignee_note",
+)
+# 其中的短文本列（String(255)），写入前截断
+_LEDGER_ASSIGNEE_SHORT_FIELDS = ("author_name", "author_email", "assignee_username", "assignee_name")
+
+
+def update_survey_ledger_assignees(survey_id: int, changes: Dict[str, dict]) -> int:
+    """
+    按指纹改写已有 Ledger 行的原始作者与处理人（{指纹: {字段: 值}}，字段限于 LEDGER_ASSIGNEE_FIELDS），返回改写了几行。
+
+    与 upsert_survey_ledger 不同，指纹不存在时跳过而不是新建：调用方（处理人追溯）拿的是稍早读出的台账，
+    期间这一行可能已经不在了，补建出来的会是一行只有处理人、没有问题内容的空行。
+    """
+    from .models import SurveyLedgerEntry
+
+    if not changes:
+        return 0
+    count = 0
+    with session_scope() as session:
+        rows = session.scalars(
+            select(SurveyLedgerEntry).where(
+                SurveyLedgerEntry.survey_id == int(survey_id), SurveyLedgerEntry.fingerprint.in_(list(changes))
+            )
+        ).all()
+        for entry in rows:
+            for key, value in changes[entry.fingerprint].items():
+                if key not in LEDGER_ASSIGNEE_FIELDS:
+                    continue
+                if key in _LEDGER_ASSIGNEE_SHORT_FIELDS and value:
+                    value = str(value)[:255]
+                setattr(entry, key, value)
+            count += 1
+    return count
+
+
+def get_survey_run_repo_targets(run_uid: str) -> Dict[str, dict]:
+    """一次运行里拉取成功的仓库，{repo_slug: {"url", "branch", "commit_sha"}}；运行不存在时返回空字典。"""
+    from .models import SurveyRun, SurveyRunRepo
+
+    with session_scope() as session:
+        run_id = session.scalar(select(SurveyRun.id).where(SurveyRun.run_uid == run_uid))
+        if run_id is None:
+            return {}
+        rows = session.scalars(
+            select(SurveyRunRepo).where(SurveyRunRepo.run_id == run_id, SurveyRunRepo.status == REPO_OK)
+        ).all()
+        return {
+            r.repo_slug: {"url": r.url or "", "branch": r.branch or "", "commit_sha": r.commit_sha or ""}
+            for r in rows if r.url
+        }
 
 
 def get_survey_push_context(run_uid: str) -> Optional[dict]:
@@ -3004,6 +3067,7 @@ def _survey_fix_to_dict(fix: "SurveyFix", stale_after_seconds: int, include_deta
         "assignee_note": fix.assignee_note or "",
         "mr_iid": fix.mr_iid,
         "mr_url": fix.mr_url or "",
+        "cleaned_at": fix.cleaned_at.isoformat() if fix.cleaned_at else "",
         "started_at": fix.started_at.isoformat() if fix.started_at else "",
         "finished_at": fix.finished_at.isoformat() if fix.finished_at else "",
     }
@@ -3015,6 +3079,7 @@ def _survey_fix_to_dict(fix: "SurveyFix", stale_after_seconds: int, include_deta
         item.update({
             "body": fix.body or "",
             "base_sha": fix.base_sha or "",
+            "commit_sha": fix.commit_sha or "",
             "summary": fix.summary or "",
             "diff": fix.diff or "",
             "verification": verification if isinstance(verification, list) else [],
@@ -3075,6 +3140,10 @@ def list_survey_fixes_for_issues(survey_uid: str, issues: List[dict], stale_afte
         ]
 
 
+# 平台上合并请求已合并的状态值
+MR_STATE_MERGED = "merged"
+
+
 def survey_fix_merge_requests(survey_id: int) -> Dict[str, List[dict]]:
     """
     一个巡检下每个指纹已提出的修复合并请求，按发起时间排列。供台账镜像使用。
@@ -3083,14 +3152,21 @@ def survey_fix_merge_requests(survey_id: int) -> Dict[str, List[dict]]:
     链接与处理人在这里一起产出，各自怎么写进台账由 ledger.py 决定（处理人按人去重，链接一个不少）。
     处理人是提出合并请求时指派的人，之后在代码平台上改派不会反映到这里。
     只收已提出合并请求的：失败与跳过的没有链接可附，进行中的还没有结果。
+    已清理的也不收：合并请求已经关闭、分支已经删掉，台账上留着它只会让人点进去扑空，或以为还有人在处理。
+    例外是清理时已经合并的：链接是这个问题修复过并合入的证据，清理只删了它的分支。
     """
+    from sqlalchemy import or_
+
     from .models import SurveyFix
 
     merge_requests: Dict[str, List[dict]] = {}
     with session_scope() as session:
         rows = session.execute(
             select(SurveyFix.fingerprint, SurveyFix.mr_url, SurveyFix.assignee_username, SurveyFix.assignee_name)
-            .where(SurveyFix.survey_id == int(survey_id), SurveyFix.status == RUN_SUCCEEDED)
+            .where(
+                SurveyFix.survey_id == int(survey_id), SurveyFix.status == RUN_SUCCEEDED,
+                or_(SurveyFix.cleaned_at.is_(None), SurveyFix.cleaned_mr_state == MR_STATE_MERGED),
+            )
             .order_by(SurveyFix.id.asc())
         ).all()
     for fingerprint, url, username, name in rows:
@@ -3098,6 +3174,28 @@ def survey_fix_merge_requests(survey_id: int) -> Dict[str, List[dict]]:
         if url and all(mr["url"] != url for mr in listed):
             listed.append({"url": url, "assignee_username": username or "", "assignee_name": name or ""})
     return merge_requests
+
+
+def mark_survey_fix_cleaned(run_uid: str, mr_state: str = "") -> bool:
+    """
+    记下修复运行已清理，返回是否由本次调用记下（已经清理过的返回 False）。只记已结束的：进行中的不能清理。
+
+    mr_state 是清理时合并请求在平台上的状态，决定它还留不留在台账上（见 survey_fix_merge_requests）。
+    """
+    from .models import SurveyFix
+
+    with session_scope() as session:
+        result = session.execute(
+            update(SurveyFix)
+            .where(SurveyFix.run_uid == run_uid, SurveyFix.status != RUN_RUNNING, SurveyFix.cleaned_at.is_(None))
+            .values(cleaned_at=utcnow(), cleaned_mr_state=str(mr_state or "")[:16] or None)
+        )
+        return result.rowcount > 0
+
+
+# 「修复合并请求」列表按清理状态筛选的取值：未清理、已清理；其他取值（含空串）不筛选
+CLEANED_FILTER_NO = "no"
+CLEANED_FILTER_YES = "yes"
 
 
 # 「修复合并请求」列表里代表"未指派"的处理人取值。平台用户名只含字母、数字、点、横线与下划线，不会撞上它
@@ -3118,12 +3216,22 @@ def _like_pattern(text: str) -> str:
 
 
 def _merge_request_fixes_stmt(survey_uid: str):
-    """提出了合并请求的修复运行（可限定巡检）的查询，口径与 survey_fix_merge_requests 一致：成功且有链接。"""
+    """
+    「修复合并请求」列表的查询（可限定巡检）：提出了合并请求的修复运行（成功且有链接），
+    加上推了分支、合并请求却没提成的已结束修复 —— 后者在平台上留着一条没人认领的分支，正是要清理的那一类。
+    """
+    from sqlalchemy import and_, or_
+
     from .models import Survey, SurveyFix
 
-    stmt = select(SurveyFix).where(
-        SurveyFix.status == RUN_SUCCEEDED, SurveyFix.mr_url.is_not(None), SurveyFix.mr_url != ""
-    )
+    has_mr = and_(SurveyFix.mr_url.is_not(None), SurveyFix.mr_url != "")
+    stmt = select(SurveyFix).where(or_(
+        and_(SurveyFix.status == RUN_SUCCEEDED, has_mr),
+        and_(
+            SurveyFix.status != RUN_RUNNING, ~has_mr,
+            SurveyFix.source_branch.is_not(None), SurveyFix.source_branch != "",
+        ),
+    ))
     if survey_uid:
         stmt = stmt.where(SurveyFix.survey_id == select(Survey.id).where(Survey.survey_uid == survey_uid).scalar_subquery())
     return stmt
@@ -3136,13 +3244,15 @@ def list_fix_merge_requests(
     limit: int = 50,
     offset: int = 0,
     stale_after_seconds: int = 600,
+    cleaned: str = "",
 ) -> dict:
     """
-    跨巡检列出修复提出的合并请求与处理人，按发起时间倒序。
+    跨巡检列出修复提出的合并请求与处理人，按发起时间倒序；也列出推了分支、合并请求没提成的修复（见 _merge_request_fixes_stmt）。
 
     assignees 是要看的处理人用户名，可含 UNASSIGNED_FILTER 表示未指派；为空表示不按处理人筛选。
-    keyword 在问题标题、仓库与文件路径里匹配。返回 {"items", "total", "assignees", "unassigned"}：
-    后两项是只按巡检与关键字筛选时，各处理人的合并请求数与未指派的数量，给筛选框当选项——
+    keyword 在问题标题、仓库与文件路径里匹配；cleaned 取 CLEANED_FILTER_* 按清理状态筛选。
+    返回 {"items", "total", "assignees", "unassigned"}：
+    后两项是只按巡检、关键字与清理状态筛选时，各处理人的合并请求数与未指派的数量，给筛选框当选项——
     不受处理人筛选影响，否则选了一个人之后其他人就从选项里消失了。
     """
     from sqlalchemy import or_
@@ -3150,6 +3260,10 @@ def list_fix_merge_requests(
     from .models import Survey, SurveyFix
 
     base = _merge_request_fixes_stmt(survey_uid)
+    if cleaned == CLEANED_FILTER_NO:
+        base = base.where(SurveyFix.cleaned_at.is_(None))
+    elif cleaned == CLEANED_FILTER_YES:
+        base = base.where(SurveyFix.cleaned_at.is_not(None))
     text_filter = str(keyword or "").strip()
     if text_filter:
         pattern = _like_pattern(text_filter)

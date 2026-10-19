@@ -1,6 +1,6 @@
 <script lang="ts" setup>
 import type { SurveyFixDetail } from "@@/apis/opencr"
-import { getSurveyFixApi, interruptSurveyFixApi } from "@@/apis/opencr"
+import { cleanupSurveyFixesApi, getSurveyFixApi, interruptSurveyFixApi } from "@@/apis/opencr"
 import {
   ASSIGNEE_SOURCE_LABEL,
   CATEGORY_LABEL,
@@ -73,6 +73,39 @@ async function confirmInterrupt() {
   await load(true)
 }
 
+const cleaning = ref(false)
+
+/** 能不能清理：已结束、推送过分支或提出过合并请求、还没清理过。服务端还会再判断分支有没有被人接手 */
+const cleanable = computed(() => {
+  const d = detail.value
+  return !!d && d.status !== "running" && !d.cleaned_at && !!(d.source_branch || d.mr_iid)
+})
+
+/** 清理这次修复：关闭合并请求、删除修复分支。没清理成的原因原样告诉操作的人 */
+async function confirmCleanup() {
+  if (cleaning.value) return
+  try {
+    await ElMessageBox.confirm(
+      h("div", FIX_NOTES.cleanup.map(text => h("p", text))),
+      FIX_NOTES.cleanupTitle(1),
+      { type: "warning", confirmButtonText: FIX_NOTES.cleanupConfirmButton, cancelButtonText: "取消" }
+    )
+  } catch {
+    return
+  }
+  cleaning.value = true
+  try {
+    const [result] = (await cleanupSurveyFixesApi([runUid.value])).results
+    if (result?.outcome === "cleaned") ElMessage.success(result.message || FIX_NOTES.cleanedTag)
+    else ElMessage.warning(result?.message || FIX_NOTES.cleanupNotDone)
+  } catch (error) {
+    ElMessage.error((error as Error).message)
+  } finally {
+    cleaning.value = false
+  }
+  await load(true)
+}
+
 const location = computed(() => {
   const d = detail.value
   if (!d) return ""
@@ -108,6 +141,17 @@ onMounted(() => load())
           <el-descriptions-item label="合并请求">
             <a v-if="detail.mr_url" :href="detail.mr_url" target="_blank" rel="noopener">{{ detail.mr_url }}</a>
             <span v-else>—</span>
+            <el-tooltip v-if="detail.cleaned_at" :content="FIX_NOTES.cleanedTip" placement="top">
+              <el-tag size="small" type="info" effect="plain" class="ml">
+                {{ FIX_NOTES.cleanedTag }} {{ formatTime(detail.cleaned_at) }}
+              </el-tag>
+            </el-tooltip>
+            <el-button
+              v-if="cleanable && userStore.isAdmin" type="danger" size="small" plain class="ml" :loading="cleaning"
+              @click="confirmCleanup"
+            >
+              {{ FIX_NOTES.cleanupButton }}
+            </el-button>
           </el-descriptions-item>
           <el-descriptions-item label="位置">
             <code>{{ location }}</code>

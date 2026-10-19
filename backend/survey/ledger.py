@@ -69,7 +69,7 @@ LEDGER_COLUMNS = (
     # 这一行下已提出的修复合并请求，一行一个链接。合并请求是按问题提的，一行（指纹）可能有好几个。
     # 不用 url 类型：url 列只能放一个链接
     Column("fix_links", "修复合并请求", COLUMN_LONG_TEXT),
-    # 这个问题的修复落在谁身上，一行一人，同一个人的多个合并请求只写一次。
+    # 这个问题落在谁身上，一行一人，同一个人的多个合并请求只写一次；没有提修复时按处理人规则为这一行定下的人。
     # 不与「修复合并请求」逐行对齐：同一个人反复出现读起来像重复数据，而哪个合并请求指派给谁，点开链接就能看到。
     # 不合进链接列写成"链接 处理人"：那样整列就不再是纯链接，表格里点不开，也没法按人筛选。
     # 表头不叫"处理人"：列按表头名称定位，用户在表格里自建的"处理人"人工列很常见，同名会被每次推送静默覆盖
@@ -381,8 +381,9 @@ def build_ledger_rows(
     """
     把 Ledger 条目转成镜像行。
 
-    fix_merge_requests：指纹 → 已提出的修复合并请求（repo.survey_fix_merge_requests）。提了合并请求不改变行的状态，
-    只是把链接与处理人带上；状态仍然只由后续 SurveyRun 的复核决定。
+    fix_merge_requests：指纹 → 已提出、未清理的修复合并请求（repo.survey_fix_merge_requests）。提了合并请求不改变行的状态，
+    只是把链接与处理人带上；状态仍然只由后续 SurveyRun 的复核决定。没有合并请求的行，处理人取条目上定下的
+    （assignee.resolve_ledger_assignees）。
 
     first_push：该 Binding 是否从未成功推送过。
     - 从未推送过 = 这是一张新表，所有行都要写进去（包括本轮未发现与已忽略）；
@@ -410,7 +411,11 @@ def build_ledger_rows(
             "last_seen": _to_zone(entry.get("last_seen_at"), zone),
             "count": int(entry.get("finding_count") or 0),
             "fix_links": "\n".join(mr["url"] for mr in merge_requests),
-            "fix_assignees": fix_assignees_cell(merge_requests),
+            # 有未清理的修复合并请求时只写那边实际指派的人（都没指派就留空）；没有时写按处理人规则为这一行定下的人。
+            # 合并请求没指派时不退回这一行定下的人：读表的人会以为合并请求已经指给了他，其实平台上没人被指派。
+            # 也不两边都写：两个来源的人不一致时，一格里出现两个人，读的人分不清该找谁
+            "fix_assignees": fix_assignees_cell(merge_requests) if merge_requests
+            else assignee_display_name(entry.get("assignee_name") or "", entry.get("assignee_username") or ""),
             "link": run_detail_link(public_url, entry.get("last_run_uid") or ""),
         }
         rows.append(LedgerRow(

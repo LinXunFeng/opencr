@@ -756,6 +756,20 @@ class SurveyLedgerEntry(Base):
     # 会一直排在队首把名额吃光，其余问题永远轮不到
     last_checked_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
 
+    # 这一行问题代码的原始作者，没提修复时也追溯，用来给台账的「修复处理人」一格找人。
+    # 只追溯一次：要为它临时克隆带历史的仓库，每轮重做的成本与行数成正比，而几周内写这段代码的人很少变。
+    # author_traced_at 为空表示还没追溯成（没轮到、或克隆与 blame 失败），下一轮再试；
+    # 非空而作者为空表示追溯过但没找到（例如没有行号），不再重试
+    author_name: Mapped[Optional[str]] = mapped_column(String(255))
+    author_email: Mapped[Optional[str]] = mapped_column(String(255))
+    author_traced_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    # 按处理人规则（原始作者 → 仓库负责人 → 不指派）为这一行确定的人，每轮按原始作者重新确定：
+    # 负责人配置改了、有人离开项目，下一轮就能跟上。这一行提过、且没清理的修复合并请求有处理人时，台账写的是那边实际指派的人
+    assignee_source: Mapped[Optional[str]] = mapped_column(String(16))
+    assignee_username: Mapped[Optional[str]] = mapped_column(String(255))
+    assignee_name: Mapped[Optional[str]] = mapped_column(String(255))
+    assignee_note: Mapped[Optional[str]] = mapped_column(Text)
+
     updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=utcnow)
 
     __table_args__ = (
@@ -866,6 +880,8 @@ class SurveyFix(Base):
     target_branch: Mapped[Optional[str]] = mapped_column(String(255))
     base_sha: Mapped[Optional[str]] = mapped_column(String(64))
     source_branch: Mapped[Optional[str]] = mapped_column(String(255))
+    # 推到修复分支上的那个提交。清理时只在分支头仍是它时才删分支：不是的话说明有人在分支上接着改了，删掉会丢掉别人的提交
+    commit_sha: Mapped[Optional[str]] = mapped_column(String(64))
 
     trigger: Mapped[str] = mapped_column(
         String(16), nullable=False, default=FIX_TRIGGER_MANUAL, server_default=FIX_TRIGGER_MANUAL
@@ -893,6 +909,12 @@ class SurveyFix(Base):
 
     mr_iid: Mapped[Optional[int]] = mapped_column(Integer)
     mr_url: Mapped[Optional[str]] = mapped_column(String(1024))
+    # 清理（关闭合并请求、删除修复分支）的时刻。清理只收拾平台上的东西，记录本身保留：
+    # 这个问题仍算修复过，批量修复不会再给它发起，否则清理掉的合并请求下一轮又会被提出来
+    cleaned_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    # 清理时合并请求在平台上的状态（opened / closed / merged，不存在时为空）。已合并的清理后链接仍留在台账上：
+    # 那是这个问题修复过并合入的证据，撤掉之后台账上看不出它曾经被修过
+    cleaned_mr_state: Mapped[Optional[str]] = mapped_column(String(16))
 
     started_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=utcnow)
     heartbeat_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=utcnow)
