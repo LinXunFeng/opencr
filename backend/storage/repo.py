@@ -1115,9 +1115,15 @@ def create_survey(
     sources: List[dict],
     next_run_at: Optional[datetime] = None,
     bindings: Optional[List[dict]] = None,
+    ignores_from: Optional[str] = None,
     **options,
 ) -> dict:
-    """新建一个巡检配置，返回它的完整数据。bindings 为 [{destination, target}]，target 须已规整。"""
+    """
+    新建一个巡检配置，返回它的完整数据。bindings 为 [{destination, target}]，target 须已规整。
+
+    ignores_from 为另一个巡检的 survey_uid 时，把它的忽略清单一并复制过来（见 _copy_survey_ignore_list）；
+    该巡检不存在时抛 ValueError，什么都不创建。
+    """
     from .models import FIX_MODE_MANUAL, Survey, SurveySource
 
     survey_uid = str(uuid.uuid4())
@@ -1158,8 +1164,49 @@ def create_survey(
         session.flush()
         if bindings:
             _sync_survey_bindings(session, survey, bindings)
+        if ignores_from:
+            # 与新建放在同一个事务里：拷贝到一半失败的话，留下一个忽略清单残缺的巡检，
+            # 下一轮会把用户早就说过不再提醒的问题当成新增报出来，比整个创建失败更难察觉
+            _copy_survey_ignore_list(session, ignores_from, survey.id)
         session.refresh(survey)
         return _survey_to_dict(survey)
+
+
+def _copy_survey_ignore_list(session, source_uid: str, target_id: int) -> None:
+    """
+    把源巡检的忽略清单（已忽略问题与已忽略仓库）复制到目标巡检；源巡检不存在时抛 ValueError。
+
+    只复制人的判断，不复制它在源巡检里留下的痕迹：已忽略问题靠快照交给模型比对，不依赖源巡检的任何发现，
+    复制过去在新巡检里同样生效；"最近一次命中"属于源巡检的运行，新巡检从零开始。
+    标记时间与理由原样保留——半年后回头看，要知道的是当初为什么忽略、什么时候忽略的，而不是哪天拷贝的。
+    不再生效的旧条目（没有快照标题，见 _ignore_is_active）不复制：它们在新巡检里同样不起作用，只会多一条要删的噪音。
+    """
+    from .models import Survey, SurveyIgnore, SurveyIgnoredRepo
+
+    source_id = session.scalar(select(Survey.id).where(Survey.survey_uid == source_uid))
+    if source_id is None:
+        raise ValueError("要拷贝忽略清单的巡检不存在")
+
+    def clone(row):
+        """
+        按表的列复制一行，换到目标巡检名下。
+
+        逐字段手写的话，表上新加的列会在这里悄悄漏掉；反过来，新加的列若指向源巡检自己的数据（例如某条发现），
+        要在这里排除，否则副本会挂着一条不属于它的引用。
+        """
+        values = {c.key: getattr(row, c.key) for c in row.__table__.columns if c.key not in {"id", "survey_id"}}
+        return type(row)(survey_id=target_id, **values)
+
+    for item in session.scalars(
+        select(SurveyIgnore).where(SurveyIgnore.survey_id == source_id).order_by(SurveyIgnore.id)
+    ).all():
+        if _ignore_is_active(item.title):
+            session.add(clone(item))
+    for item in session.scalars(
+        select(SurveyIgnoredRepo).where(SurveyIgnoredRepo.survey_id == source_id).order_by(SurveyIgnoredRepo.id)
+    ).all():
+        session.add(clone(item))
+    session.flush()
 
 
 def update_survey(

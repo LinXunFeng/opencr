@@ -48,6 +48,7 @@ _Avoid_: Step、Stage、进度
 一份定期执行的全量代码审查配置：一组仓库（或仓库组织）、一个执行周期、一组参与分析的 Skill。
 仓库组织指组织自己及其各级子组织下的仓库，不含其他组织共享给它的仓库——巡检的范围以配置里写明的为准。
 它是配置，不是执行——"巡检跑了没有"的主语是 SurveyRun。
+拷贝一个 Survey 得到的是另一个 Survey：带过去的只有配置与 IgnoreList，Ledger、SurveyRun、FixRun 与 Workspace 都从零开始，之后两者互不影响。
 _Avoid_: 任务、Task、Job、扫描
 
 **SurveyRun / 巡检运行**：

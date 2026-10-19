@@ -148,6 +148,7 @@ class GoogleSheetDestination(Destination):
             required=False,
             placeholder="留空则使用巡检名称",
             help="不存在时自动创建。多个巡检可以共用一张工作表，靠「巡检」列区分。",
+            follows_survey_name=True,
         ),
     )
 

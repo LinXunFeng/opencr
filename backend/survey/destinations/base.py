@@ -45,6 +45,9 @@ class TargetField:
     required: bool = True
     placeholder: str = ""
     help: str = ""
+    # 留空时由 normalize_target 取巡检名称。落库存的是取到的名称，拷贝巡检时前端据此清空这类字段，
+    # 让副本跟着自己的名称走；不清的话，按月拷贝出来的「11 月巡检」会悄悄写进「10 月巡检」那张工作表
+    follows_survey_name: bool = False
 
     def to_dict(self) -> dict:
         """接口数据。"""
@@ -54,6 +57,7 @@ class TargetField:
             "required": self.required,
             "placeholder": self.placeholder,
             "help": self.help,
+            "follows_survey_name": self.follows_survey_name,
         }
 
 
