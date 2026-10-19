@@ -852,12 +852,19 @@ def api_surveys():
 @admin_bp.route("/api/admin/surveys", methods=["POST"])
 @require_admin
 def api_create_survey():
-    """新建巡检。"""
+    """
+    新建巡检。
+
+    拷贝巡检也走这里：配置由前端从源巡检预填、经 Admin 核对后整份提交，与新建没有区别；
+    额外带上 copy_ignores_from（源巡检的 survey_uid）时，把源巡检的忽略清单一并复制过来。
+    忽略清单不在表单里，前端拿不到能原样提交的形状，只能由服务端复制。
+    """
     payload = request.get_json(silent=True) or {}
     try:
         fields, sources = _parse_survey_payload(payload, partial=False)
     except (ValueError, SurveyError) as e:
         return jsonify({"error": str(e)}), 400
+    ignores_from = str(payload.get("copy_ignores_from") or "").strip() or None
 
     try:
         bindings = _parse_bindings(payload.get("bindings") or [], fields["name"], [])
@@ -865,18 +872,25 @@ def api_create_survey():
         return jsonify({"error": str(e)}), 400
 
     next_run = next_fire_time(fields["schedule_kind"], fields["schedule_expr"], fields["timezone"])
-    survey = repo.create_survey(
-        name=fields["name"],
-        slug=slugify(fields["name"], fallback="survey"),
-        schedule_kind=fields["schedule_kind"],
-        schedule_expr=fields["schedule_expr"],
-        timezone_name=fields["timezone"],
-        sources=sources,
-        next_run_at=next_run,
-        bindings=bindings,
-        **{k: v for k, v in fields.items() if k not in {"name", "schedule_kind", "schedule_expr", "timezone"}},
+    try:
+        survey = repo.create_survey(
+            name=fields["name"],
+            slug=slugify(fields["name"], fallback="survey"),
+            schedule_kind=fields["schedule_kind"],
+            schedule_expr=fields["schedule_expr"],
+            timezone_name=fields["timezone"],
+            sources=sources,
+            next_run_at=next_run,
+            bindings=bindings,
+            ignores_from=ignores_from,
+            **{k: v for k, v in fields.items() if k not in {"name", "schedule_kind", "schedule_expr", "timezone"}},
+        )
+    except ValueError as e:
+        # 源巡检不存在（通常是打开拷贝表单之后被删掉了）；整个创建已回滚，不会留下一个没有忽略清单的副本
+        return jsonify({"error": str(e)}), 400
+    logger.info(
+        "Admin created survey: %s (slug=%s, ignores copied from %s)", survey["name"], survey["slug"], ignores_from or "-"
     )
-    logger.info("Admin created survey: %s (slug=%s)", survey["name"], survey["slug"])
     return jsonify(_decorate_survey(survey)), 201
 
 

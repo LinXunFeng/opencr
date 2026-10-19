@@ -181,6 +181,8 @@ export interface DestinationTargetField {
   required: boolean
   placeholder: string
   help: string
+  /** 留空时取巡检名称。拷贝巡检时这类字段一律清空，让副本跟着自己的名称走 */
+  follows_survey_name: boolean
 }
 
 /** 连通性测试的一项结论。warn 表示能用但有需要知道的事（例如工作表会在首次推送时自动创建） */
@@ -573,7 +575,8 @@ export function getSurveyApi(surveyUid: string) {
   return request<Survey>({ url: `surveys/${surveyUid}`, method: "get" })
 }
 
-export function createSurveyApi(data: Partial<Survey>) {
+/** copy_ignores_from：拷贝巡检时源巡检的 survey_uid，服务端把它的忽略清单一并复制到新巡检 */
+export function createSurveyApi(data: Partial<Survey> & { copy_ignores_from?: string }) {
   return request<Survey>({ url: "surveys", method: "post", data })
 }
 

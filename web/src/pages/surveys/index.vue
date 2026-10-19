@@ -47,6 +47,19 @@ const dialogVisible = ref(false)
 const saving = ref(false)
 const editingUid = ref("")
 
+/** 正在拷贝的源巡检；非空时对话框是「拷贝巡检」，保存走新建 */
+const copySource = ref<Survey | null>(null)
+/** 是否连同忽略清单一起拷贝。默认拷贝：按月新建的巡检不带上它，上个月说过不再提醒的问题会全部重新冒出来 */
+const copyIgnores = ref(true)
+/** 拷贝时按源巡检调整过的地方，在对话框顶部逐条说明，免得 Admin 以为是原样复制 */
+const copyAdjustments = ref<string[]>([])
+
+/** 对话框标题：编辑、拷贝与新建三种模式 */
+const dialogTitle = computed(() => {
+  if (editingUid.value) return "编辑巡检"
+  return copySource.value ? `拷贝巡检：${copySource.value.name}` : "新建巡检"
+})
+
 /**
  * 表单里用「勾选集」，落库用「排除集」。
  *
@@ -71,6 +84,9 @@ const form = reactive({
   fix_mr_title_template: "",
   budget_wall_clock_minutes: null as number | null,
   budget_l2_max_focus: null as number | null,
+  // 以下两项不在表单上展示，只为原样带回：新建接口没收到的字段一律落成全局默认，拷贝时不带上就会悄悄丢掉源巡检的设置
+  budget_l1_max_chars: null as number | null,
+  budget_index_timeout_seconds: null as number | null,
   sources: [] as SurveySource[],
   bindings: [] as BindingForm[]
 })
@@ -124,18 +140,22 @@ function resetForm() {
   form.fix_mr_title_template = ""
   form.budget_wall_clock_minutes = null
   form.budget_l2_max_focus = null
+  form.budget_l1_max_chars = null
+  form.budget_index_timeout_seconds = null
   form.sources = [{ kind: "repo", url: "", branch: "", exclude_patterns: [] }]
   form.bindings = []
 }
 
+/** 打开空白的新建表单 */
 function openCreate() {
   editingUid.value = ""
+  copySource.value = null
   resetForm()
   dialogVisible.value = true
 }
 
-function openEdit(row: any) {
-  editingUid.value = row.survey_uid
+/** 把一个巡检的配置填进表单。编辑与拷贝共用，拷贝在此之上再做调整 */
+function fillForm(row: any) {
   resetForm()
   form.name = row.name
   form.enabled = row.enabled
@@ -162,6 +182,8 @@ function openEdit(row: any) {
   form.fix_mr_title_template = row.fix_mr_title_template ?? ""
   form.budget_wall_clock_minutes = row.budget_wall_clock_minutes
   form.budget_l2_max_focus = row.budget_l2_max_focus
+  form.budget_l1_max_chars = row.budget_l1_max_chars ?? null
+  form.budget_index_timeout_seconds = row.budget_index_timeout_seconds ?? null
   form.sources = row.sources.length
     ? row.sources.map((s: SurveySource) => ({ ...s, exclude_patterns: [...s.exclude_patterns] }))
     : [{ kind: "repo", url: "", branch: "", exclude_patterns: [] }]
@@ -169,6 +191,62 @@ function openEdit(row: any) {
     destination: b.destination,
     target: { ...(b.target ?? {}) }
   }))
+}
+
+/** 打开编辑表单，保存时按 survey_uid 更新原巡检 */
+function openEdit(row: any) {
+  editingUid.value = row.survey_uid
+  copySource.value = null
+  fillForm(row)
+  dialogVisible.value = true
+}
+
+/**
+ * 以一个巡检的配置为底稿新建巡检，应对「每月一份巡检报告」这类要反复建同样配置的场景。
+ *
+ * 只预填表单，保存仍走新建接口：服务端照常校验，Admin 也能在保存前改掉不该照搬的地方。
+ */
+function openCopy(row: any) {
+  editingUid.value = ""
+  copySource.value = row
+  copyIgnores.value = true
+  fillForm(row)
+  form.name = `${row.name} 副本`
+  const adjustments: string[] = []
+
+  // 修复记录按巡检登记，不随拷贝过去：照搬自动发起的话，新巡检第一轮就会把提过合并请求的问题再提一遍
+  if (form.fix_mode !== "manual") {
+    form.fix_mode = "manual"
+    adjustments.push(SURVEY_NOTES.copyFixModeReset)
+  }
+
+  // 新建时服务端不接受指向不可用实例的绑定，带过去只会让保存失败
+  const kept: BindingForm[] = []
+  const dropped: string[] = []
+  const cleared: string[] = []
+  for (const binding of form.bindings) {
+    const destination = destinationOf(binding.destination)
+    if (!destination || destination.error) {
+      dropped.push(binding.destination)
+      continue
+    }
+    // 落库存的是留空时取到的名称，原样带过去，新巡检就会写进源巡检的那张工作表。
+    // 一律清空而不是只清"等于源巡检名称"的：源巡检改过名时落库的仍是旧名，比对不上就会漏清；
+    // 代价是有意共用一张工作表的要重填一次，所以把原值写进提示里
+    for (const field of destination.target_fields) {
+      const value = (binding.target[field.key] ?? "").trim()
+      if (field.follows_survey_name && value) {
+        cleared.push(`${binding.destination} 的${field.label}「${value}」`)
+        binding.target[field.key] = ""
+      }
+    }
+    kept.push(binding)
+  }
+  form.bindings = kept
+  if (dropped.length) adjustments.push(SURVEY_NOTES.copyBindingsDropped(dropped))
+  if (cleared.length) adjustments.push(SURVEY_NOTES.copyWorksheetFollowsName(cleared))
+
+  copyAdjustments.value = adjustments
   dialogVisible.value = true
 }
 
@@ -277,6 +355,8 @@ async function save() {
       fix_mr_title_template: form.fix_mr_title_template,
       budget_wall_clock_minutes: form.budget_wall_clock_minutes,
       budget_l2_max_focus: form.budget_l2_max_focus,
+      budget_l1_max_chars: form.budget_l1_max_chars,
+      budget_index_timeout_seconds: form.budget_index_timeout_seconds,
       sources,
       bindings: form.bindings
         .filter(b => b.destination)
@@ -286,7 +366,10 @@ async function save() {
       await updateSurveyApi(editingUid.value, payload as any)
       ElMessage.success("已保存")
     } else {
-      await createSurveyApi(payload as any)
+      await createSurveyApi({
+        ...payload,
+        copy_ignores_from: copySource.value && copyIgnores.value ? copySource.value.survey_uid : undefined
+      } as any)
       ElMessage.success("已创建")
     }
     dialogVisible.value = false
@@ -467,13 +550,16 @@ onMounted(load)
             />
           </template>
         </el-table-column>
-        <el-table-column v-if="userStore.isAdmin" label="操作" width="330" fixed="right">
+        <el-table-column v-if="userStore.isAdmin" label="操作" width="370" fixed="right">
           <template #default="{ row }">
             <el-button link type="primary" size="small" @click="runNow(row)">
               立即执行
             </el-button>
             <el-button link type="primary" size="small" @click="openEdit(row)">
               编辑
+            </el-button>
+            <el-button link type="primary" size="small" @click="openCopy(row)">
+              拷贝
             </el-button>
             <el-button link type="primary" size="small" @click="openIgnores(row)">
               忽略清单
@@ -489,7 +575,13 @@ onMounted(load)
       </el-table>
     </el-card>
 
-    <el-dialog v-model="dialogVisible" :title="editingUid ? '编辑巡检' : '新建巡检'" width="720px" top="6vh">
+    <el-dialog v-model="dialogVisible" :title="dialogTitle" width="720px" top="6vh">
+      <el-alert v-if="copySource" type="info" :closable="false" class="mb">
+        <div>{{ SURVEY_NOTES.copyScope }}</div>
+        <div v-for="(item, i) in copyAdjustments" :key="i" class="copy-adjustment">
+          {{ item }}
+        </div>
+      </el-alert>
       <el-form label-width="110px" size="small">
         <el-form-item label="名称">
           <el-input v-model="form.name" placeholder="例如：移动端周巡检" />
@@ -707,6 +799,15 @@ onMounted(load)
         <el-form-item label="启用">
           <el-switch v-model="form.enabled" />
         </el-form-item>
+
+        <el-form-item v-if="copySource" label="忽略清单">
+          <el-checkbox v-model="copyIgnores">
+            一并拷贝源巡检的忽略清单
+          </el-checkbox>
+          <div class="sub">
+            {{ SURVEY_NOTES.copyIgnores }}
+          </div>
+        </el-form-item>
       </el-form>
 
       <template #footer>
@@ -819,6 +920,11 @@ onMounted(load)
 }
 
 .degraded {
+  color: var(--el-color-warning);
+}
+
+.copy-adjustment {
+  margin-top: 6px;
   color: var(--el-color-warning);
 }
 </style>
