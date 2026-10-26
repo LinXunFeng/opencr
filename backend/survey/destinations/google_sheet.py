@@ -16,7 +16,7 @@ import logging
 import re
 import threading
 from datetime import datetime
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 from .base import (
     CHECK_ERROR,
@@ -322,7 +322,7 @@ class GoogleSheetDestination(Destination):
     # ------------------------------------------------------------------
 
     def push(self, target: Dict[str, str], columns: Sequence[Column], rows: List[LedgerRow]) -> PushStats:
-        """把台账镜像到工作表。整体流程：定位工作表 → 补表头 → 读键列 → 更新已有行 → 追加缺失行。"""
+        """把台账镜像到工作表。整体流程：定位工作表 → 补表头 → 读键列与 keep_filled 列 → 更新已有行 → 追加缺失行。"""
         spreadsheet_id = target["spreadsheet"]
         worksheet = target["worksheet"]
         with _sheet_lock(spreadsheet_id, worksheet):
@@ -357,6 +357,18 @@ class GoogleSheetDestination(Destination):
         else:
             existing = self._read_keys(spreadsheet_id, sheet_ref, header_row, positions[key_column.key])
 
+        # 刚补出来的列整列为空，不必读；没有已有行时也不必读。
+        # 与键列分两次读，中间有人增删行会让行号错位；不为此合成一次 batchGet：之后按行号写入同样隔着这段窗口，
+        # 这个插件本来就接受"读完到写完之间表格不被增删行"，合并读取只缩短其中一小段，还要多维护一个接口映射
+        new_indexes = {index for index, _ in new_headers}
+        filled: Dict[str, Set[int]] = {}
+        if existing:
+            for column in columns:
+                if column.keep_filled and positions[column.key] not in new_indexes:
+                    filled[column.key] = {number for number, _ in self._read_column(
+                        spreadsheet_id, sheet_ref, header_row, positions[column.key]
+                    )}
+
         stats = PushStats()
         updates: List[dict] = []
         appends: List[List[Any]] = []
@@ -365,7 +377,8 @@ class GoogleSheetDestination(Destination):
             row_numbers = existing.get(row.key)
             if row_numbers:
                 for number in row_numbers:
-                    updates.extend(self._row_updates(sheet_ref, number, columns, positions, row))
+                    kept = {key for key, numbers in filled.items() if number in numbers}
+                    updates.extend(self._row_updates(sheet_ref, number, columns, positions, row, kept))
                 stats.updated += 1
             elif row.restore_if_missing:
                 cells: List[Any] = [None] * width
@@ -453,7 +466,16 @@ class GoogleSheetDestination(Destination):
         self, spreadsheet_id: str, sheet_ref: str, header_row: int, key_index: int
     ) -> Dict[str, List[int]]:
         """读表头以下的键列，返回 {键: [行号...]}。同一个键出现多行（用户复制过行）时每一行都更新。"""
-        letter = column_letter(key_index)
+        keys: Dict[str, List[int]] = {}
+        for number, key in self._read_column(spreadsheet_id, sheet_ref, header_row, key_index):
+            keys.setdefault(key, []).append(number)
+        return keys
+
+    def _read_column(
+        self, spreadsheet_id: str, sheet_ref: str, header_row: int, index: int
+    ) -> List[Tuple[int, str]]:
+        """读表头以下的某一列，返回非空格子的 [(行号, 去掉首尾空白的文本)]；只有空白的格子按空处理。"""
+        letter = column_letter(index)
         first_row = header_row + 1
         data = self._transport.call(
             "spreadsheets.values.get",
@@ -462,23 +484,27 @@ class GoogleSheetDestination(Destination):
                 "majorDimension": "ROWS", "valueRenderOption": "UNFORMATTED_VALUE",
             },
         )
-        keys: Dict[str, List[int]] = {}
-        for offset, cells in enumerate(data.get("values") or []):
-            key = str(cells[0]).strip() if cells else ""
-            if key:
-                keys.setdefault(key, []).append(offset + first_row)
-        return keys
+        cells: List[Tuple[int, str]] = []
+        for offset, row in enumerate(data.get("values") or []):
+            text = str(row[0]).strip() if row else ""
+            if text:
+                cells.append((offset + first_row, text))
+        return cells
 
     @staticmethod
     def _row_updates(
-        sheet_ref: str, row_number: int, columns: List[Column], positions: Dict[str, int], row: LedgerRow
+        sheet_ref: str, row_number: int, columns: List[Column], positions: Dict[str, int], row: LedgerRow,
+        kept: Set[str],
     ) -> List[dict]:
         """
-        一行已有记录的系统列更新，按连续列段拆成若干范围。
+        一行已有记录的系统列更新，按连续列段拆成若干范围；kept 是这一行上保留平台原值、不写的列的 key。
 
         不整行覆盖：系统列之间可能夹着用户插入的人工列，整行写会把它们清空。
         """
-        cells = sorted((positions[c.key], _cell_value(c, row.values.get(c.key))) for c in columns)
+        # 键列从不 keep_filled（Column 的约定），所以 cells 至少有键列这一格
+        cells = sorted(
+            (positions[c.key], _cell_value(c, row.values.get(c.key))) for c in columns if c.key not in kept
+        )
         ranges: List[dict] = []
         start, values = cells[0][0], [cells[0][1]]
         for index, value in cells[1:]:
