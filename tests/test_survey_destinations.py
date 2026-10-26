@@ -518,6 +518,13 @@ class LedgerRowsTests(unittest.TestCase):
         # 后台是 hash 路由
         self.assertEqual(row.values["link"], "https://cr.example.com/admin/#/surveys/runs/run-uid")
 
+    def test_only_fix_assignees_keeps_what_the_sheet_has(self):
+        """修复处理人在表格里常由人改派，已有行以表格为准；其余系统列都是镜像，照常覆盖。"""
+        from backend.survey.ledger import ledger_columns
+
+        kept = [c.header for c in ledger_columns(include_link=True) if c.keep_filled]
+        self.assertEqual(kept, ["修复处理人"])
+
     def test_link_column_only_with_public_url(self):
         from backend.survey.ledger import ledger_columns
 
@@ -1510,6 +1517,58 @@ class GoogleSheetTests(unittest.TestCase):
         appended = session.requests[5]["json"]["values"]
         # 人工列位置是 null，追加接口会跳过它而不是写空串
         self.assertEqual(appended, [["s:new", None, "t", "存在", 2]])
+
+    def test_keep_filled_column_is_written_only_where_empty(self):
+        """
+        「修复处理人」这类列在已有行上以表格为准：非空的格子不覆盖（人在表格里改派过），
+        空格子照常写；同一个键的多行逐行判断，新追加的行照常写。
+        """
+        from backend.survey.destinations.base import Column, LedgerRow
+
+        columns = [Column("key", "键"), Column("title", "标题"), Column("owner", "修复处理人", keep_filled=True),
+                   Column("state", "状态")]
+
+        def row(key):
+            """一行系统算出处理人为张三的台账行。"""
+            return LedgerRow(key=key, values={"key": key, "title": "t", "owner": "张三", "state": "存在"})
+
+        destination, session, _ = self._destination([
+            _sheet_meta(),
+            _Response(payload={"values": [["键", "标题", "修复处理人", "状态"]]}),
+            _Response(payload={"values": [["s:1"], ["s:2"], ["s:1"]]}),
+            # 第 2 行改派成了李四；第 3 行为空；第 4 行只有空白，按空处理
+            _Response(payload={"values": [["李四"], [], ["  "]]}),
+            _Response(payload={}),  # 批量更新
+            _Response(payload={}),  # 追加
+        ])
+        stats = destination.push(self.TARGET, columns, [row("s:1"), row("s:2"), row("s:new")])
+        self.assertEqual(stats.to_dict(), {"updated": 2, "inserted": 1, "skipped": 0})
+
+        self.assertTrue(session.requests[3]["url"].endswith("'巡检'!C2:C"))
+        ranges = {d["range"]: d["values"][0] for d in session.requests[4]["json"]["data"]}
+        self.assertEqual(ranges, {
+            # C2 跳过，按连续列段拆开
+            "'巡检'!A2:B2": ["s:1", "t"], "'巡检'!D2:D2": ["存在"],
+            "'巡检'!A3:D3": ["s:2", "t", "张三", "存在"],
+            "'巡检'!A4:D4": ["s:1", "t", "张三", "存在"],
+        })
+        self.assertEqual(session.requests[5]["json"]["values"], [["s:new", "t", "张三", "存在"]])
+
+    def test_new_keep_filled_column_is_not_read(self):
+        """刚补出来的列整列为空，不必为它多读一次。"""
+        from backend.survey.destinations.base import Column, LedgerRow
+
+        columns = [Column("key", "键"), Column("owner", "修复处理人", keep_filled=True)]
+        destination, session, _ = self._destination([
+            _sheet_meta(),
+            _Response(payload={"values": [["键"]]}),
+            _Response(payload={}),  # 补表头
+            _Response(payload={"values": [["s:1"]]}),
+            _Response(payload={}),  # 批量更新
+        ])
+        destination.push(self.TARGET, columns, [LedgerRow(key="s:1", values={"key": "s:1", "owner": "张三"})])
+        self.assertEqual(len(session.requests), 5)
+        self.assertEqual(session.requests[4]["json"]["data"], [{"range": "'巡检'!A2:B2", "values": [["s:1", "张三"]]}])
 
     def test_grid_is_widened_before_writing_new_headers(self):
         destination, session, _ = self._destination([

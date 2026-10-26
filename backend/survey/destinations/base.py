@@ -68,12 +68,16 @@ class Column:
 
     插件**按 header 定位列**而不是按位置：用户可以在表里随意调整列序、插入人工列。
     代价是系统列的表头不能改名 —— 改名后下次推送会补出一个新列，旧列变成人工列。
+
+    keep_filled：已有行上这一格在平台上非空时不覆盖，只在为空时写入。哪一列这样写由核心层声明，插件只照做。
+    键列不能 keep_filled：插件靠它认行，每次推送都必须写。
     """
 
     key: str
     header: str
     kind: str = COLUMN_TEXT
     options: Tuple[str, ...] = ()
+    keep_filled: bool = False
 
 
 @dataclass
@@ -194,6 +198,7 @@ class Destination(ABC):
 
         约定：
         - 平台上已存在的行（按 columns[0] 即键列匹配）只覆盖系统列，其余列一个字都不碰；
+          keep_filled 的系统列在那一格非空时也不碰；
         - 不存在的行仅在 restore_if_missing 为真时追加；
         - 平台上多出来的行（台账里没有的键）不删除。
         """
