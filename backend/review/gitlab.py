@@ -628,6 +628,17 @@ def get_merge_request(project_path: str, mr_iid: int) -> Optional[dict]:
     return _json_object_or_none(response)
 
 
+def get_latest_merge_request_note(project_path: str, mr_iid: int) -> Optional[dict]:
+    """读取合并请求上最新的一条评论（含系统记录，如改派、改标题），没有评论时返回 None。"""
+    response = _gitlab_send(
+        "GET",
+        f"/projects/{encode_project_path(project_path)}/merge_requests/{int(mr_iid)}/notes"
+        "?sort=desc&order_by=created_at&per_page=1",
+    )
+    data = response.json()
+    return data[0] if isinstance(data, list) and data and isinstance(data[0], dict) else None
+
+
 def close_merge_request(project_path: str, mr_iid: int) -> None:
     """关闭合并请求。关闭而不是删除：删除要 Owner 权限，还会把上面的讨论一起抹掉，关闭之后需要时仍能重新打开。"""
     _gitlab_send(

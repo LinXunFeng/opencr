@@ -1032,6 +1032,7 @@ def _survey_to_dict(survey: "Survey") -> dict:
         "fix_min_severity": survey.fix_min_severity,
         "fix_prompt": survey.fix_prompt or "",
         "fix_mr_title_template": survey.fix_mr_title_template or "",
+        "fix_cleanup_after_days": survey.fix_cleanup_after_days,
         "last_run_at": survey.last_run_at.isoformat() if survey.last_run_at else "",
         "next_run_at": survey.next_run_at.isoformat() if survey.next_run_at else "",
         "created_at": survey.created_at.isoformat() if survey.created_at else "",
@@ -1150,6 +1151,7 @@ def create_survey(
             fix_min_severity=options.get("fix_min_severity") or SEVERITY_WARNING,
             fix_prompt=options.get("fix_prompt") or None,
             fix_mr_title_template=options.get("fix_mr_title_template") or None,
+            fix_cleanup_after_days=options.get("fix_cleanup_after_days") or None,
         )
         session.add(survey)
         session.flush()
@@ -3069,6 +3071,7 @@ def _survey_fix_to_dict(fix: "SurveyFix", stale_after_seconds: int, include_deta
         "mr_iid": fix.mr_iid,
         "mr_url": fix.mr_url or "",
         "cleaned_at": fix.cleaned_at.isoformat() if fix.cleaned_at else "",
+        "cleanup_note": fix.cleanup_note or "",
         "started_at": fix.started_at.isoformat() if fix.started_at else "",
         "finished_at": fix.finished_at.isoformat() if fix.finished_at else "",
     }
@@ -3189,9 +3192,65 @@ def mark_survey_fix_cleaned(run_uid: str, mr_state: str = "") -> bool:
         result = session.execute(
             update(SurveyFix)
             .where(SurveyFix.run_uid == run_uid, SurveyFix.status != RUN_RUNNING, SurveyFix.cleaned_at.is_(None))
-            .values(cleaned_at=utcnow(), cleaned_mr_state=str(mr_state or "")[:16] or None)
+            .values(cleaned_at=utcnow(), cleaned_mr_state=str(mr_state or "")[:16] or None, cleanup_note=None)
         )
         return result.rowcount > 0
+
+
+def list_survey_fix_cleanup_candidates(survey_uid: str, finished_before: datetime, limit: int) -> List[str]:
+    """
+    一个巡检下该自动清理的修复运行（run_uid），最多 limit 条：未清理、已结束、在 finished_before 之前结束，
+    且提过合并请求或推过分支 —— 什么都没推过的没有可清理的，放进来只会白占名额。
+
+    最久没被自动清理看过的优先（从没看过的最先），同样久的先结束的优先：被拒绝的（分支被人接手、合并请求还有人在动）
+    会一直留在候选里，不轮换的话每轮都是它们。
+    """
+    from sqlalchemy import or_
+
+    from .models import Survey, SurveyFix
+
+    with session_scope() as session:
+        rows = session.scalars(
+            select(SurveyFix.run_uid)
+            .where(
+                SurveyFix.survey_id == select(Survey.id).where(Survey.survey_uid == survey_uid).scalar_subquery(),
+                SurveyFix.cleaned_at.is_(None),
+                SurveyFix.status != RUN_RUNNING,
+                SurveyFix.finished_at.is_not(None),
+                SurveyFix.finished_at < finished_before,
+                or_(
+                    SurveyFix.mr_iid.is_not(None),
+                    (SurveyFix.source_branch.is_not(None)) & (SurveyFix.source_branch != ""),
+                ),
+            )
+            # 不用 NULLS FIRST：SQLite 3.30 之前不支持；先按"看过没有"排，没看过的（False）在前
+            .order_by(
+                SurveyFix.cleanup_checked_at.is_not(None).asc(),
+                SurveyFix.cleanup_checked_at.asc(),
+                SurveyFix.finished_at.asc(),
+                SurveyFix.id.asc(),
+            )
+            .limit(max(int(limit), 0))
+        ).all()
+        return list(rows)
+
+
+def record_survey_fix_cleanup_checks(reasons: Dict[str, str], checked: bool = False) -> None:
+    """
+    记下最近一次清理这些修复运行的结果（{run_uid: 没清理掉的原因，清理掉了为空串}）。
+    checked 为 True（自动清理）时同时记下看过的时刻，下一轮自动清理把它们排到后面。不存在的 run_uid 忽略。
+    """
+    from .models import SurveyFix
+
+    if not reasons:
+        return
+    now = utcnow()
+    with session_scope() as session:
+        for run_uid, reason in reasons.items():
+            values: Dict[str, object] = {"cleanup_note": str(reason or "")[:1000] or None}
+            if checked:
+                values["cleanup_checked_at"] = now
+            session.execute(update(SurveyFix).where(SurveyFix.run_uid == run_uid).values(**values))
 
 
 # 「修复合并请求」列表按清理状态筛选的取值：未清理、已清理；其他取值（含空串）不筛选

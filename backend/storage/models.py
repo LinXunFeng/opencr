@@ -446,6 +446,10 @@ class Survey(Base):
     # 修复合并请求的标题模板，{title} 换成问题标题。填了就决定整个标题，后台设置里的全局前缀不再加；NULL 表示沿用前缀加问题标题。
     # 放在 Survey 上：不同巡检对应不同团队，合并请求要挂到各自的需求单上（例如自动合并要求标题带需求链接）
     fix_mr_title_template: Mapped[Optional[str]] = mapped_column(Text)
+    # 自动清理修复：修复结束超过这么多天、合并请求也这么多天没有动静的，每轮巡检结束后自动清理。NULL 表示不自动清理。
+    # 默认不开：清理会在代码平台上关闭别人名下的合并请求，必须由人明确打开；
+    # 放在 Survey 上而不是 config.yaml：各巡检对应的团队处理合并请求的节奏不同
+    fix_cleanup_after_days: Mapped[Optional[int]] = mapped_column(Integer)
 
     # 保留最近多少次 SurveyRun。清理永远不会删掉最近一次（见 repo.purge_survey_runs）。
     retention_runs: Mapped[int] = mapped_column(Integer, nullable=False, default=20)
@@ -917,6 +921,12 @@ class SurveyFix(Base):
     # 清理时合并请求在平台上的状态（opened / closed / merged，不存在时为空）。已合并的清理后链接仍留在台账上：
     # 那是这个问题修复过并合入的证据，撤掉之后台账上看不出它曾经被修过
     cleaned_mr_state: Mapped[Optional[str]] = mapped_column(String(16))
+    # 自动清理最近一次看过它的时刻（清理成功、被拒绝、平台出错都记）。挑候选时最久没看过的优先：
+    # 分支被人接手、合并请求还有人在动的会一直留在候选里，不轮换的话它们排在队首把每轮的名额吃光
+    cleanup_checked_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    # 最近一次清理（手动或自动）没清理掉它的原因（分支被人接手、合并请求还有动静、平台出错）；清理掉了或还没清理过为空。
+    # 只存最近一次：要的是"现在为什么还卡着"，历次原因日志里有
+    cleanup_note: Mapped[Optional[str]] = mapped_column(Text)
 
     started_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=utcnow)
     heartbeat_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=utcnow)

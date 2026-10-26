@@ -236,6 +236,8 @@ export interface Survey {
   fix_prompt?: string
   /** 修复合并请求的标题模板，{title} 换成问题标题；空串表示沿用全局前缀加问题标题。只有 Admin 拿得到 */
   fix_mr_title_template?: string
+  /** 自动清理修复：修复结束超过这么多天、合并请求也这么多天没有动静的，每轮巡检结束后自动清理；null 表示不自动清理 */
+  fix_cleanup_after_days: number | null
   last_run_at: string
   next_run_at: string
   created_at: string
@@ -355,6 +357,8 @@ export interface SurveyFix {
   mr_url: string
   /** 清理（关闭合并请求、删除修复分支）的时刻；未清理为空串 */
   cleaned_at: string
+  /** 最近一次清理（手动或自动）没清理掉它的原因；清理掉了或还没清理过为空串 */
+  cleanup_note: string
   started_at: string
   finished_at: string
 }

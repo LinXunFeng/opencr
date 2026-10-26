@@ -49,6 +49,7 @@ from .common import SurveyError, finding_fingerprint
 from .config import load_max_repos, load_survey_config, resolve_budget
 from .crossrepo import build_cross_repo_map, render_cross_repo_map
 from .fix import FixBatchBusy, fix_unsupported_reason, start_fix_batch
+from .fix_cleanup import auto_cleanup_fixes
 from .ignores import attach_ignored, match_by_title
 from .ledger import plan_rechecks, update_ledger_for_run
 from .profile import build_profile, codegraph_status, save_profile
@@ -375,7 +376,29 @@ def execute_survey_run(survey_uid: str, trigger: str) -> Optional[str]:
     if succeeded:
         _publish(run_uid)
         _auto_fix(survey, run_uid)
+    # 失败的一轮也清理：清理只看修复记录与平台状态，不依赖这一轮的产出；分析连续失败几周时合并请求照样在堆。
+    # 被确认中断的不清理：新一轮可能已经开始，它收尾时会清理，两边同时清理只是重复调平台
+    if closed:
+        _auto_cleanup_fixes(survey_uid)
     return run_uid
+
+
+def _auto_cleanup_fixes(survey_uid: str) -> None:
+    """
+    巡检配置了自动清理修复时，清理结束已久、合并请求也久无动静的修复（见 fix_cleanup.auto_cleanup_fixes）。
+
+    放在自动发起修复之后：两者互不相干（自动修复只给从没修复过的问题发起，清理只动已结束的修复），
+    但清理要逐条调平台接口、可能要一两分钟，不该拖慢这一轮台账的推送。
+    它跑在这一轮自己的执行线程里、运行已经收尾：调度线程不等它，has_running_survey_run 也不再把这一轮算作进行中，挡不住下一次触发。
+    重新读一次巡检配置：一轮可能跑了几十分钟，期间 Admin 关掉了自动清理的话要按关掉的办。
+    """
+    try:
+        survey = repo.get_survey(survey_uid)
+        if survey is not None:
+            auto_cleanup_fixes(survey)
+    except Exception:
+        # 自动清理是附加动作，失败不影响这一轮的结果；没清理的下一轮再试，Admin 也可以在「修复合并请求」页手动清理
+        logger.exception("Auto fix cleanup failed: survey=%s", survey_uid)
 
 
 def _auto_fix(survey: dict, run_uid: str) -> None:

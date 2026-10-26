@@ -4,7 +4,8 @@
 1. 清理不能删掉别人的工作 —— 分支上有不是 OpenCR 推的提交时整条拒绝，合并请求也不关；
 2. 清理过的问题仍算修复过 —— 批量修复不能再给它发起，否则自动修复会把清理掉的合并请求原样提回来；
 3. 已清理的合并请求不再出现在台账里；
-4. 台账行的处理人与修复同一套规则，原始作者只追溯一次，处理人每轮重新确定，读不到平台时保留上一次的结果。
+4. 台账行的处理人与修复同一套规则，原始作者只追溯一次，处理人每轮重新确定，读不到平台时保留上一次的结果；
+5. 自动清理默认关闭，只动结束已久的修复，合并请求还有人在动的不关，被拒绝的不能每轮都占着名额。
 """
 
 import sys
@@ -208,6 +209,21 @@ class CleanupTests(CleanupTestCase):
         self.assertEqual(result["outcome"], "rejected")
         platform.get_branch.assert_not_called()
 
+    def test_manual_rejection_recorded_without_touching_rotation(self):
+        """手动清理没清掉的也记下原因，页面上不会挂着过时的旧原因；但不记看过的时刻，那只管自动清理的轮换。"""
+        from backend.storage import db
+        from backend.storage.models import SurveyFix
+
+        uid = self._opened_fix()
+        self.repo.record_survey_fix_cleanup_checks({uid: "上一次自动清理的旧原因"}, checked=True)
+        self._cleanup([uid], branch={"commit": {"id": "someone-else"}})
+        self.assertIn("追加了提交", self.repo.get_survey_fix(uid)["cleanup_note"])
+        with db.session_scope() as session:
+            checked = session.query(SurveyFix).filter_by(run_uid=uid).one().cleanup_checked_at
+        self.repo.record_survey_fix_cleanup_checks({uid: "又一次"})
+        with db.session_scope() as session:
+            self.assertEqual(session.query(SurveyFix).filter_by(run_uid=uid).one().cleanup_checked_at, checked)
+
     def test_cleaned_issue_still_counts_as_fixed(self):
         """清理过的问题不会被批量修复再次发起，否则下一轮自动修复会把它原样提回来。"""
         run_uid, finding_id = self._run_with_finding()
@@ -256,6 +272,246 @@ class CleanupRouteTests(FixRouteTestCase):
         response = self.client.post("/api/admin/survey-fixes/cleanup", json={"run_uids": ["missing"]})
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json["results"][0]["outcome"], "rejected")
+
+
+# ---------------------------------------------------------------------------
+# 自动清理
+# ---------------------------------------------------------------------------
+
+class MrActiveSinceTests(unittest.TestCase):
+    """合并请求在期限之后有没有动静；读不出时间时按有动静处理。"""
+
+    def test_mr_active_since(self):
+        """看最新一条评论的时刻，没有评论看提出时刻；带时区的时间与 naive UTC 的期限比较；缺失或格式不对时按有动静处理。"""
+        from datetime import datetime
+
+        from backend.survey.fix_cleanup import mr_active_since
+
+        cutoff = datetime(2026, 10, 1, 12, 0)
+        # updated_at 再新也不算：目标分支一有提交平台就会刷新它
+        mr = {"created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-10-20T00:00:00Z"}
+        self.assertFalse(mr_active_since(mr, None, cutoff))
+        self.assertFalse(mr_active_since(mr, {"created_at": "2026-10-01T11:59:00.000Z"}, cutoff))
+        self.assertTrue(mr_active_since(mr, {"created_at": "2026-10-01T12:01:00.000Z"}, cutoff))
+        # +08:00 的 19:30 是 UTC 11:30，在期限之前
+        self.assertFalse(mr_active_since(mr, {"created_at": "2026-10-01T19:30:00+08:00"}, cutoff))
+        self.assertTrue(mr_active_since(mr, {"created_at": "2026-10-01T20:30:00+08:00"}, cutoff))
+        self.assertTrue(mr_active_since({"created_at": "2026-10-02T00:00:00Z"}, None, cutoff))
+        for note in ({}, {"created_at": ""}, {"created_at": "昨天"}):
+            self.assertTrue(mr_active_since(mr, note or {"created_at": None}, cutoff), note)
+        self.assertTrue(mr_active_since({}, None, cutoff))
+
+
+class LatestNoteApiTests(unittest.TestCase):
+    """读取合并请求最新一条评论的接口封装。"""
+
+    def test_reads_newest_note_or_none(self):
+        """按创建时间倒序只取一条；没有评论时返回 None。"""
+        from backend.review import gitlab
+
+        response = mock.Mock()
+        response.json.return_value = [{"id": 9, "created_at": "2026-10-01T00:00:00Z"}]
+        with mock.patch.object(gitlab, "_gitlab_send", return_value=response) as send:
+            self.assertEqual(gitlab.get_latest_merge_request_note("a/app", 7)["id"], 9)
+        method, path = send.call_args[0]
+        self.assertEqual(method, "GET")
+        self.assertEqual(path, "/projects/a%2Fapp/merge_requests/7/notes?sort=desc&order_by=created_at&per_page=1")
+        response.json.return_value = []
+        with mock.patch.object(gitlab, "_gitlab_send", return_value=response):
+            self.assertIsNone(gitlab.get_latest_merge_request_note("a/app", 7))
+
+
+class AutoCleanupTests(CleanupTestCase):
+    """巡检结束后按自动清理期限清理结束已久的修复。"""
+
+    DAYS = 14
+
+    def _age(self, uid, days):
+        """把修复的结束时刻拨回 days 天前。"""
+        from datetime import timedelta
+
+        from backend.storage import db
+        from backend.storage.models import SurveyFix, utcnow
+
+        with db.session_scope() as session:
+            session.query(SurveyFix).filter_by(run_uid=uid).one().finished_at = utcnow() - timedelta(days=days)
+
+    def _enable(self, days=DAYS):
+        """打开这个巡检的自动清理。"""
+        self.repo.update_survey(self.survey["survey_uid"], {"fix_cleanup_after_days": days})
+
+    def _auto(self, note_days_ago=30, mr_state="opened", branch="owned"):
+        """以给定的平台状态跑一次自动清理，返回 (结果, 平台替身)。最新一条评论以几天前计，None 表示没有评论。"""
+        from datetime import timedelta
+
+        from backend.storage.models import utcnow
+        from backend.survey import fix_cleanup
+
+        def ago(days):
+            """几天前的平台时间。"""
+            return (utcnow() - timedelta(days=days)).isoformat() + "Z"
+
+        platform = mock.Mock()
+        platform.get_branch.side_effect = lambda _p, name: (
+            {"commit": {"id": "c1", "parent_ids": ["b0"]}} if branch == "owned" else None
+        )
+        # updated_at 永远是刚刚：活跃仓库里目标分支一有提交它就会刷新，不能拿它当动静
+        platform.get_merge_request.return_value = {"state": mr_state, "created_at": ago(60), "updated_at": ago(0)}
+        platform.get_latest_merge_request_note.return_value = (
+            None if note_days_ago is None else {"created_at": ago(note_days_ago)}
+        )
+        with mock.patch.multiple(
+            fix_cleanup, get_branch=platform.get_branch, get_merge_request=platform.get_merge_request,
+            close_merge_request=platform.close_merge_request, delete_branch=platform.delete_branch,
+            get_latest_merge_request_note=platform.get_latest_merge_request_note,
+        ), mock.patch.object(fix_cleanup, "republish_ledger") as republish, \
+                mock.patch.object(fix_cleanup.threading, "Thread", side_effect=_run_inline):
+            results = fix_cleanup.auto_cleanup_fixes(self.repo.get_survey(self.survey["survey_uid"]))
+        self.republish = republish
+        return results, platform
+
+    def test_off_by_default(self):
+        """没配置期限时什么都不做，连候选都不查：自动清理会关闭别人名下的合并请求，必须由人明确打开。"""
+        uid = self._opened_fix()
+        self._age(uid, 365)
+        self.assertIsNone(self.repo.get_survey(self.survey["survey_uid"])["fix_cleanup_after_days"])
+        results, platform = self._auto()
+        self.assertEqual(results, [])
+        platform.get_branch.assert_not_called()
+        self.assertEqual(self.repo.get_survey_fix(uid)["cleaned_at"], "")
+
+    def test_cleans_old_idle_fix_and_leaves_young_one(self):
+        """结束超过期限、合并请求也久无动静的被清理；还没到期限的不碰。"""
+        old = self._opened_fix()
+        young = self._opened_fix(self._run_with_finding(title="另一个问题")[1])
+        self._age(old, self.DAYS + 1)
+        self._age(young, self.DAYS - 1)
+        self._enable()
+        results, platform = self._auto(note_days_ago=None)
+        self.assertEqual([(r["run_uid"], r["outcome"]) for r in results], [(old, "cleaned")])
+        platform.close_merge_request.assert_called_once_with("a/app", 7)
+        self.assertTrue(self.repo.get_survey_fix(old)["cleaned_at"])
+        self.assertEqual(self.repo.get_survey_fix(young)["cleaned_at"], "")
+        self.republish.assert_called_once_with(self._survey_id())
+
+    def test_recently_active_mr_is_left_open(self):
+        """合并请求还开着、期限内有过评论：不关、不删分支、不标已清理，原因记在修复记录上；之后清理掉了原因随之清空。"""
+        uid = self._opened_fix()
+        self._age(uid, self.DAYS + 30)
+        self._enable()
+        [result], platform = self._auto(note_days_ago=1)
+        self.assertEqual(result["outcome"], "rejected")
+        self.assertIn("动静", result["message"])
+        platform.close_merge_request.assert_not_called()
+        platform.delete_branch.assert_not_called()
+        fix = self.repo.get_survey_fix(uid)
+        self.assertEqual(fix["cleaned_at"], "")
+        self.assertIn("动静", fix["cleanup_note"])
+        self.assertIn("动静", self.repo.list_fix_merge_requests()["items"][0]["cleanup_note"])
+        [result], _ = self._auto(note_days_ago=self.DAYS + 1)
+        self.assertEqual(result["outcome"], "cleaned", result["message"])
+        self.assertEqual(self.repo.get_survey_fix(uid)["cleanup_note"], "")
+
+    def test_merged_mr_wrapped_up_regardless_of_activity(self):
+        """已合并的不看动静：合并本身就会刷新 updated_at，看动静的话它永远收不了尾。"""
+        uid = self._opened_fix()
+        self._age(uid, self.DAYS + 1)
+        self._enable()
+        [result], platform = self._auto(note_days_ago=0, mr_state="merged")
+        self.assertEqual(result["outcome"], "cleaned", result["message"])
+        platform.close_merge_request.assert_not_called()
+        platform.delete_branch.assert_called_once()
+
+    def test_candidates_exclude_running_cleaned_and_empty(self):
+        """进行中的、已清理的、什么都没推过的都不进候选，免得白占名额。"""
+        from datetime import timedelta
+
+        from backend.storage.models import utcnow
+
+        cleaned = self._opened_fix()
+        self.repo.mark_survey_fix_cleaned(cleaned, "closed")
+        _, running = self.repo.start_survey_fix(self._run_with_finding(title="进行中")[1])
+        _, empty = self.repo.start_survey_fix(self._run_with_finding(title="没推过")[1])
+        self.repo.finish_survey_fix(empty, "skipped")
+        wanted = self._opened_fix(self._run_with_finding(title="该清理")[1])
+        for uid in (cleaned, running, empty, wanted):
+            self._age(uid, 100)
+        cutoff = utcnow() - timedelta(days=self.DAYS)
+        self.assertEqual(self.repo.list_survey_fix_cleanup_candidates(self.survey["survey_uid"], cutoff, 10), [wanted])
+        # 别的巡检的修复不会混进来
+        self.assertEqual(self.repo.list_survey_fix_cleanup_candidates("no-such-survey", cutoff, 10), [])
+
+    def test_rejected_ones_rotate_to_the_back(self):
+        """被拒绝的记下看过的时刻、排到后面：否则每轮名额都被同几条吃光，其余的永远轮不到。"""
+        from datetime import timedelta
+
+        from backend.storage.models import utcnow
+        from backend.survey import fix_cleanup
+
+        first = self._opened_fix()
+        second = self._opened_fix(self._run_with_finding(title="另一个问题")[1])
+        self._age(first, self.DAYS + 10)
+        self._age(second, self.DAYS + 5)
+        self._enable()
+        cutoff = utcnow() - timedelta(days=self.DAYS)
+        with mock.patch.object(fix_cleanup, "MAX_AUTO_CLEANUP_PER_RUN", 1):
+            [result], _ = self._auto(note_days_ago=1)
+            self.assertEqual((result["run_uid"], result["outcome"]), (first, "rejected"))
+            self.assertEqual(self.repo.list_survey_fix_cleanup_candidates(self.survey["survey_uid"], cutoff, 2), [second, first])
+            [result], _ = self._auto()
+        self.assertEqual((result["run_uid"], result["outcome"]), (second, "cleaned"))
+
+    def test_runner_cleans_even_when_run_fails(self):
+        """巡检失败的一轮也清理：清理不依赖这一轮的产出；读的是最新的巡检配置。"""
+        from backend.survey import runner
+
+        uid = self.survey["survey_uid"]
+        self.repo.add_survey_ignored_repos(uid, ["https://g.com/a/app.git"], "")
+        self._enable()
+        with mock.patch.object(runner, "_cleanup"), mock.patch.object(runner, "auto_cleanup_fixes") as auto:
+            run_uid = runner.execute_survey_run(uid, "manual")
+        self.assertEqual(self.repo.get_survey_run_detail(run_uid)["status"], "failed")
+        auto.assert_called_once()
+        self.assertEqual(auto.call_args[0][0]["fix_cleanup_after_days"], self.DAYS)
+
+    def test_runner_survives_cleanup_crash(self):
+        """自动清理出错只记日志，不影响这一轮的结果。"""
+        from backend.survey import runner
+
+        uid = self.survey["survey_uid"]
+        self.repo.add_survey_ignored_repos(uid, ["https://g.com/a/app.git"], "")
+        with mock.patch.object(runner, "_cleanup"), \
+                mock.patch.object(runner, "auto_cleanup_fixes", side_effect=RuntimeError("boom")):
+            run_uid = runner.execute_survey_run(uid, "manual")
+        self.assertEqual(run_uid, self.repo.list_survey_runs(uid)[0]["run_uid"])
+
+
+class AutoCleanupRouteTests(FixRouteTestCase):
+    """巡检配置里的自动清理期限。"""
+
+    def test_saved_and_validated(self):
+        """正整数照存；空与 0 都表示不自动清理；非整数、负数与超出上限的返回 400 且不改动。"""
+        self._login()
+        uid = self.survey["survey_uid"]
+        url = f"/api/admin/surveys/{uid}"
+        self.assertIsNone(self.client.get(url).json["fix_cleanup_after_days"])
+        self.assertEqual(self.client.patch(url, json={"fix_cleanup_after_days": 30}).json["fix_cleanup_after_days"], 30)
+        for bad in ("abc", -1, 3651, True, False, 1.5, 0.0):
+            self.assertEqual(self.client.patch(url, json={"fix_cleanup_after_days": bad}).status_code, 400, bad)
+        self.assertEqual(self.repo.get_survey(uid)["fix_cleanup_after_days"], 30)
+        for off in (0, None, ""):
+            self.client.patch(url, json={"fix_cleanup_after_days": 30})
+            self.assertIsNone(self.client.patch(url, json={"fix_cleanup_after_days": off}).json["fix_cleanup_after_days"], off)
+
+    def test_saved_on_create(self):
+        """新建时同样能带上（拷贝巡检走的就是新建）。"""
+        self._login()
+        created = self.client.post("/api/admin/surveys", json={
+            "name": "带自动清理", "sources": [{"kind": "repo", "url": "https://g.com/a/b.git"}],
+            "fix_cleanup_after_days": 7,
+        })
+        self.assertEqual(created.status_code, 201, created.json)
+        self.assertEqual(self.repo.get_survey(created.json["survey_uid"])["fix_cleanup_after_days"], 7)
 
 
 # ---------------------------------------------------------------------------
