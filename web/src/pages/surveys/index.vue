@@ -82,6 +82,7 @@ const form = reactive({
   fix_min_severity: "warning" as Survey["fix_min_severity"],
   fix_prompt: "",
   fix_mr_title_template: "",
+  fix_cleanup_after_days: null as number | null,
   budget_wall_clock_minutes: null as number | null,
   budget_l2_max_focus: null as number | null,
   // 以下两项不在表单上展示，只为原样带回：新建接口没收到的字段一律落成全局默认，拷贝时不带上就会悄悄丢掉源巡检的设置
@@ -138,6 +139,7 @@ function resetForm() {
   form.fix_min_severity = "warning"
   form.fix_prompt = ""
   form.fix_mr_title_template = ""
+  form.fix_cleanup_after_days = null
   form.budget_wall_clock_minutes = null
   form.budget_l2_max_focus = null
   form.budget_l1_max_chars = null
@@ -180,6 +182,7 @@ function fillForm(row: any) {
   form.fix_min_severity = row.fix_min_severity
   form.fix_prompt = row.fix_prompt ?? ""
   form.fix_mr_title_template = row.fix_mr_title_template ?? ""
+  form.fix_cleanup_after_days = row.fix_cleanup_after_days ?? null
   form.budget_wall_clock_minutes = row.budget_wall_clock_minutes
   form.budget_l2_max_focus = row.budget_l2_max_focus
   form.budget_l1_max_chars = row.budget_l1_max_chars ?? null
@@ -353,6 +356,7 @@ async function save() {
       fix_min_severity: form.fix_min_severity,
       fix_prompt: form.fix_prompt,
       fix_mr_title_template: form.fix_mr_title_template,
+      fix_cleanup_after_days: form.fix_cleanup_after_days,
       budget_wall_clock_minutes: form.budget_wall_clock_minutes,
       budget_l2_max_focus: form.budget_l2_max_focus,
       budget_l1_max_chars: form.budget_l1_max_chars,
@@ -777,6 +781,19 @@ onMounted(load)
           />
           <div class="sub">
             {{ FIX_NOTES.titleTemplateHelp }}
+          </div>
+        </el-form-item>
+
+        <el-form-item label="自动清理修复">
+          <div class="schedule-row">
+            <el-input-number
+              v-model="form.fix_cleanup_after_days" :min="1" :max="3650" :value-on-clear="null"
+              :placeholder="FIX_NOTES.cleanupAfterPlaceholder" controls-position="right" style="width: 160px"
+            />
+            <span>天后</span>
+          </div>
+          <div class="sub">
+            {{ FIX_NOTES.cleanupAfterHelp }}
           </div>
         </el-form-item>
 

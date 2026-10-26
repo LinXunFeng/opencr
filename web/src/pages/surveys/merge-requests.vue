@@ -244,6 +244,11 @@ onMounted(() => {
                 {{ FIX_NOTES.cleanedTag }}
               </el-tag>
             </el-tooltip>
+            <el-tooltip v-else-if="row.cleanup_note" :content="row.cleanup_note" placement="top">
+              <el-tag size="small" type="warning" effect="plain" class="ml">
+                {{ FIX_NOTES.cleanupSkippedTag }}
+              </el-tag>
+            </el-tooltip>
           </template>
         </el-table-column>
         <el-table-column label="提出时间" min-width="160">

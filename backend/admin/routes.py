@@ -585,6 +585,8 @@ MAX_SURVEY_BINDINGS = 10
 MAX_FIX_PROMPT_CHARS = 2000
 # 合并请求标题模板的长度上限。平台标题上限 255，留出至少 55 个字给问题标题，否则标题只剩模板、分不出是哪个问题
 MAX_FIX_MR_TITLE_TEMPLATE_CHARS = 200
+# 自动清理修复天数的上限。十年足够表达"几乎不清理"，再大的数折成日期会越过 datetime 的范围
+MAX_FIX_CLEANUP_AFTER_DAYS = 3650
 
 
 def _parse_sources(raw) -> list:
@@ -672,6 +674,23 @@ def _parse_survey_payload(payload: dict, partial: bool) -> tuple:
             raise ValueError("合并请求标题模板不能包含换行或制表符")
         # 与读取时（fix.mr_title）的规整一致：连续空白压成一个，存的就是实际生效的
         fields["fix_mr_title_template"] = " ".join(template.split()) or None
+
+    if "fix_cleanup_after_days" in payload:
+        days = payload.get("fix_cleanup_after_days")
+        # 空、0 都表示不自动清理：前端清空数字框时传 null，手写接口的人更可能传 0
+        if days in (None, "", "0") or (type(days) is int and days == 0):
+            fields["fix_cleanup_after_days"] = None
+        else:
+            # 布尔与小数不能放过：int(True) 是 1、int(1.9) 也是 1，传错类型会悄悄打开"1 天后就清理"
+            if isinstance(days, (bool, float)):
+                raise ValueError("fix_cleanup_after_days 必须是整数")
+            try:
+                parsed = int(days)
+            except (TypeError, ValueError):
+                raise ValueError("fix_cleanup_after_days 必须是整数")
+            if parsed < 0 or parsed > MAX_FIX_CLEANUP_AFTER_DAYS:
+                raise ValueError(f"fix_cleanup_after_days 只能在 0 到 {MAX_FIX_CLEANUP_AFTER_DAYS} 之间")
+            fields["fix_cleanup_after_days"] = parsed or None
 
     if "excluded_skills" in payload:
         raw = payload["excluded_skills"]
@@ -793,6 +812,7 @@ def _decorate_survey(survey: dict) -> dict:
         "workspace_bytes": workspace_size_bytes(survey["slug"]),
     }
     if not admin:
+        # fix_cleanup_after_days 与 fix_mode 一样只是开关，不含正文，Guest 照常可见
         decorated.pop("fix_prompt", None)
         decorated.pop("fix_mr_title_template", None)
     return decorated

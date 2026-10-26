@@ -6,18 +6,23 @@
 FixRun 记录本身保留并记下清理时刻，这个问题仍算修复过，批量修复不会再给它发起 ——
 否则清理掉的合并请求，下一轮巡检后自动修复又会原样提一个出来。
 
-判定逻辑（cleanup_rejection / branch_owned_by_fix）是纯函数，不碰网络与数据库。
+巡检配置了自动清理修复（fix_cleanup_after_days）时，每轮巡检结束后按同一套规则清理结束已久、合并请求也久无动静的修复（auto_cleanup_fixes）。
+
+判定逻辑（cleanup_rejection / branch_owned_by_fix / mr_active_since）是纯函数，不碰网络与数据库。
 """
 
 import logging
 import threading
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
 
 from ..review.common import ReviewError
 from ..review.config import load_gitlab_config
-from ..review.gitlab import close_merge_request, delete_branch, get_branch, get_merge_request
+from ..review.gitlab import (
+    close_merge_request, delete_branch, get_branch, get_latest_merge_request_note, get_merge_request,
+)
 from ..storage import repo
-from ..storage.models import RUN_RUNNING
+from ..storage.models import RUN_RUNNING, utcnow
 from .fix import FIX_BRANCH_PREFIX, fix_unsupported_reason, project_path_from_url, republish_ledger
 
 logger = logging.getLogger(__name__)
@@ -30,6 +35,10 @@ CLEANUP_CLEANED = "cleaned"
 CLEANUP_REJECTED = "rejected"
 # 平台接口出错，可能做了一半（例如合并请求已关闭、分支没删掉）；再清理一次会接着做完
 CLEANUP_FAILED = "failed"
+
+# 自动清理每轮最多处理几条。逐条同步调平台接口，刚打开开关时积压的可能有几百条，一轮全做完会撞上平台限流；
+# 剩下的留给下一轮，候选按最久没看过的优先轮换（见 repo.list_survey_fix_cleanup_candidates）
+MAX_AUTO_CLEANUP_PER_RUN = 50
 
 
 def cleanup_rejection(fix: Optional[dict]) -> str:
@@ -64,12 +73,41 @@ def branch_owned_by_fix(branch: dict, commit_sha: str, base_sha: str) -> bool:
     return False
 
 
-def cleanup_fix(run_uid: str) -> dict:
+def _parse_platform_time(raw) -> Optional[datetime]:
+    """把平台给的 ISO 时间（带 Z 或时区偏移）转成 naive UTC；读不出时返回 None。"""
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    try:
+        # Python 3.11 之前的 fromisoformat 不认末尾的 Z
+        moment = datetime.fromisoformat(text[:-1] + "+00:00" if text.endswith("Z") else text)
+    except ValueError:
+        return None
+    if moment.tzinfo is not None:
+        moment = moment.astimezone(timezone.utc).replace(tzinfo=None)
+    return moment
+
+
+def mr_active_since(mr: dict, latest_note: Optional[dict], cutoff: datetime) -> bool:
+    """
+    合并请求在 cutoff（naive UTC）之后是否有过动静：最新一条评论（含改派、改标题这类系统记录）的时刻，没有评论时看提出时刻。
+
+    不看合并请求的 updated_at：目标分支有新提交时平台会重算可合并状态，活跃仓库里没人理的合并请求也会一直显得"刚更新过"，
+    自动清理就永远轮不到它们。源分支上的新提交不用在这里看，清理前已经按分支头挡过（branch_owned_by_fix）。
+    读不出时间按"有动静"处理：自动清理宁可这一轮不关，也不要关掉一个可能有人正在看的合并请求。
+    """
+    raw = latest_note.get("created_at") if latest_note else (mr or {}).get("created_at")
+    moment = _parse_platform_time(raw)
+    return moment is None or moment > cutoff
+
+
+def cleanup_fix(run_uid: str, idle_cutoff: Optional[datetime] = None) -> dict:
     """
     清理一条修复运行，返回 {"run_uid", "outcome", "message", "already_cleaned"}，outcome 取 CLEANUP_*。任何错误都收敛进返回值，不向上抛。
 
     先查分支、再关合并请求、最后删分支：分支被人接手时整条拒绝，合并请求也不关 —— 他多半正在那个合并请求上继续改。
     已经清理过的再清理一次视为成功，不重复调用平台。
+    idle_cutoff（naive UTC）只由自动清理传入：合并请求还开着、且在它之后有过动静时整条拒绝，说明还有人在处理。
     """
     result = {"run_uid": run_uid, "outcome": CLEANUP_REJECTED, "message": "", "already_cleaned": False}
     fix = repo.get_survey_fix(run_uid)
@@ -101,6 +139,12 @@ def cleanup_fix(run_uid: str) -> dict:
             state = str((mr or {}).get("state") or "").lower()
             # locked 是平台在合并过程中的短暂状态，同样还没结束，按打开处理
             if state in ("opened", "locked"):
+                if idle_cutoff is not None and mr_active_since(
+                    mr, get_latest_merge_request_note(project_path, fix["mr_iid"]), idle_cutoff
+                ):
+                    # 放在关闭之前、且此前没有动过平台：拒绝时分支与合并请求都原样留着
+                    result["message"] = "合并请求最近还有动静（评论、改派等），这一轮不自动清理"
+                    return result
                 close_merge_request(project_path, fix["mr_iid"])
                 state = "closed"
                 notes.append("已关闭合并请求")
@@ -132,24 +176,58 @@ def cleanup_fix(run_uid: str) -> dict:
     return result
 
 
-def cleanup_fixes(run_uids: List[str]) -> List[dict]:
+def cleanup_fixes(run_uids: List[str], idle_cutoff: Optional[datetime] = None) -> List[dict]:
     """
-    逐条清理，返回每条的结果（见 cleanup_fix）；清理成功的巡检在后台重推一次台账，把已清理的链接从外部表格里撤掉。
+    逐条清理，返回每条的结果（见 cleanup_fix，idle_cutoff 同）；清理成功的巡检在后台重推一次台账，把已清理的链接从外部表格里撤掉。
 
     逐条而不是并行：每条只是几次平台接口调用，并行省下的时间不多，却会在限流时让一半失败。
     """
     results: List[dict] = []
     survey_ids: Dict[int, None] = {}
     for run_uid in dict.fromkeys(run_uids):
-        outcome = cleanup_fix(run_uid)
+        outcome = cleanup_fix(run_uid, idle_cutoff)
         results.append(outcome)
         # 早就清理过的不用重推：上次清理时已经推过了
         if outcome["outcome"] == CLEANUP_CLEANED and not outcome["already_cleaned"]:
             fix = repo.get_survey_fix(run_uid)
             if fix is not None:
                 survey_ids[fix["survey_id"]] = None
+    # 手动与自动清理都记下没清理掉的原因：页面上标的是"最近一次为什么没清掉"，只记自动的话，
+    # 手动清理刚被拒绝，页面上还挂着上一次自动清理的旧原因。只有自动清理才记"看过的时刻"，它决定的是自动清理的轮换
+    repo.record_survey_fix_cleanup_checks(
+        reasons={r["run_uid"]: "" if r["outcome"] == CLEANUP_CLEANED else r["message"] for r in results},
+        checked=idle_cutoff is not None,
+    )
     if survey_ids:
         _republish_in_background(list(survey_ids))
+    return results
+
+
+def auto_cleanup_fixes(survey: dict) -> List[dict]:
+    """
+    巡检配置了自动清理修复时，清理它名下结束超过 fix_cleanup_after_days 天、合并请求也这么久没有动静的修复，
+    返回每条的结果；没开、或当前平台不支持修复时返回空列表。
+
+    规则与 Admin 手动清理完全相同（同一个 cleanup_fix），只多一道"合并请求最近有没有动静"（见 mr_active_since）：
+    提出得早不等于没人管，有人还在评论、改派的不关。已合并、已关闭的不看动静，照常收尾（删分支、标为已清理）。
+    没清理掉的原因记在修复记录上（cleanup_note，见 cleanup_fixes），「修复合并请求」页据此标出哪些一直卡着、为什么。
+    """
+    days = survey.get("fix_cleanup_after_days")
+    if not days or int(days) <= 0:
+        return []
+    unsupported = fix_unsupported_reason()
+    if unsupported:
+        logger.warning("Auto fix cleanup skipped: survey=%s: %s", survey.get("slug"), unsupported)
+        return []
+    cutoff = utcnow() - timedelta(days=int(days))
+    run_uids = repo.list_survey_fix_cleanup_candidates(survey["survey_uid"], cutoff, MAX_AUTO_CLEANUP_PER_RUN)
+    if not run_uids:
+        return []
+    results = cleanup_fixes(run_uids, idle_cutoff=cutoff)
+    logger.info(
+        "Auto fix cleanup finished: survey=%s candidates=%s cleaned=%s",
+        survey.get("slug"), len(run_uids), sum(1 for r in results if r["outcome"] == CLEANUP_CLEANED),
+    )
     return results
 
 
