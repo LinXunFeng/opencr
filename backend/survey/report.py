@@ -31,6 +31,7 @@ from ..storage.models import (
     INDEX_MODE_FAILED,
     INDEX_MODE_INIT,
     INDEX_MODE_SYNC,
+    REPO_EMPTY,
     REPO_FETCH_FAILED,
     REPO_IGNORED,
     REPO_TRUNCATED,
@@ -72,16 +73,18 @@ DEGRADATION_LABELS: Dict[str, str] = {
 }
 
 # 没有参与分析的仓库状态。运行记录里仍留一行，是为了看得出少了谁、为什么。
-# 导出报告里没有状态列可对照，所以比前端 SURVEY_REPO_STATUS_LABEL 的短标签多说半句原因
+# 导出报告里没有状态列可对照，所以比前端 SURVEY_REPO_STATUS_LABEL 的短标签多说半句原因；键与前端 SURVEY_REPO_SKIPPED_STATUSES 一致
 SKIPPED_REPO_LABELS: Dict[str, str] = {
     REPO_IGNORED: "在忽略清单里",
     REPO_TRUNCATED: "超出单次巡检的仓库上限",
+    REPO_EMPTY: "空仓库，还没有任何提交",
 }
 
 # 「本轮未复查」里所在仓库本轮没参与的原因，与前端 SURVEY_UNCHECKED_REPO_LABEL 一致
 UNCHECKED_REPO_LABELS: Dict[str, str] = {
     REPO_TRUNCATED: "仓库超出上限",
     REPO_FETCH_FAILED: "仓库拉取失败",
+    REPO_EMPTY: "仓库为空",
 }
 
 # 以下文案与 web/src/common/constants/opencr.ts 的同名映射是两份拷贝（跨语言无法共用），改一边要同步另一边
@@ -434,7 +437,7 @@ def render_run_markdown(detail: dict) -> str:
     lines.extend([
         "## 本轮未复查",
         "",
-        "_以下问题在上一次巡检中出现过，本次没有再报出，但所在文件本次没有得出可信结论（没轮到取证、文件超出读取上限只看了片段、源码读取或模型输出失败，或所在仓库本次超出上限、拉取失败，条目上会注明），状态未知。_",
+        "_以下问题在上一次巡检中出现过，本次没有再报出，但所在文件本次没有得出可信结论（没轮到取证、文件超出读取上限只看了片段、源码读取或模型输出失败，或所在仓库本次超出上限、拉取失败、是空仓库，条目上会注明），状态未知。_",
         "",
         _render_findings(unchecked_items, include_body),
         "",

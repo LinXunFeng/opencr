@@ -269,6 +269,8 @@ REPO_IGNORED = "ignored"
 # 超出单次巡检仓库上限、本轮被截掉的仓库。记下来既是为了看得出少了谁，也让它能在忽略清单里被选中 ——
 # 仓库太多时最想剔除的恰恰是这一批
 REPO_TRUNCATED = "truncated"
+# 远端一个引用都没有、本轮跳过的仓库（新建后还没推过提交）。不记降级：没有代码可看，产出质量没有受损
+REPO_EMPTY = "empty"
 
 # --- SurveyRunRepo.profile_kind ------------------------------------------
 PROFILE_CODEGRAPH = "codegraph"

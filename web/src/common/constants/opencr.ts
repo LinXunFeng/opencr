@@ -230,24 +230,27 @@ export const SURVEY_REPO_STATUS_LABEL: Record<string, string> = {
   fetch_failed: "拉取失败",
   index_failed: "索引失败",
   ignored: "已忽略",
-  truncated: "超出上限"
+  truncated: "超出上限",
+  empty: "空仓库"
 }
 
 /** 「本轮未复查」里所在仓库本轮没参与的原因，与服务端 report.UNCHECKED_REPO_LABELS 一致 */
 export const SURVEY_UNCHECKED_REPO_LABEL: Record<string, string> = {
   truncated: "仓库超出上限",
-  fetch_failed: "仓库拉取失败"
+  fetch_failed: "仓库拉取失败",
+  empty: "仓库为空"
 }
 
-/** 已忽略是用户的选择、超出上限是配置问题，都不是故障，不能和拉取失败一样标红 */
+/** 已忽略是用户的选择、超出上限是配置问题、空仓库是还没有代码，都不是故障，不能和拉取失败一样标红 */
 export const SURVEY_REPO_STATUS_TAG: Record<string, TagType> = {
   ok: "success",
   ignored: "info",
-  truncated: "warning"
+  truncated: "warning",
+  empty: "info"
 }
 
-/** 没有参与分析的仓库状态：运行记录里仍列出（看得出少了谁），但不算「覆盖的仓库」 */
-export const SURVEY_REPO_SKIPPED_STATUSES = ["ignored", "truncated"]
+/** 没有参与分析的仓库状态：运行记录里仍列出（看得出少了谁），但不算「覆盖的仓库」。与服务端 report.SKIPPED_REPO_LABELS 的键一致 */
+export const SURVEY_REPO_SKIPPED_STATUSES = ["ignored", "truncated", "empty"]
 
 /** Reach 里画像中出现文件的来源 */
 export const REACH_SOURCE_LABEL: Record<string, string> = {
@@ -554,7 +557,7 @@ export const SURVEY_NOTES = {
   focusCapIncludesRecheck:
     "关注点上限同时也是每轮复核台账问题的文件数上限（另算），一轮最多取证两倍于此的文件。",
   uncheckedNotResolved:
-    "这些问题上一次巡检出现过、本次没有再报出，但所在文件本次没有得出可信结论（没轮到取证、文件超出读取上限只看了片段、源码读取或模型输出失败，或所在仓库本次超出上限、拉取失败，位置旁会注明），既不能算仍存在，也不能算已消失。",
+    "这些问题上一次巡检出现过、本次没有再报出，但所在文件本次没有得出可信结论（没轮到取证、文件超出读取上限只看了片段、源码读取或模型输出失败，或所在仓库本次超出上限、拉取失败、是空仓库，位置旁会注明），既不能算仍存在，也不能算已消失。",
   ignoredRepoFindings:
     "这些问题上一次巡检出现过，所在仓库本次在忽略清单里，没有参与巡检。它们不是没轮到检查，也不说明已修复；取消忽略后，下一轮会重新复核。",
   guestScope:
@@ -633,9 +636,9 @@ export const SURVEY_NOTES = {
   ignoreRepoNotePlaceholder:
     "例如：已停止维护，代码迁到了新仓库",
   repoSkipped:
-    "这个仓库本轮没有参与分析：它在忽略清单里，或超出了单次巡检的仓库上限。没有拉取，也就没有统计。",
+    "这个仓库本轮没有参与分析：它在忽略清单里、超出了单次巡检的仓库上限，或是还没有任何提交的空仓库。没有可分析的代码，也就没有统计。",
   skippedRepos: (count: number) =>
-    `另有 ${count} 个仓库未参与（在忽略清单里，或超出单次巡检的仓库上限），见状态列`,
+    `另有 ${count} 个仓库未参与（在忽略清单里、超出单次巡检的仓库上限，或是空仓库），见状态列`,
   workspaceKept:
     "删除巡检不会连带删除本地工作区——那可能是几十 GB 代码，且删除不可逆。工作区清理是单独的动作。"
 }

@@ -145,6 +145,11 @@ Admin 标记为"不再巡检"的一个仓库，可附理由。不论它是手填
 取消忽略同样不说明它的问题仍然存在：它在 Ledger 里的行停在已忽略，直到后续 SurveyRun 给出证据。
 _Avoid_: 排除仓库、屏蔽仓库、黑名单
 
+**EmptyRepo / 空仓库**：
+还没有任何提交的仓库，通常是刚建好、还没往里推过代码。SurveyRun 跳过它并在运行记录里注明，等它有了内容后自动参与。
+它不是 Degradation：没有代码可看，产出质量没有受损；也不是拉取失败，不需要有人去处理。
+_Avoid_: 拉取失败、无效仓库
+
 **IgnoreList / 忽略清单**：
 一个 Survey 下全部 IgnoredIssue 与 IgnoredRepo。
 _Avoid_: 忽略指纹

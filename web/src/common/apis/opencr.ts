@@ -313,7 +313,7 @@ export interface SurveyFinding {
   /** Guest 拿不到标题与正文，字段直接不存在（服务端剔除，不是前端隐藏） */
   title?: string
   body?: string
-  /** 只出现在「本轮未复查」里：所在仓库本轮没参与的原因（truncated / fetch_failed），其余为空串 */
+  /** 只出现在「本轮未复查」里：所在仓库本轮没参与的原因（truncated / fetch_failed / empty），其余为空串 */
   repo_status?: string
   /** 针对这个问题发起过的修复（含之前各轮发起的同一个问题）。只有 Admin 拿得到 */
   fixes?: SurveyFix[]
