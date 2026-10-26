@@ -23,6 +23,7 @@ from .models import (
     ERROR_UNEXPECTED,
     PHASE_DONE,
     REASON_NOT_TRACKABLE,
+    REPO_EMPTY,
     REPO_FETCH_FAILED,
     REPO_IGNORED,
     REPO_OK,
@@ -1861,7 +1862,7 @@ def get_survey_run_detail(
     "已消失"不从库里读 —— 它没有对应的行（见 models 里 FINDING_STATE 的注释），
     是拿上一次的指纹集减去本次算出来的。差集里落在本轮没取证过的文件上的，
     单独列为"本轮未复查"（unchecked_findings），不算已消失；其中所在仓库本轮没参与的
-    （超出上限、拉取失败）带上 repo_status 说明原因。
+    （超出上限、拉取失败、空仓库）带上 repo_status 说明原因。
     所在仓库本轮因为在忽略清单里而跳过的，再单独列为 ignored_repo_findings：它们不是没轮到检查，
     而是用户说过不再看这个仓库，混在"本轮未复查"里会虚增它的条数，也会让人以为该去催一次复查。
 
@@ -1945,9 +1946,9 @@ def get_survey_run_detail(
                 elif inspected is None or (f.repo_slug, f.file_path or "") in inspected:
                     resolved.append(item)
                 else:
-                    # 只标"整个仓库没参与"的两种状态，与 survey/report.py 的 UNCHECKED_REPO_LABELS 对应
+                    # 只标"整个仓库没参与"的三种状态，与 survey/report.py 的 UNCHECKED_REPO_LABELS 对应
                     # （storage 不反向依赖 survey 层，所以在这里各列一遍）
-                    item["repo_status"] = status if status in (REPO_TRUNCATED, REPO_FETCH_FAILED) else ""
+                    item["repo_status"] = status if status in (REPO_TRUNCATED, REPO_FETCH_FAILED, REPO_EMPTY) else ""
                     unchecked.append(item)
         detail["resolved_findings"] = resolved
         detail["unchecked_findings"] = unchecked

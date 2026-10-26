@@ -105,6 +105,24 @@ def _run_git(
     return completed
 
 
+class EmptyRepoError(SurveyError):
+    """远端仓库一个引用都没有（新建后还没推过任何提交），没有代码可巡检。"""
+
+
+# 确认空仓库只是失败后的追问，不该再占满一次拉取超时：主机不可达时每个仓库会多等一整轮
+_EMPTY_CHECK_TIMEOUT = 60
+
+
+def _remote_is_empty(url: str, token: str, timeout: int) -> bool:
+    """远端是否一个引用都没有。ls-remote 本身失败时返回 False，交由调用方按原错误处理。"""
+    try:
+        # 看全部引用而不只是分支：只有 tag 的仓库是有内容的，拉取失败要照常报出来，不能当空仓库静默跳过
+        out = _run_git(["ls-remote", url], None, token, min(timeout, _EMPTY_CHECK_TIMEOUT)).stdout
+    except SurveyError:
+        return False
+    return not out.strip()
+
+
 def _resolve_default_branch(repo_dir: Path, token: str, timeout: int) -> str:
     """
     取远端默认分支。
@@ -140,12 +158,35 @@ def prepare_repo(
     """
     把一个仓库准备到"最新内容"状态，返回 (工作区路径, 实际分支, commit sha)。
 
+    远端一个引用都没有时抛 EmptyRepoError，其余失败抛 SurveyError。
+    """
+    token = load_gitlab_config().get("token", "")
+    repo_dir = survey_workspace_dir(survey_slug) / repo_slug_from_url(url)
+    try:
+        return _fetch_latest(survey_slug, repo_dir, url, branch, token, timeout)
+    except SurveyError:
+        # 空仓库在哪一步失败取决于有没有指定分支、本地有没有上一轮留下的克隆：
+        # 指定了分支时 clone 直接报 "Remote branch ... not found"，没指定时 clone 成功、到取默认分支才失败。
+        # 所以不逐个匹配报错文案，失败后统一问一次远端；正常仓库不为此多一次网络请求
+        if not _remote_is_empty(url, token, timeout):
+            raise
+        # 留着这份没有任何提交的克隆没有用处，删掉让仓库有内容之后重新浅克隆
+        shutil.rmtree(repo_dir, ignore_errors=True)
+        # 丢掉原报错链：那是 git 对空仓库的各种说法（Remote branch not found、无法确定默认分支），
+        # 留着只会让日志看起来像真的拉取失败
+        raise EmptyRepoError("仓库为空，还没有任何提交") from None
+
+
+def _fetch_latest(
+    survey_slug: str, repo_dir: Path, url: str, branch: str, token: str, timeout: int
+) -> Tuple[Path, str, str]:
+    """
+    在 repo_dir 上克隆或增量拉取到远端最新，返回值同 prepare_repo；失败一律抛 SurveyError，不区分空仓库。
+
     已存在则重置本地改动后增量拉取，不存在则浅克隆。
     用 --depth 1 是因为巡检分析的是**当前快照**，历史一行都用不到，
     而全历史 clone 在大仓库上是几十倍的时间与磁盘。
     """
-    token = load_gitlab_config().get("token", "")
-    repo_dir = survey_workspace_dir(survey_slug) / repo_slug_from_url(url)
     git_dir = repo_dir / ".git"
 
     if not git_dir.is_dir():

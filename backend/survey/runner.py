@@ -24,6 +24,7 @@ from ..storage.models import (
     FIX_TRIGGER_AUTO,
     PROFILE_MANIFEST,
     PUSH_TRIGGER_AUTO,
+    REPO_EMPTY,
     REPO_FETCH_FAILED,
     REPO_IGNORED,
     REPO_INDEX_FAILED,
@@ -54,7 +55,7 @@ from .profile import build_profile, codegraph_status, save_profile
 from .reach import collect_reach
 from .push import PushRejected, begin_pushes, execute_pushes
 from .sources import resolve_sources
-from .workspace import artifacts_dir, count_files, delete_workspace, prepare_repo
+from .workspace import EmptyRepoError, artifacts_dir, count_files, delete_workspace, prepare_repo
 
 logger = logging.getLogger(__name__)
 
@@ -78,11 +79,12 @@ def _prepare_workspaces(
     budget_cfg: dict,
 ) -> List[dict]:
     """
-    拉取全部仓库并生成画像。单个仓库失败记降级后继续。
+    拉取全部仓库并生成画像。单个仓库拉取失败记降级后继续，空仓库跳过、不记降级。
 
-    返回成功处理的仓库上下文列表 [{slug, dir, profile}]。
+    返回成功处理的仓库上下文列表 [{slug, dir, profile}]。没有一个仓库成功、且其中有空仓库时抛 SurveyError。
     """
     prepared: List[dict] = []
+    empty_count = 0
     artifacts = artifacts_dir(survey["slug"])
     # 整轮只查一次，并传给每个仓库的画像：状态要在快照、降级与仓库状态之间保持一致
     run_codegraph_status = codegraph_status()
@@ -109,6 +111,12 @@ def _prepare_workspaces(
                 survey["slug"], target["url"], target.get("branch", ""),
                 timeout=budget_cfg.get("fetch_timeout_seconds", 600),
             )
+        except EmptyRepoError:
+            # 不记降级：没有代码可看，产出质量没有受损；仓库有了内容后下一轮自动参与
+            logger.info("Empty repo skipped: %s", target["url"])
+            repo.record_survey_repo(run_uid, slug, target["url"], target.get("branch", ""), status=REPO_EMPTY)
+            empty_count += 1
+            continue
         except SurveyError as e:
             logger.warning("Repo fetch failed: %s: %s", target["url"], e)
             repo.record_survey_repo(
@@ -144,6 +152,15 @@ def _prepare_workspaces(
         )
         prepared.append({"slug": slug, "dir": repo_dir, "profile": profile})
 
+    if not prepared and empty_count:
+        # 与"全部在忽略清单里"一样判失败而不是"成功但零发现"，但要说清有几个只是空仓库：
+        # 笼统报"均拉取失败"会让人去排查一批其实没毛病的仓库。
+        # 放在这里而不是调用方，是因为只有这一层知道每个仓库是怎么没参与的
+        if empty_count == len(targets):
+            raise SurveyError(f"全部 {len(targets)} 个仓库都是空仓库，没有可巡检的代码")
+        raise SurveyError(
+            f"全部 {len(targets)} 个仓库均未能参与：{empty_count} 个是空仓库，其余拉取失败"
+        )
     return prepared
 
 
