@@ -181,7 +181,7 @@ export interface DestinationTargetField {
   required: boolean
   placeholder: string
   help: string
-  /** 留空时取巡检名称。拷贝巡检时这类字段一律清空，让副本跟着自己的名称走 */
+  /** 留空时取巡检名称。拷贝时清空、编辑时随改名同步（见 surveys/index.vue 的 onNameInput） */
   follows_survey_name: boolean
 }
 

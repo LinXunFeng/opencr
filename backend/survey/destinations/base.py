@@ -47,6 +47,7 @@ class TargetField:
     help: str = ""
     # 留空时由 normalize_target 取巡检名称。落库存的是取到的名称，拷贝巡检时前端据此清空这类字段，
     # 让副本跟着自己的名称走；不清的话，按月拷贝出来的「11 月巡检」会悄悄写进「10 月巡检」那张工作表
+    # 编辑时改名的跟随也由前端负责，见 web/src/pages/surveys/index.vue 的 onNameInput
     follows_survey_name: bool = False
 
     def to_dict(self) -> dict:

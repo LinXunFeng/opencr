@@ -122,8 +122,22 @@ async function load() {
   }
 }
 
+/** 名称输入框上一次的值，onNameInput 据此判断跟随中的字段有没有被用户改过 */
+let followedName = ""
+
+/**
+ * 跟着巡检名称走的目标位置字段：打开表单那一刻值等于巡检名称、且类型声明了 follows_survey_name 的。
+ *
+ * 只在打开时圈定一次，不在每次按键时按当前名称重新匹配：名称打到一半的中间态可能恰好等于
+ * 另一个有意填写的工作表名（「月报」→「月报汇总 v2」途经「月报汇总」），会把它误吸附进来。
+ * 不用 watch(form.name) 驱动：打开表单时程序填名称也会触发它，拿到的旧值是上一次弹窗残留的名称。
+ */
+let followers: { binding: BindingForm, key: string }[] = []
+
 function resetForm() {
   form.name = ""
+  followedName = ""
+  followers = []
   form.enabled = true
   form.schedule_kind = "weekly"
   form.weekday = 1
@@ -160,6 +174,7 @@ function openCreate() {
 function fillForm(row: any) {
   resetForm()
   form.name = row.name
+  followedName = row.name
   form.enabled = row.enabled
   form.schedule_kind = row.schedule_kind
   form.timezone = row.timezone
@@ -194,6 +209,13 @@ function fillForm(row: any) {
     destination: b.destination,
     target: { ...(b.target ?? {}) }
   }))
+  for (const binding of form.bindings) {
+    for (const field of destinationOf(binding.destination)?.target_fields ?? []) {
+      if (field.follows_survey_name && (binding.target[field.key] ?? "").trim() === row.name.trim()) {
+        followers.push({ binding, key: field.key })
+      }
+    }
+  }
 }
 
 /** 打开编辑表单，保存时按 survey_uid 更新原巡检 */
@@ -215,6 +237,9 @@ function openCopy(row: any) {
   copyIgnores.value = true
   fillForm(row)
   form.name = `${row.name} 副本`
+  followedName = form.name
+  // 这类字段下面一律清空，留空即在保存时取新名称，用不着跟随
+  followers = []
   const adjustments: string[] = []
 
   // 修复记录按巡检登记，不随拷贝过去：照搬自动发起的话，新巡检第一轮就会把提过合并请求的问题再提一遍
@@ -290,7 +315,29 @@ function removeBinding(index: number) {
 /** 换了实例就清空目标位置：不同类型的字段含义不同，沿用旧值只会得到一个看起来合法的错误位置 */
 function onDestinationChange(binding: BindingForm) {
   binding.target = {}
+  // 跟随项是按旧类型的字段圈定的，新类型里同名的字段未必跟随名称
+  followers = followers.filter(f => f.binding !== binding)
   binding.check = null
+}
+
+/**
+ * 用户编辑名称时，把跟随中（见 followers）且没被手动改过的字段同步成新名称。
+ *
+ * 落库存的是保存那一刻取到的名称，之后改名不会自动跟随：拷贝出「10 月巡检 副本」、
+ * 名称改成「11 月巡检 副本」先保存、再去掉「副本」，工作表会一直停在「11 月巡检 副本」。
+ * 放在前端而不是服务端保存时改写：表单上看得见、保存前还能改回去，有意沿用旧工作表的不会被悄悄换掉。
+ * 后果是改名即换一张工作表：目标位置变了，服务端按新绑定处理、首次推送写满新表，
+ * 旧表连同里面的人工列原样留着，不迁移。
+ */
+function onNameInput(value: string) {
+  const before = followedName.trim()
+  followedName = value
+  for (const { binding, key } of followers) {
+    if ((binding.target[key] ?? "").trim() === before) {
+      binding.target[key] = value.trim()
+      onTargetInput(binding)
+    }
+  }
 }
 
 /** 测试结果对应的是点击那一刻的填写内容，改了之后旧结论就不再成立，直接清掉免得误读 */
@@ -588,7 +635,7 @@ onMounted(load)
       </el-alert>
       <el-form label-width="110px" size="small">
         <el-form-item label="名称">
-          <el-input v-model="form.name" placeholder="例如：移动端周巡检" />
+          <el-input v-model="form.name" placeholder="例如：移动端周巡检" @input="onNameInput" />
         </el-form-item>
 
         <el-form-item label="执行周期">
