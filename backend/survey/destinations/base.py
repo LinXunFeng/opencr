@@ -174,6 +174,16 @@ class Destination(ABC):
         return " / ".join(parts)
 
     @classmethod
+    def target_location(cls, target: Dict[str, Any]) -> str:
+        """
+        目标位置给人看的短名（例如工作表名），用于修复合并请求的说明里指明"去哪里找这一行"。
+
+        与 describe_target 分开：后者给 Admin 核对配置，带着表格 ID 这类对审查者没有意义的字段。
+        默认返回空串（说明里只写实例名），不回落到 describe_target，免得把那些字段带进合并请求。
+        """
+        return ""
+
+    @classmethod
     def target_url(cls, target: Dict[str, Any]) -> str:
         """
         目标位置在平台上的浏览链接，用于后台列表一键打开；拼不出时返回空串。

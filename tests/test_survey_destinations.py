@@ -1434,6 +1434,14 @@ class GoogleSheetTests(unittest.TestCase):
         self.assertEqual(GoogleSheetDestination.target_url({"spreadsheet": "not an id"}), "")
         self.assertEqual(GoogleSheetDestination.target_url({}), "")
 
+    def test_target_location_names_worksheet(self):
+        """位置短名只写工作表，不带表格 ID：链接已经指向表格，审查者要知道的是去哪个工作表找。"""
+        from backend.survey.destinations.google_sheet import GoogleSheetDestination
+
+        target = {"spreadsheet": "1AbC_defGhijklmnopqrstuvwxyz0123", "worksheet": "11 月巡检"}
+        self.assertEqual(GoogleSheetDestination.target_location(target), "工作表「11 月巡检」")
+        self.assertEqual(GoogleSheetDestination.target_location({}), "")
+
     def test_missing_credentials_file_is_a_config_error(self):
         from backend.survey.destinations import DestinationError
         from backend.survey.destinations.google_sheet import GoogleSheetDestination

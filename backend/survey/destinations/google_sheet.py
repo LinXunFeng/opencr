@@ -225,6 +225,12 @@ class GoogleSheetDestination(Destination):
         return {"spreadsheet": parse_spreadsheet_id(spreadsheet), "worksheet": worksheet}
 
     @classmethod
+    def target_location(cls, target: Dict[str, Any]) -> str:
+        """工作表名。链接只能定位到整张表格（见 target_url），工作表要靠这一句指明。"""
+        worksheet = str((target or {}).get("worksheet") or "").strip()
+        return f"工作表「{worksheet}」" if worksheet else ""
+
+    @classmethod
     def target_url(cls, target: Dict[str, Any]) -> str:
         """表格的浏览链接，定位到整张表格而不是某个工作表。"""
         # 直达工作表要用数值 sheetId（#gid=），而落库的只有工作表名。为此在列表页逐行调

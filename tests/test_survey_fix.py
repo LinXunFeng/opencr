@@ -86,6 +86,61 @@ class StaticChecksTests(unittest.TestCase):
         self.assertFalse(verdict_passed({"checks": [{"passed": True}], "problems": ["引入了空指针"]}))
 
 
+class LedgerNoticeTests(unittest.TestCase):
+    """合并请求说明开头的台账提醒。"""
+
+    FIX = {"repo_slug": "app", "file_path": "lib/calc.py"}
+
+    @staticmethod
+    def _target(**kwargs):
+        """一个输出目标的指路信息，默认是带链接的 Google Sheet。"""
+        from backend.survey.destinations import BoundTarget
+
+        values = {"name": "qa_sheet", "label": "Google Sheet", "location": "工作表「11 月巡检」",
+                  "url": "https://docs.google.com/spreadsheets/d/x/edit"}
+        values.update(kwargs)
+        return BoundTarget(**values)
+
+    def test_no_targets_no_notice(self):
+        """没有输出目标时不出这一节：没有表格可更新，提醒只会让人去找一张不存在的表。"""
+        from backend.survey.fix import ledger_notice
+
+        self.assertEqual(ledger_notice([], "s:fp", self.FIX), [])
+
+    def test_lists_each_target_with_link_and_row_key(self):
+        """每个输出目标一行，有链接的给链接；给出行键与仓库、文件，并提醒别改系统维护的「状态」列。"""
+        from backend.survey.fix import ledger_notice
+
+        plain = self._target(name="feishu", label="飞书", location="", url="")
+        text = "\n".join(ledger_notice([self._target(), plain], "weekly:fp1", self.FIX))
+        self.assertTrue(text.startswith("### "))
+        self.assertIn(
+            "> - [`qa_sheet`（Google Sheet） · `工作表「11 月巡检」`](<https://docs.google.com/spreadsheets/d/x/edit>)", text)
+        self.assertIn("> - `feishu`（飞书）\n", text)
+        self.assertIn("「键」列查找 `weekly:fp1` 即可定位到这一行（仓库 `app`、文件 `lib/calc.py`）", text)
+        self.assertIn("只针对上面「问题」一节里的那一条", text)
+        self.assertIn("「状态」等系统列由巡检自动维护", text)
+        self.assertIn("可以自行添加一列", text)
+
+    def test_admin_text_cannot_break_markdown(self):
+        """
+        Admin 填的名称不能改变说明的结构：方括号不能截断链接，@ 不能真的通知人，换行不能跳出引用块；
+        行键里的反引号不能提前闭合行内代码。
+        """
+        from backend.survey.fix import ledger_notice
+
+        target = self._target(location="工作表「a](javascript:x) @all !1\n# 标题」")
+        text = "\n".join(ledger_notice([target], "s:a`b", {}))
+        # 包成行内代码：所有 GitLab 版本都不在代码里解析引用与链接；CommonMark 里行内代码比链接方括号优先，里面的 ] 截不断链接
+        self.assertIn(" · `工作表「a](javascript:x) @all !1 # 标题」`](<https://", text)
+        self.assertIn("``s:a`b``", text)
+        # 仓库与文件缺失时不输出空的行内代码
+        self.assertIn("（仓库 （未知）、文件 （未知））", text)
+        # 每一行都还在引用块里或是标题、空行
+        for line in text.split("\n"):
+            self.assertTrue(line == "" or line.startswith((">", "###")), line)
+
+
 class ProjectPathTests(unittest.TestCase):
     """从仓库地址取平台上的项目路径。"""
 
@@ -694,6 +749,8 @@ class ExecuteFixTests(FixTestCase):
         self.assertEqual(args.args[3], "[OpenCR] 求和没有处理空价格")
         self.assertEqual(args.kwargs["assignee_id"], 1)
         self.assertIn("合并不会直接改变巡检台账的状态", args.args[4])
+        # 巡检没有绑定输出目标：没有表格可更新，不出台账提醒
+        self.assertNotIn("请同步更新巡检台账", args.args[4])
         # 分支真的推到了远端，提交只含这一个文件
         branch = result["source_branch"]
         shown = _git(self.root / "remote.git", "show", "--name-only", "--format=%an|%ae|%cn|%ce", branch)
@@ -705,6 +762,52 @@ class ExecuteFixTests(FixTestCase):
         self.republish.assert_called_once()
         # 工作区做完即删
         self.assertFalse((self.root / "ws" / ".fixes").exists() and any((self.root / "ws" / ".fixes").iterdir()))
+
+    def _bind_destinations(self, config, bindings):
+        """注册假平台并给巡检绑定输出目标；config 是 config.yaml 的 destinations 段。"""
+        from backend.survey import destinations
+        from tests.test_survey_destinations import _fake_destination_class
+
+        fake = _fake_destination_class()
+        for patch in (mock.patch.dict(destinations.DESTINATION_TYPES, {"fake": fake}),
+                      mock.patch.object(destinations, "load_file_config", return_value={"destinations": config})):
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.survey = self.repo.update_survey(self.survey["survey_uid"], {}, bindings=bindings)
+        return fake
+
+    def test_description_points_to_ledger_targets(self):
+        """说明开头列出可用的输出目标与行键；配置有误、已删除的实例不列，非 https 链接不给。"""
+        fake = self._bind_destinations(
+            {"fake-1": {"type": "fake"}, "fake-2": {"type": "fake"}, "broken": {"type": "nope"}},
+            [{"destination": "fake-1", "target": {"table": "T1"}},
+             {"destination": "fake-2", "target": {"table": "javascript:x"}},
+             {"destination": "broken", "target": {"table": "T3"}},
+             {"destination": "gone", "target": {"table": "T4"}}],
+        )
+        with mock.patch.object(fake, "target_url", classmethod(
+                lambda cls, t: t["table"] if ":" in t["table"] else f"https://x/{t['table']}")):
+            result, create = self._execute([self._proposal(), '{"resolved":true,"problems":[]}'])
+        self.assertEqual(result["status"], "succeeded", result["error_message"])
+        description = create.call_args.args[4]
+        self.assertTrue(description.startswith("### 📋 请同步更新巡检台账"), description[:80])
+        self.assertIn("> - [`fake-1`（假平台）](<https://x/T1>)", description)
+        self.assertIn("> - `fake-2`（假平台）\n", description)
+        self.assertNotIn("broken", description)
+        self.assertNotIn("gone", description)
+        self.assertIn(f"`{self.survey['slug']}:{result['fingerprint']}`", description)
+        # 台账提醒在前，原有内容照旧
+        self.assertLess(description.index("请同步更新巡检台账"), description.index("### 问题"))
+        self.assertIn("合并不会直接改变巡检台账的状态", description)
+
+    def test_ledger_target_failure_still_opens_mr(self):
+        """读输出目标出错时照常提合并请求，只是没有台账提醒：分支已经推上去了，不能留下孤儿分支。"""
+        from backend.survey import fix
+
+        with mock.patch.object(fix, "bound_targets", side_effect=RuntimeError("boom")):
+            result, create = self._execute([self._proposal(), '{"resolved":true,"problems":[]}'])
+        self.assertEqual(result["status"], "succeeded", result["error_message"])
+        self.assertNotIn("请同步更新巡检台账", create.call_args.args[4])
 
     def test_mr_title_prefix_follows_setting(self):
         """标题前缀按后台设置；设成空串时标题只有问题本身。"""

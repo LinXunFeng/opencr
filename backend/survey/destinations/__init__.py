@@ -11,6 +11,7 @@ Destination（输出目标）注册表与实例配置解析。
 
 import logging
 import re
+from dataclasses import dataclass
 from typing import Dict, List, Type
 
 from ...review.config import load_file_config
@@ -78,6 +79,49 @@ def destination_type_of(name: str) -> str:
     return info.type_name if info else ""
 
 
+def safe_target_url(cls: Type[Destination], target: dict) -> str:
+    """
+    插件给出的目标位置链接，只放行 https，其余一律返回空串。
+
+    链接会被直接放进后台的 href 与合并请求说明的 Markdown 链接里：插件若把用户填写的内容透传出来，
+    javascript: 链接点一下就会执行。两处共用这一个判断，不各写一份。
+    """
+    url = cls.target_url(target)
+    return url if isinstance(url, str) and url.startswith("https://") else ""
+
+
+@dataclass(frozen=True)
+class BoundTarget:
+    """一个 Binding 在平台上的指路信息：实例名、类型名称、位置短名与浏览链接（拼不出时为空串）。"""
+
+    name: str
+    label: str
+    location: str
+    url: str
+
+
+def bound_targets(bindings: List[dict]) -> List[BoundTarget]:
+    """
+    把巡检的 Binding 解析成指路信息，供修复合并请求的说明告诉审查者"去哪里找这一行"。
+
+    实例已从 config.yaml 删除或配置有误的绑定不列：推送本来就推不过去，表格里不会有这一行的最新内容。
+    """
+    destinations = load_destinations()
+    result = []
+    for binding in bindings or []:
+        info = destinations.get(binding["destination"])
+        if info is None or info.error:
+            continue
+        cls = DESTINATION_TYPES[info.type_name]
+        result.append(BoundTarget(
+            name=binding["destination"],
+            label=cls.label or cls.type_name,
+            location=cls.target_location(binding["target"]),
+            url=safe_target_url(cls, binding["target"]),
+        ))
+    return result
+
+
 def list_destination_types() -> List[dict]:
     """全部已注册的类型，供后台展示。"""
     return [
@@ -91,12 +135,15 @@ def list_destination_types() -> List[dict]:
 
 
 __all__ = [
+    "BoundTarget",
     "DESTINATION_TYPES",
     "Destination",
     "DestinationError",
     "DestinationInfo",
+    "bound_targets",
     "build_destination",
     "destination_type_of",
     "list_destination_types",
     "load_destinations",
+    "safe_target_url",
 ]

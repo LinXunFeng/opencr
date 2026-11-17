@@ -9,7 +9,7 @@ FixRun（修复运行）的唯一执行入口：针对一条巡检 Finding 生�
 本地验证不在服务端构建、不跑测试，只做不需要目标仓库工具链的检查加一次模型复核，理由见
 docs/adr/0007-survey-fix-local-verification.md。构建与测试交给目标仓库自己的 CI。
 
-判定逻辑（apply_edits / static_checks / verdict_passed / project_path_from_url / pick_commit_author / mr_title）是纯函数，不碰 git、网络与数据库。
+判定逻辑（apply_edits / static_checks / verdict_passed / project_path_from_url / pick_commit_author / mr_title / ledger_notice）是纯函数，不碰 git、网络与数据库。
 """
 
 import difflib
@@ -49,6 +49,8 @@ from .analysis import _call_model, _parse_json_payload
 from .assignee import changed_lines, find_original_author, resolve_assignee
 from .common import SurveyError, issue_key
 from .config import load_fix_mr_title_prefix, load_public_url, load_survey_config, resolve_budget
+from .destinations import BoundTarget, bound_targets
+from .ledger import KEY_COLUMN, LEDGER_COLUMNS, ledger_key
 from .push import PushRejected, begin_pushes, execute_pushes
 from .workspace import CommitAuthor, commit_and_push_fix, delete_fix_workspace, prepare_fix_repo
 
@@ -460,14 +462,87 @@ def _generate_verified(run_uid: str, fix: dict, source: str, fix_prompt: str) ->
     raise FixFailure(FIX_VERIFY_FAILED, f"{len(attempts)} 次生成的修改都没有通过本地验证，未提出合并请求")
 
 
-def _mr_description(fix: dict, survey_name: str, summary: str, attempts: List[dict], assignee: dict) -> str:
-    """合并请求的说明。写清它是机器生成的、验证做到了哪一步、合并之后台账会怎样。"""
+# 台账里由推送覆盖写入的「状态」列表头。提醒审查者别去改它，文案跟着列定义走，不另抄一份；
+# 给兜底值而不是让 next() 抛 StopIteration：列定义改动不该让整个修复模块在导入时就失败
+_STATE_HEADER = next((c.header for c in LEDGER_COLUMNS if c.key == "state"), "状态")
+
+
+def _admin_text(text: str) -> str:
+    """
+    把一段不受我们控制的文字（Admin 填的实例名、工作表名，以及仓库与文件路径）放进合并请求说明：折成一行后包成行内代码。
+
+    包成行内代码而不是逐个反斜杠转义：反斜杠挡 GitLab 引用（@all、!12、~label）只在较新的版本上有效，
+    旧版本的自建实例去掉反斜杠后照样识别成引用，工作表名里有个 @all 就会真的通知全员；行内代码在所有版本里都不做引用解析。
+    换行折成空格，否则会跳出引用块、打乱整段说明。
+    """
+    return _code_span(re.sub(r"\s+", " ", str(text)).strip())
+
+
+def _code_span(text: str) -> str:
+    """包成行内代码。反引号围栏取比正文里最长的连续反引号多一个，正文带反引号也不会提前闭合。空串写成"（未知）"。"""
+    if not text:
+        # 空的行内代码在 CommonMark 里不成立，会把两个反引号原样显示出来
+        return "（未知）"
+    longest = max((len(m) for m in re.findall(r"`+", text)), default=0)
+    fence = "`" * (longest + 1)
+    pad = " " if text.startswith("`") or text.endswith("`") else ""
+    return f"{fence}{pad}{text}{pad}{fence}"
+
+
+def ledger_notice(targets: List[BoundTarget], row_key: str, fix: dict) -> List[str]:
+    """
+    合并请求说明开头那段"去台账更新处理进度"的提醒，返回 Markdown 行；没有输出目标时返回空列表。
+    row_key 是这一行在「键」列的值；fix 提供仓库与文件，供人在表格里核对找到的是不是这一行。
+
+    放在说明最前面并用标题加引用块框起来：审查者通常只扫一眼开头就去看改动，放在末尾等于没写。
+    不用 GitLab 的 `> [!important]` 提示块语法：旧版本的自建实例不认识它，会把方括号原样显示出来。
+
+    链接写进合并请求后，能看到合并请求的人都能看到它。这不算扩大 ADR-0002 的可见范围：那里管的是后台对游客的裁剪，
+    而这份说明本来就带着发现正文；表格本身能不能打开，仍由它自己的共享设置决定。
+    """
+    if not targets:
+        return []
+    lines = [
+        "### 📋 请同步更新巡检台账",
+        "",
+        "> **这个问题记录在下面的巡检台账里。合并或关闭这个合并请求后，请到表格里更新这一行的处理进度。**",
+        ">",
+    ]
+    for target in targets:
+        # 类型名称来自插件代码，不是 Admin 填的，不必包成代码
+        text = " · ".join(
+            part for part in (f"{_admin_text(target.name)}（{target.label}）", target.location and _admin_text(target.location))
+            if part
+        )
+        # 地址包进尖括号：插件给的链接里有空格或右括号时，裸写会让链接在半路断开
+        lines.append(f"> - [{text}](<{target.url}>)" if target.url else f"> - {text}")
+    lines += [
+        ">",
+        f"> 在「{KEY_COLUMN.header}」列查找 {_code_span(row_key)} 即可定位到这一行"
+        f"（仓库 {_admin_text(fix.get('repo_slug') or '')}、文件 {_admin_text(fix.get('file_path') or '')}）。",
+        # 台账按 仓库 + 文件 + 类别 聚合成一行，这个合并请求只修其中一条；不说的话，审查者会把整行标成已处理
+        "> 同一文件里同一类别的问题合在这一行，这个合并请求只针对上面「问题」一节里的那一条。",
+        ">",
+        # 状态是系统列，每次推送按复核结果覆盖；让人去改它，改完下一轮就被冲掉，还会让人以为系统出了错。
+        # 人工列由团队自己加，系统从不建也从不读，所以要说明没有时自己加一列
+        f"> 「{_STATE_HEADER}」等系统列由巡检自动维护，手动修改会在下次推送时被覆盖；"
+        "请在团队自己维护的列（例如「处理进度」，表格里还没有的话可以自行添加一列）里记下处理结果。",
+        "",
+    ]
+    return lines
+
+
+def _mr_description(
+    fix: dict, survey: dict, summary: str, attempts: List[dict], assignee: dict, targets: List[BoundTarget]
+) -> str:
+    """合并请求的说明。写清它是机器生成的、该去哪个台账更新进度、验证做到了哪一步、合并之后台账会怎样。"""
+    survey_name = survey.get("name") or ""
     public_url = load_public_url()
     passed = next((a for a in reversed(attempts) if a.get("passed")), {})
     checks = "\n".join(
         f"- {c['name']}：通过" + (f"（{c['detail']}）" if c.get("detail") else "") for c in passed.get("checks") or []
     )
-    lines = [
+    lines = ledger_notice(targets, ledger_key(survey["slug"], fix["fingerprint"]), fix) + [
         f"OpenCR 巡检「{survey_name}」发现了下面这个问题，这是自动生成的修改，请审查后再合并。",
         "",
         "### 问题",
@@ -601,11 +676,18 @@ def _execute(run_uid: str, fix: dict) -> None:
         commit_author, timeout=budget.get("fetch_timeout_seconds", 600),
     )
     repo.update_survey_fix(run_uid, source_branch=source_branch, commit_sha=commit_sha)
+    # 输出目标同样在执行时读取：说明里指向的应是此刻推送会写到的表格
+    try:
+        targets = bound_targets(survey.get("bindings") or [])
+    except Exception:
+        # 分支已经推上去了，这里抛出会留下一个没有合并请求的修复分支；放过的代价只是这份说明里少了台账指路
+        logger.exception("Resolving ledger targets for MR description failed: run=%s", run_uid)
+        targets = []
     mr = create_merge_request(
         project_path, source_branch, branch,
         # 标题模板与修复提示词一样在执行时读取：排队期间改了模板，之后提出的合并请求按新的来
         mr_title(load_fix_mr_title_prefix(), title, survey["fix_mr_title_template"]),
-        _mr_description(fix, survey.get("name") or "", summary, attempts, assignee),
+        _mr_description(fix, survey, summary, attempts, assignee, targets),
         assignee_id=assignee["id"],
     )
     repo.update_survey_fix(run_uid, mr_iid=mr.get("iid"), mr_url=str(mr.get("web_url") or ""))
